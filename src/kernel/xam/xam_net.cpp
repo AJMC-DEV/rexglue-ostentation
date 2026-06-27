@@ -12,6 +12,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <cstdio>
 #include <cstring>
 #include <random>
 
@@ -492,7 +493,13 @@ u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, m
 void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string string_out,
                                      u32 string_size) {
   REXKRNL_INFO("XNetInAddrToString: in_addr={:08X}", (uint32_t)in_addr);
-  rex::string::copy_truncating(string_out, "666.666.666.666", string_size);
+  // in_addr is in network byte order (big-endian) from the PPC guest register.
+  // Format each octet from high byte to low byte.
+  char buf[16] = {};
+  std::snprintf(buf, sizeof(buf), "%u.%u.%u.%u",
+                (in_addr >> 24) & 0xFF, (in_addr >> 16) & 0xFF,
+                (in_addr >> 8) & 0xFF,  (in_addr >> 0) & 0xFF);
+  rex::string::copy_truncating(string_out, buf, string_size);
 }
 
 // This converts a XNet address to an IN_ADDR. The IN_ADDR is used for

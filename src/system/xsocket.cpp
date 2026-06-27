@@ -277,8 +277,9 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
             continue;
           }
           uint16_t peer_port = ws.port ? ws.port : sl_port;
-          if (peer_port == sl_port) {
-            REXKRNL_DEBUG("XSocket::SendTo skipping self (port={})", peer_port);
+          bool is_self = (ws.host_address == my_ip) && (peer_port == sl_port);
+          if (is_self) {
+            REXKRNL_DEBUG("XSocket::SendTo skipping self (addr={} port={})", ws.host_address, peer_port);
             continue;
           }
           bool same_public_ip = ws.host_address == my_ip;

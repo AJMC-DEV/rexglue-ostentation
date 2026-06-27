@@ -124,50 +124,79 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           session_ptr, flags, num_slots_public, num_slots_private,
           user_xuid_lo, session_info_ptr, nonce_ptr);
 
+      // HOST flag (0x01) distinguishes session creator from joiner.
+      // SYSTEMLINK_FEATURES = HOST | PEER_NETWORK. Clients joining an existing
+      // session do NOT set HOST, so we must not overwrite their XSESSION_INFO.
+      constexpr uint32_t XSESSION_CREATE_HOST = 0x00000001;
+      const bool is_host_session = (flags & XSESSION_CREATE_HOST) != 0;
+
       if (session_info_ptr && REXCVAR_GET(xlive_web_enabled)) {
-        REXKRNL_INFO("XGISessionCreateImpl: web enabled, EnsureReady...");
-        auto& wc = system::XLiveWebClient::Get();
-        wc.EnsureReady();
-        REXKRNL_INFO("XGISessionCreateImpl: wc.is_ready()={}", wc.is_ready());
-        if (!wc.is_ready()) {
-          REXKRNL_ERROR("XGISessionCreateImpl: web client not ready, skipping web session");
-          return X_E_SUCCESS;
-        }
+        if (is_host_session) {
+          REXKRNL_INFO("XGISessionCreateImpl: web enabled (HOST), EnsureReady...");
+          auto& wc = system::XLiveWebClient::Get();
+          wc.EnsureReady();
+          REXKRNL_INFO("XGISessionCreateImpl: wc.is_ready()={}", wc.is_ready());
+          if (!wc.is_ready()) {
+            REXKRNL_ERROR("XGISessionCreateImpl: web client not ready, skipping web session");
+            return X_E_SUCCESS;
+          }
 
-        uint64_t host_xuid = kernel_state_->user_profile()->xuid();
-        uint16_t port = static_cast<uint16_t>(
-            REXCVAR_GET(systemlink_base_port) + REXCVAR_GET(systemlink_port_offset));
-        REXKRNL_INFO("XGISessionCreateImpl: host_xuid={:016X} port={} public_ip={}",
-                     host_xuid, port, wc.public_address());
+          uint64_t host_xuid = kernel_state_->user_profile()->xuid();
+          uint16_t port = static_cast<uint16_t>(
+              REXCVAR_GET(systemlink_base_port) + REXCVAR_GET(systemlink_port_offset));
+          REXKRNL_INFO("XGISessionCreateImpl: host_xuid={:016X} port={} public_ip={}",
+                       host_xuid, port, wc.public_address());
 
-        auto& session = system::GetActiveSession();
-        session.CreateHostSession(host_xuid, flags, num_slots_public, num_slots_private,
-                                  wc.public_address_net(), port);
-        REXKRNL_INFO("XGISessionCreateImpl: local session created");
+          auto& session = system::GetActiveSession();
+          session.CreateHostSession(host_xuid, flags, num_slots_public, num_slots_private,
+                                    wc.public_address_net(), port);
+          REXKRNL_INFO("XGISessionCreateImpl: local host session created");
 
-        system::WebSession ws_info;
-        ws_info.host_xuid     = host_xuid;
-        ws_info.slots_public  = num_slots_public;
-        ws_info.slots_private = num_slots_private;
-        ws_info.port          = port;
-        ws_info.host_address  = wc.public_address();
-        REXKRNL_INFO("XGISessionCreateImpl: calling wc.CreateSession title_id={:08X}",
-                     kernel_state_->title_id());
-        std::string web_id;
-        bool create_ok = wc.CreateSession(kernel_state_->title_id(), ws_info, web_id);
-        REXKRNL_INFO("XGISessionCreateImpl: CreateSession ok={} web_id='{}'", create_ok, web_id);
-        if (create_ok && !web_id.empty()) {
-          session.set_web_session_id(web_id);
-        }
+          system::WebSession ws_info;
+          ws_info.host_xuid     = host_xuid;
+          ws_info.slots_public  = num_slots_public;
+          ws_info.slots_private = num_slots_private;
+          ws_info.port          = port;
+          ws_info.host_address  = wc.public_address();
+          REXKRNL_INFO("XGISessionCreateImpl: calling wc.CreateSession title_id={:08X}",
+                       kernel_state_->title_id());
+          std::string web_id;
+          bool create_ok = wc.CreateSession(kernel_state_->title_id(), ws_info, web_id);
+          REXKRNL_INFO("XGISessionCreateImpl: CreateSession ok={} web_id='{}'", create_ok, web_id);
+          if (create_ok && !web_id.empty()) {
+            session.set_web_session_id(web_id);
+          }
 
-        auto* info_raw = memory_->TranslateVirtual(session_info_ptr);
-        REXKRNL_INFO("XGISessionCreateImpl: info_raw={} session_info_ptr={:08X}",
-                     (void*)info_raw, session_info_ptr);
-        if (info_raw) {
-          const auto& si = session.session_info();
-          std::memcpy(info_raw, &si, sizeof(system::XSESSION_INFO));
-          REXKRNL_INFO("XGISessionCreateImpl: XSESSION_INFO written ({} bytes)",
-                       sizeof(system::XSESSION_INFO));
+          auto* info_raw = memory_->TranslateVirtual(session_info_ptr);
+          REXKRNL_INFO("XGISessionCreateImpl: info_raw={} session_info_ptr={:08X}",
+                       (void*)info_raw, session_info_ptr);
+          if (info_raw) {
+            const auto& si = session.session_info();
+            std::memcpy(info_raw, &si, sizeof(system::XSESSION_INFO));
+            REXKRNL_INFO("XGISessionCreateImpl: XSESSION_INFO written ({} bytes)",
+                         sizeof(system::XSESSION_INFO));
+          }
+        } else {
+          // Client joining an existing session.
+          // The game already populated session_info_ptr with the host's XSESSION_INFO
+          // (received via broadcast or session search). Read it and initialise a
+          // client-side session without touching guest memory or the web API.
+          REXKRNL_INFO("XGISessionCreateImpl: client join path (no HOST flag), flags={:08X}", flags);
+          auto* info_raw = memory_->TranslateVirtual(session_info_ptr);
+          if (info_raw) {
+            system::XSESSION_INFO host_si{};
+            std::memcpy(&host_si, info_raw, sizeof(system::XSESSION_INFO));
+
+            auto& session = system::GetActiveSession();
+            session.CreateClientSession(host_si, 0 /*host_xuid unknown*/, flags,
+                                         num_slots_public, num_slots_private);
+
+            // Cache the host's XNADDR so XNetXnAddrToInAddr can resolve it.
+            system::XNetAddrCache::Get().Store(host_si.hostAddress, host_si.sessionID);
+
+            REXKRNL_INFO("XGISessionCreateImpl: client session ready, host inaOnline={:08X}",
+                         host_si.hostAddress.inaOnline);
+          }
         }
       }
       return X_E_SUCCESS;

@@ -83,9 +83,20 @@ u32 XamUserGetSigninState_entry(u32 user_index) {
   return signin_state;
 }
 
-#define XONLINE_USER_MEMBERSHIP_TIER_GOLD 2
+#define XONLINE_USER_MEMBERSHIP_TIER_GOLD 6   // matches kSubscriptionTierGold in xenia
 #define XONLINE_USER_MEMBERSHIP_TIER_MASK 0x00F00000
 #define XUSER_INFO_FLAG_LIVE_ENABLED      0x00000001
+
+// XamUserGetSigninInfo flags
+constexpr uint32_t X_USER_GET_SIGNIN_INFO_OFFLINE_XUID_ONLY = 0x01;
+constexpr uint32_t X_USER_GET_SIGNIN_INFO_ONLINE_XUID_ONLY  = 0x02;
+
+// Online XUIDs on Xbox Live have high word 0x0009. Offline XUIDs have 0xE... or 0xB...
+// We synthesize an online XUID by replacing the high 2 bytes with the Live prefix
+// while keeping the lower 6 bytes as the unique user identifier.
+static inline uint64_t MakeSyntheticOnlineXuid(uint64_t offline_xuid) {
+  return 0x0009000000000000ULL | (offline_xuid & 0x0000FFFFFFFFFFFFULL);
+}
 
 typedef struct {
   rex::be<uint64_t> xuid;
@@ -108,16 +119,26 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
   }
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  info->xuid = user_profile->xuid();
+  uint64_t xuid = user_profile->xuid();
+
+  // When the game requests the online XUID specifically and we're in Live mode,
+  // return a synthetic online XUID (0x0009... prefix). Games use the high word to
+  // decide whether the user has an Xbox Live account; an offline 0xB13E... XUID
+  // causes the game to hide the Xbox Live option and only show System Link.
+  if ((flags & X_USER_GET_SIGNIN_INFO_ONLINE_XUID_ONLY) && REXCVAR_GET(xlive_web_enabled)) {
+    xuid = MakeSyntheticOnlineXuid(xuid);
+  }
+  info->xuid = xuid;
+
   uint32_t state = user_profile->signin_state();
   if (REXCVAR_GET(xlive_web_enabled) && state == 1) state = 2;
   info->signin_state = state;
-  info->info_flags = XUSER_INFO_FLAG_LIVE_ENABLED |
-                     (XONLINE_USER_MEMBERSHIP_TIER_GOLD << 20);
+  // Only LIVE_ENABLED belongs in info_flags. Tier lives in cached_user_flags
+  // (returned separately via XamUserGetCachedUserFlags / XamUserGetUserFlags).
+  info->info_flags = REXCVAR_GET(xlive_web_enabled) ? XUSER_INFO_FLAG_LIVE_ENABLED : 0u;
   rex::string::copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
   REXKRNL_INFO("XamUserGetSigninInfo: user={} flags={:08X} -> state={} xuid={:016X} name='{}'",
-               (uint32_t)user_index, (uint32_t)flags, state,
-               (uint64_t)info->xuid, info->name);
+               (uint32_t)user_index, (uint32_t)flags, state, xuid, info->name);
   return X_E_SUCCESS;
 }
 
@@ -400,10 +421,15 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
     }
   }
 
-  REXKRNL_INFO("XamUserCheckPrivilege: user={} mask={:08X} -> {}",
-               (uint32_t)user_index, (uint32_t)mask,
-               REXCVAR_GET(xlive_web_enabled) ? 1 : 0);
-  *out_value = REXCVAR_GET(xlive_web_enabled) ? 1 : 0;
+  if (!REXCVAR_GET(xlive_web_enabled)) {
+    REXKRNL_INFO("XamUserCheckPrivilege: user={} mask={:08X} -> NOT_LOGGED_ON",
+                 (uint32_t)user_index, (uint32_t)mask);
+    *out_value = 0;
+    return X_ERROR_NOT_LOGGED_ON;
+  }
+  REXKRNL_INFO("XamUserCheckPrivilege: user={} mask={:08X} -> 1 (allowed)",
+               (uint32_t)user_index, (uint32_t)mask);
+  *out_value = 1;
   return X_ERROR_SUCCESS;
 }
 
@@ -443,8 +469,9 @@ u32 XamUserContentRestrictionCheckAccess_entry(u32 user_index, u32 unk1, u32 unk
 }
 
 u32 XamUserIsOnlineEnabled_entry(u32 user_index) {
-  REXKRNL_INFO("XamUserIsOnlineEnabled: user={} -> 1", (uint32_t)user_index);
-  return 1;
+  uint32_t result = REXCVAR_GET(xlive_web_enabled) ? 1u : 0u;
+  REXKRNL_INFO("XamUserIsOnlineEnabled: user={} -> {}", (uint32_t)user_index, result);
+  return result;
 }
 
 static uint32_t GetUserOnlineFlags() {
