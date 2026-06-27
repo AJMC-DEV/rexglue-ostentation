@@ -10,8 +10,15 @@
  */
 
 #include <rex/kernel/xam/apps/xgi_app.h>
+#include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/system/xlive_web_client.h>
+#include <rex/system/xsession.h>
 #include <rex/thread.h>
+
+REXCVAR_DECLARE(bool,    xlive_web_enabled);
+REXCVAR_DECLARE(int32_t, systemlink_base_port);
+REXCVAR_DECLARE(int32_t, systemlink_port_offset);
 
 namespace rex {
 namespace kernel {
@@ -29,6 +36,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                       uint32_t buffer_length) {
   // NOTE: buffer_length may be zero or valid.
   auto buffer = memory_->TranslateVirtual(buffer_ptr);
+  REXKRNL_INFO("XGI dispatch: msg={:08X} buffer_ptr={:08X} buffer_length={}", message, buffer_ptr, buffer_length);
   switch (message) {
     case 0x000B0006: {
       assert_true(!buffer_length || buffer_length == 24);
@@ -94,37 +102,87 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B0010: {
-      assert_true(!buffer_length || buffer_length == 28);
-      // Sequence:
-      // - XamSessionCreateHandle
-      // - XamSessionRefObjByHandle
-      // - [this]
-      // - CloseHandle
-      uint32_t session_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t flags = memory::load_and_swap<uint32_t>(buffer + 4);
-      uint32_t num_slots_public = memory::load_and_swap<uint32_t>(buffer + 8);
-      uint32_t num_slots_private = memory::load_and_swap<uint32_t>(buffer + 12);
-      uint32_t user_xuid = memory::load_and_swap<uint32_t>(buffer + 16);
-      uint32_t session_info_ptr = memory::load_and_swap<uint32_t>(buffer + 20);
-      uint32_t nonce_ptr = memory::load_and_swap<uint32_t>(buffer + 24);
+      REXKRNL_INFO("XGISessionCreateImpl: buffer_length={} buffer_ptr={:08X}",
+                   buffer_length, buffer_ptr);
+      if (buffer_length && buffer_length != 28) {
+        REXKRNL_WARN("XGISessionCreateImpl: unexpected buffer_length={}", buffer_length);
+      }
+      if (buffer_length < 0x1C) {
+        REXKRNL_ERROR("XGISessionCreateImpl: buffer too small ({}), returning early", buffer_length);
+        return X_E_SUCCESS;
+      }
+      uint32_t session_ptr      = memory::load_and_swap<uint32_t>(buffer + 0x0);
+      uint32_t flags            = memory::load_and_swap<uint32_t>(buffer + 0x4);
+      uint32_t num_slots_public = memory::load_and_swap<uint32_t>(buffer + 0x8);
+      uint32_t num_slots_private= memory::load_and_swap<uint32_t>(buffer + 0xC);
+      uint32_t user_xuid_lo     = memory::load_and_swap<uint32_t>(buffer + 0x10);
+      uint32_t session_info_ptr = memory::load_and_swap<uint32_t>(buffer + 0x14);
+      uint32_t nonce_ptr        = memory::load_and_swap<uint32_t>(buffer + 0x18);
 
       REXKRNL_DEBUG(
-          "XGISessionCreateImpl({:08X}, {:08X}, {}, {}, {:08X}, {:08X}, "
-          "{:08X})",
-          session_ptr, flags, num_slots_public, num_slots_private, user_xuid, session_info_ptr,
-          nonce_ptr);
+          "XGISessionCreateImpl({:08X}, {:08X}, {}, {}, {:08X}, {:08X}, {:08X})",
+          session_ptr, flags, num_slots_public, num_slots_private,
+          user_xuid_lo, session_info_ptr, nonce_ptr);
+
+      if (session_info_ptr && REXCVAR_GET(xlive_web_enabled)) {
+        REXKRNL_INFO("XGISessionCreateImpl: web enabled, EnsureReady...");
+        auto& wc = system::XLiveWebClient::Get();
+        wc.EnsureReady();
+        REXKRNL_INFO("XGISessionCreateImpl: wc.is_ready()={}", wc.is_ready());
+        if (!wc.is_ready()) {
+          REXKRNL_ERROR("XGISessionCreateImpl: web client not ready, skipping web session");
+          return X_E_SUCCESS;
+        }
+
+        uint64_t host_xuid = kernel_state_->user_profile()->xuid();
+        uint16_t port = static_cast<uint16_t>(
+            REXCVAR_GET(systemlink_base_port) + REXCVAR_GET(systemlink_port_offset));
+        REXKRNL_INFO("XGISessionCreateImpl: host_xuid={:016X} port={} public_ip={}",
+                     host_xuid, port, wc.public_address());
+
+        auto& session = system::GetActiveSession();
+        session.CreateHostSession(host_xuid, flags, num_slots_public, num_slots_private,
+                                  wc.public_address_net(), port);
+        REXKRNL_INFO("XGISessionCreateImpl: local session created");
+
+        system::WebSession ws_info;
+        ws_info.host_xuid     = host_xuid;
+        ws_info.slots_public  = num_slots_public;
+        ws_info.slots_private = num_slots_private;
+        ws_info.port          = port;
+        ws_info.host_address  = wc.public_address();
+        REXKRNL_INFO("XGISessionCreateImpl: calling wc.CreateSession title_id={:08X}",
+                     kernel_state_->title_id());
+        std::string web_id;
+        bool create_ok = wc.CreateSession(kernel_state_->title_id(), ws_info, web_id);
+        REXKRNL_INFO("XGISessionCreateImpl: CreateSession ok={} web_id='{}'", create_ok, web_id);
+        if (create_ok && !web_id.empty()) {
+          session.set_web_session_id(web_id);
+        }
+
+        auto* info_raw = memory_->TranslateVirtual(session_info_ptr);
+        REXKRNL_INFO("XGISessionCreateImpl: info_raw={} session_info_ptr={:08X}",
+                     (void*)info_raw, session_info_ptr);
+        if (info_raw) {
+          const auto& si = session.session_info();
+          std::memcpy(info_raw, &si, sizeof(system::XSESSION_INFO));
+          REXKRNL_INFO("XGISessionCreateImpl: XSESSION_INFO written ({} bytes)",
+                       sizeof(system::XSESSION_INFO));
+        }
+      }
       return X_E_SUCCESS;
     }
     case 0x000B0011: {
-      assert_true(!buffer_length || buffer_length == 16);
-
-      uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t flags = memory::load_and_swap<uint32_t>(buffer + 4);
-      uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
-
-      REXKRNL_DEBUG("XGISessionDelete({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
-
-      return X_E_SUCCESS;
+      REXKRNL_INFO("XGISessionDelete");
+      if (REXCVAR_GET(xlive_web_enabled)) {
+        auto& session = system::GetActiveSession();
+        if (!session.web_session_id().empty()) {
+          system::XLiveWebClient::Get().DeleteSession(kernel_state_->title_id(),
+                                                      session.web_session_id());
+        }
+        session.Destroy();
+      }
+      return X_STATUS_SUCCESS;
     }
     case 0x000B0012: {
       assert_true(!buffer_length || buffer_length == 20);
@@ -135,8 +193,8 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t private_slots_array = memory::load_and_swap<uint32_t>(buffer + 16);
 
       assert_zero(unk_0);
-      REXKRNL_DEBUG("XGISessionJoinLocal({:08X}, {}, {}, {:08X}, {:08X})", session_ptr, user_count,
-                    unk_0, user_index_array, private_slots_array);
+      REXKRNL_INFO("XGISessionJoinLocal({:08X}, {}, {}, {:08X}, {:08X})", session_ptr, user_count,
+                   unk_0, user_index_array, private_slots_array);
       return X_E_SUCCESS;
     }
     case 0x000B0014: {
@@ -385,8 +443,8 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t context_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
       auto context = context_ptr ? memory_->TranslateVirtual(context_ptr) : nullptr;
       uint32_t context_id = context ? memory::load_and_swap<uint32_t>(context + 0) : 0;
-      REXKRNL_DEBUG("XGIUserGetContext({:08X}, {:08X}, {:08X}))", user_index, context_ptr,
-                    context_id);
+      REXKRNL_INFO("XGIUserGetContext({:08X}, {:08X}, {:08X}))", user_index, context_ptr,
+                   context_id);
       uint32_t value = 0;
       if (context) {
         memory::store_and_swap<uint32_t>(context + 4, value);
@@ -441,7 +499,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B0071: {
-      REXKRNL_DEBUG("XGI 0x000B0071, unimplemented");
+      REXKRNL_INFO("XGI 0x000B0071");
       return X_E_SUCCESS;
     }
   }

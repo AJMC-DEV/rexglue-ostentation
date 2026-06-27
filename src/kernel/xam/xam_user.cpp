@@ -15,6 +15,9 @@
 #include <cstring>
 
 #include <rex/cvar.h>
+
+REXCVAR_DECLARE(bool, xlive_web_enabled);
+
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -71,14 +74,22 @@ u32 XamUserGetSigninState_entry(u32 user_index) {
     if (user_index == 0) {
       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
       signin_state = user_profile->signin_state();
+      if (REXCVAR_GET(xlive_web_enabled) && signin_state == 1) {
+        signin_state = 2;
+      }
     }
   }
+  REXKRNL_INFO("XamUserGetSigninState: user={} -> {}", (uint32_t)user_index, signin_state);
   return signin_state;
 }
 
+#define XONLINE_USER_MEMBERSHIP_TIER_GOLD 2
+#define XONLINE_USER_MEMBERSHIP_TIER_MASK 0x00F00000
+#define XUSER_INFO_FLAG_LIVE_ENABLED      0x00000001
+
 typedef struct {
   rex::be<uint64_t> xuid;
-  rex::be<uint32_t> unk08;  // maybe zero?
+  rex::be<uint32_t> info_flags;
   rex::be<uint32_t> signin_state;
   rex::be<uint32_t> unk10;  // ?
   rex::be<uint32_t> unk14;  // ?
@@ -98,8 +109,15 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   info->xuid = user_profile->xuid();
-  info->signin_state = user_profile->signin_state();
+  uint32_t state = user_profile->signin_state();
+  if (REXCVAR_GET(xlive_web_enabled) && state == 1) state = 2;
+  info->signin_state = state;
+  info->info_flags = XUSER_INFO_FLAG_LIVE_ENABLED |
+                     (XONLINE_USER_MEMBERSHIP_TIER_GOLD << 20);
   rex::string::copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
+  REXKRNL_INFO("XamUserGetSigninInfo: user={} flags={:08X} -> state={} xuid={:016X} name='{}'",
+               (uint32_t)user_index, (uint32_t)flags, state,
+               (uint64_t)info->xuid, info->name);
   return X_E_SUCCESS;
 }
 
@@ -382,8 +400,10 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
     }
   }
 
-  // If we deny everything, games should hopefully not try to do stuff.
-  *out_value = 0;
+  REXKRNL_INFO("XamUserCheckPrivilege: user={} mask={:08X} -> {}",
+               (uint32_t)user_index, (uint32_t)mask,
+               REXCVAR_GET(xlive_web_enabled) ? 1 : 0);
+  *out_value = REXCVAR_GET(xlive_web_enabled) ? 1 : 0;
   return X_ERROR_SUCCESS;
 }
 
@@ -423,7 +443,38 @@ u32 XamUserContentRestrictionCheckAccess_entry(u32 user_index, u32 unk1, u32 unk
 }
 
 u32 XamUserIsOnlineEnabled_entry(u32 user_index) {
+  REXKRNL_INFO("XamUserIsOnlineEnabled: user={} -> 1", (uint32_t)user_index);
   return 1;
+}
+
+static uint32_t GetUserOnlineFlags() {
+  return static_cast<uint32_t>(XONLINE_USER_MEMBERSHIP_TIER_GOLD) << 20;
+}
+
+u32 XamUserGetCachedUserFlags_entry(u32 user_index) {
+  uint32_t flags = (user_index == 0) ? GetUserOnlineFlags() : 0;
+  REXKRNL_INFO("XamUserGetCachedUserFlags: user={} -> {:08X}", (uint32_t)user_index, flags);
+  return flags;
+}
+
+u32 XamUserGetUserFlags_entry(u32 user_index) {
+  uint32_t flags = (user_index == 0) ? GetUserOnlineFlags() : 0;
+  REXKRNL_INFO("XamUserGetUserFlags: user={} -> {:08X}", (uint32_t)user_index, flags);
+  return flags;
+}
+
+u32 XamUserGetUserFlagsFromXUID_entry(u64 xuid) {
+  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+  uint32_t flags = (user_profile->xuid() == (uint64_t)xuid) ? GetUserOnlineFlags() : 0;
+  REXKRNL_INFO("XamUserGetUserFlagsFromXUID: xuid={:016X} -> {:08X}", (uint64_t)xuid, flags);
+  return flags;
+}
+
+u32 XamUserGetMembershipTierFromXUID_entry(u64 xuid) {
+  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+  uint32_t tier = (user_profile->xuid() == (uint64_t)xuid) ? XONLINE_USER_MEMBERSHIP_TIER_GOLD : 0;
+  REXKRNL_INFO("XamUserGetMembershipTierFromXUID: xuid={:016X} -> {}", (uint64_t)xuid, tier);
+  return tier;
 }
 
 u32 XamUserGetMembershipTier_entry(u32 user_index) {
@@ -433,7 +484,8 @@ u32 XamUserGetMembershipTier_entry(u32 user_index) {
   if (user_index) {
     return X_ERROR_NO_SUCH_USER;
   }
-  return 6 /* 6 appears to be Gold */;
+  REXKRNL_INFO("XamUserGetMembershipTier: user={} -> 6 (Gold)", (uint32_t)user_index);
+  return 6; /* 6 appears to be Gold */
 }
 
 u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 out_value,
@@ -766,18 +818,18 @@ REX_EXPORT_STUB(__imp__XamUserCreateTitlesPlayedEnumerator);
 REX_EXPORT_STUB(__imp__XamUserFlushLogonQueue);
 REX_EXPORT_STUB(__imp__XamUserGetAge);
 REX_EXPORT_STUB(__imp__XamUserGetAgeGroup);
-REX_EXPORT_STUB(__imp__XamUserGetCachedUserFlags);
+REX_EXPORT(__imp__XamUserGetCachedUserFlags, rex::kernel::xam::XamUserGetCachedUserFlags_entry);
 REX_EXPORT_STUB(__imp__XamUserGetDeviceId);
 REX_EXPORT_STUB(__imp__XamUserGetIndexFromXUID);
-REX_EXPORT_STUB(__imp__XamUserGetMembershipTierFromXUID);
+REX_EXPORT(__imp__XamUserGetMembershipTierFromXUID, rex::kernel::xam::XamUserGetMembershipTierFromXUID_entry);
 REX_EXPORT_STUB(__imp__XamUserGetOnlineCountryFromXUID);
 REX_EXPORT_STUB(__imp__XamUserGetOnlineLanguageFromXUID);
 REX_EXPORT_STUB(__imp__XamUserGetOnlineXUIDFromOfflineXUID);
 REX_EXPORT_STUB(__imp__XamUserGetReportingInfo);
 REX_EXPORT_STUB(__imp__XamUserGetRequestedUserIndexMask);
 REX_EXPORT_STUB(__imp__XamUserGetSubscriptionType);
-REX_EXPORT_STUB(__imp__XamUserGetUserFlags);
-REX_EXPORT_STUB(__imp__XamUserGetUserFlagsFromXUID);
+REX_EXPORT(__imp__XamUserGetUserFlags, rex::kernel::xam::XamUserGetUserFlags_entry);
+REX_EXPORT(__imp__XamUserGetUserFlagsFromXUID, rex::kernel::xam::XamUserGetUserFlagsFromXUID_entry);
 REX_EXPORT_STUB(__imp__XamUserGetUserIndexMask);
 REX_EXPORT_STUB(__imp__XamUserGetUserTenure);
 REX_EXPORT_STUB(__imp__XamUserGetUsersMissingAvatars);

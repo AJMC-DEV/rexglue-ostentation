@@ -13,8 +13,10 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <cstring>
+#include <random>
 
 #include <rex/chrono/clock.h>
+#include <rex/cvar.h>
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/kernel/xboxkrnl/error.h>
@@ -25,9 +27,21 @@
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xevent.h>
+#include <rex/system/xlive_web_client.h>
+#include <rex/system/xsession.h>
 #include <rex/system/xsocket.h>
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
+
+REXCVAR_DECLARE(bool,        xlive_web_enabled);
+REXCVAR_DECLARE(int32_t,     systemlink_base_port);
+REXCVAR_DECLARE(int32_t,     systemlink_port_offset);
+REXCVAR_DECLARE(int32_t,     xlive_web_qos_rtt_min_ms);
+REXCVAR_DECLARE(int32_t,     xlive_web_qos_rtt_median_ms);
+REXCVAR_DECLARE(int32_t,     xlive_web_qos_up_bits_per_second);
+REXCVAR_DECLARE(int32_t,     xlive_web_qos_down_bits_per_second);
+REXCVAR_DECLARE(std::string, user_xuid);
+REXCVAR_DECLARE(bool,        xlive_web_bridge_loopback_same_public_ip);
 
 #if REX_PLATFORM_WIN32
 // NOTE: must be included last as it expects windows.h to already be included.
@@ -432,64 +446,116 @@ struct XnAddrStatus {
 };
 
 u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
-  // Just return a loopback address atm.
-  addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
+  REXKRNL_INFO("XNetGetTitleXnAddr: caller={:08X}", (uint32_t)caller);
+
+  if (REXCVAR_GET(xlive_web_enabled)) {
+    auto& wc = rex::system::XLiveWebClient::Get();
+    wc.EnsureReady();
+    if (wc.is_ready()) {
+      uint32_t pub_net = wc.public_address_net();
+      addr_ptr->ina.s_addr       = htonl(INADDR_LOOPBACK);
+      addr_ptr->inaOnline.s_addr = pub_net;
+      addr_ptr->wPortOnline      = htons(static_cast<uint16_t>(
+          REXCVAR_GET(systemlink_base_port) + REXCVAR_GET(systemlink_port_offset)));
+      auto xuid_str = REXCVAR_GET(user_xuid);
+      uint64_t xuid = xuid_str.empty() ? 0xB13EBABEBABEBEBULL
+                                       : std::stoull(xuid_str, nullptr, 16);
+      for (int i = 0; i < 6; ++i)
+        addr_ptr->abEnet[i] = static_cast<uint8_t>(xuid >> (i * 8));
+      std::memset(addr_ptr->abOnline, 0, 20);
+      REXKRNL_INFO("XNetGetTitleXnAddr: -> ETHERNET|STATIC|ONLINE inaOnline={:08X} port={}",
+                   ntohl(pub_net), ntohs(addr_ptr->wPortOnline));
+      return XnAddrStatus::XNET_GET_XNADDR_ETHERNET | XnAddrStatus::XNET_GET_XNADDR_STATIC | XnAddrStatus::XNET_GET_XNADDR_ONLINE;
+    }
+  }
+
+  addr_ptr->ina.s_addr       = htonl(INADDR_LOOPBACK);
   addr_ptr->inaOnline.s_addr = 0;
-  addr_ptr->wPortOnline = 0;
-
-  // TODO(gibbed): A proper mac address.
-  // RakNet's 360 version appears to depend on abEnet to create "random" 64-bit
-  // numbers. A zero value will cause RakPeer::Startup to fail. This causes
-  // 58411436 to crash on startup.
-  // The 360-specific code is scrubbed from the RakNet repo, but there's still
-  // traces of what it's doing which match the game code.
-  // https://github.com/facebookarchive/RakNet/blob/master/Source/RakPeer.cpp#L382
-  // https://github.com/facebookarchive/RakNet/blob/master/Source/RakPeer.cpp#L4527
-  // https://github.com/facebookarchive/RakNet/blob/master/Source/RakPeer.cpp#L4467
-  // "Mac address is a poor solution because you can't have multiple connections
-  // from the same system"
+  addr_ptr->wPortOnline      = 0;
   std::memset(addr_ptr->abEnet, 0xCC, 6);
-
   std::memset(addr_ptr->abOnline, 0, 20);
-
+  REXKRNL_INFO("XNetGetTitleXnAddr: -> STATIC (fallback/loopback)");
   return XnAddrStatus::XNET_GET_XNADDR_STATIC;
 }
 
 u32 NetDll_XNetGetDebugXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
+  REXKRNL_INFO("XNetGetDebugXnAddr: -> NONE");
   addr_ptr.Zero();
-
-  // XNET_GET_XNADDR_NONE causes caller to gracefully return.
   return XnAddrStatus::XNET_GET_XNADDR_NONE;
 }
 
 u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, mapped_u32 id_ptr) {
-  // Tell the caller we're not signed in to live (non-zero ret)
+  REXKRNL_INFO("XNetXnAddrToMachineId: -> 1");
   return 1;
 }
 
 void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string string_out,
                                      u32 string_size) {
+  REXKRNL_INFO("XNetInAddrToString: in_addr={:08X}", (uint32_t)in_addr);
   rex::string::copy_truncating(string_out, "666.666.666.666", string_size);
 }
 
 // This converts a XNet address to an IN_ADDR. The IN_ADDR is used for
 // subsequent socket calls (like a handle to a XNet address)
 u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mapped_void xid,
-                                    mapped_void in_addr) {
-  return 1;
+                                    mapped_void in_addr_out) {
+  using namespace rex::system;
+  REXKRNL_INFO("XNetXnAddrToInAddr: xn_addr={:08X} xid={:08X}",
+               xn_addr.guest_address(), xid.guest_address());
+
+  if (!xn_addr || !in_addr_out) return 1;
+
+  rex::system::XNADDR addr{};
+  addr.ina         = xn_addr->ina.s_addr;
+  addr.inaOnline   = xn_addr->inaOnline.s_addr;
+  addr.wPortOnline = static_cast<uint16_t>(xn_addr->wPortOnline);
+  std::memcpy(addr.abEnet, xn_addr->abEnet, 6);
+  std::memcpy(addr.abOnline, xn_addr->abOnline, 20);
+
+  XNKID kid{};
+  if (xid) std::memcpy(kid.ab, xid, 8);
+
+  if (REXCVAR_GET(xlive_web_bridge_loopback_same_public_ip)) {
+    auto& wc = XLiveWebClient::Get();
+    if (wc.is_ready() && addr.inaOnline == wc.public_address_net())
+      addr.ina = htonl(INADDR_LOOPBACK);
+  }
+
+  uint32_t token = XNetAddrCache::Get().Store(addr, kid);
+  uint8_t* out_ptr = static_cast<uint8_t*>(static_cast<void*>(in_addr_out));
+  memory::store_and_swap<uint32_t>(out_ptr, token);
+  return 0;
 }
 
 // Does the reverse of the above.
-// FIXME: Arguments may not be correct.
-u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, mapped_void in_addr, ppc_ptr_t<XNADDR> xn_addr,
-                                    mapped_void xid) {
-  return 1;
+u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, mapped_void in_addr, ppc_ptr_t<XNADDR> xn_addr_out,
+                                    mapped_void xid_out) {
+  using namespace rex::system;
+  REXKRNL_INFO("XNetInAddrToXnAddr: in_addr={:08X}", in_addr.guest_address());
+  if (!in_addr || !xn_addr_out) return 1;
+
+  uint32_t token = memory::load_and_swap<uint32_t>(
+      static_cast<uint8_t*>(static_cast<void*>(in_addr)));
+  XNetAddrEntry entry;
+  if (!XNetAddrCache::Get().Lookup(token, entry)) return 1;
+
+  xn_addr_out->ina.s_addr       = entry.xn_addr.ina;
+  xn_addr_out->inaOnline.s_addr = entry.xn_addr.inaOnline;
+  xn_addr_out->wPortOnline      = entry.xn_addr.wPortOnline;
+  std::memcpy(xn_addr_out->abEnet, entry.xn_addr.abEnet, 6);
+  std::memcpy(xn_addr_out->abOnline, entry.xn_addr.abOnline, 20);
+  if (xid_out) std::memcpy(xid_out, entry.xn_kid.ab, 8);
+  return 0;
 }
 
 // https://www.google.com/patents/WO2008112448A1?cl=en
 // Reserves a port for use by system link
+static uint16_t g_system_link_port = 0;
+
 u32 NetDll_XNetSetSystemLinkPort_entry(u32 caller, u32 port) {
-  return 1;
+  g_system_link_port = static_cast<uint16_t>(port);
+  REXKRNL_INFO("XNetSetSystemLinkPort: port={}", port);
+  return 0;
 }
 
 // https://github.com/ILOVEPIE/Cxbx-Reloaded/blob/master/src/CxbxKrnl/EmuXOnline.h#L39
@@ -502,10 +568,13 @@ struct XEthernetStatus {
 };
 
 u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
-  return 0;
+  uint32_t status = REXCVAR_GET(xlive_web_enabled) ? 0x0Bu : 0u;
+  REXKRNL_INFO("XNetGetEthernetLinkStatus -> {:02X}", status);
+  return status;
 }
 
 u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle, mapped_u32 pdns) {
+  REXKRNL_INFO("XNetDnsLookup: host='{}'", host ? host.value() : std::string("null"));
   // TODO(gibbed): actually implement this
   if (pdns) {
     auto dns_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(XNDNS));
@@ -530,6 +599,7 @@ u32 NetDll_XNetDnsRelease_entry(u32 caller, ppc_ptr_t<XNDNS> dns) {
 }
 
 u32 NetDll_XNetQosServiceLookup_entry(u32 caller, u32 flags, u32 event_handle, mapped_u32 pqos) {
+  REXKRNL_INFO("XNetQosServiceLookup: flags={:08X}", (uint32_t)flags);
   // Set pqos as some games will try accessing it despite non-successful result
   if (pqos) {
     auto qos_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(XNQOS));
@@ -555,7 +625,10 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
 
 u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32 data_size, u32 r7,
                                u32 flags) {
-  return X_ERROR_FUNCTION_FAILED;
+  REXKRNL_INFO("XNetQosListen: id={:08X} data_size={} flags={:08X}",
+               id.guest_address(), (uint32_t)data_size, (uint32_t)flags);
+  if (!REXCVAR_GET(xlive_web_enabled)) return 0;
+  return 0;
 }
 
 u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
@@ -929,6 +1002,91 @@ void NetDll_WSASetLastError_entry(u32 error_code) {
   XThread::SetLastError(error_code);
 }
 
+// ---------------------------------------------------------------------------
+// XNet key management
+// ---------------------------------------------------------------------------
+
+u32 NetDll_XNetCreateKey_entry(u32 caller, mapped_void xnkid_ptr, mapped_void xnkey_ptr) {
+  using namespace rex::system;
+  if (!xnkid_ptr || !xnkey_ptr) return 1;
+
+  auto xuid_str = REXCVAR_GET(user_xuid);
+  uint64_t xuid = xuid_str.empty() ? 0xB13EBABEBABEBABE
+                                   : std::stoull(xuid_str, nullptr, 16);
+
+  std::random_device rd;
+  uint64_t nonce = (static_cast<uint64_t>(rd()) << 32) | rd();
+
+  XNKID kid;
+  XNKEY key;
+  XNetKeyRegistry::GenerateKey(xuid, nonce, kid, key);
+  std::memcpy(xnkid_ptr, kid.ab, 8);
+  std::memcpy(xnkey_ptr, key.ab, 16);
+  REXKRNL_INFO("XNetCreateKey: generated XNKID {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+               kid.ab[0], kid.ab[1], kid.ab[2], kid.ab[3],
+               kid.ab[4], kid.ab[5], kid.ab[6], kid.ab[7]);
+  return 0;
+}
+
+u32 NetDll_XNetRegisterKey_entry(u32 caller, mapped_void xnkid_ptr, mapped_void xnkey_ptr) {
+  using namespace rex::system;
+  if (!xnkid_ptr) return 1;
+  XNKID kid;
+  XNKEY key{};
+  std::memcpy(kid.ab, xnkid_ptr, 8);
+  if (xnkey_ptr) std::memcpy(key.ab, xnkey_ptr, 16);
+  XNetKeyRegistry::Get().Register(kid, key);
+  REXKRNL_INFO("XNetRegisterKey: XNKID {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+               kid.ab[0], kid.ab[1], kid.ab[2], kid.ab[3],
+               kid.ab[4], kid.ab[5], kid.ab[6], kid.ab[7]);
+  return 0;
+}
+
+u32 NetDll_XNetUnregisterKey_entry(u32 caller, mapped_void xnkid_ptr) {
+  using namespace rex::system;
+  if (!xnkid_ptr) return 1;
+  XNKID kid;
+  std::memcpy(kid.ab, xnkid_ptr, 8);
+  REXKRNL_INFO("XNetUnregisterKey: XNKID {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+               kid.ab[0], kid.ab[1], kid.ab[2], kid.ab[3],
+               kid.ab[4], kid.ab[5], kid.ab[6], kid.ab[7]);
+  XNetKeyRegistry::Get().Unregister(kid);
+  return 0;
+}
+
+u32 NetDll_XNetQosLookup_entry(u32 caller, u32 num, mapped_void xnaddr_array,
+                               mapped_void xnkid_array, mapped_void xnkey_array,
+                               mapped_void xndata_array, mapped_void xndata_size_array,
+                               u32 flags, u32 event_handle, mapped_u32 pqos) {
+  REXKRNL_INFO("XNetQosLookup: num={} flags={:08X}", (uint32_t)num, (uint32_t)flags);
+  if (pqos) {
+    size_t alloc_size = sizeof(XNQOS) + sizeof(XNQOSINFO) * (num > 1 ? num - 1 : 0);
+    auto qos_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(static_cast<uint32_t>(alloc_size));
+    auto qos = REX_KERNEL_MEMORY()->TranslateVirtual<XNQOS*>(qos_guest);
+    qos->count         = num;
+    qos->count_pending = 0;
+    for (uint32_t i = 0; i < num; ++i) {
+      auto& info            = qos->info[i];
+      info.flags            = 0x07;
+      info.reserved         = 0;
+      info.probes_xmit      = 4;
+      info.probes_recv      = 4;
+      info.data_len         = 0;
+      info.data_ptr         = 0;
+      info.rtt_min_in_msecs = static_cast<uint16_t>(REXCVAR_GET(xlive_web_qos_rtt_min_ms));
+      info.rtt_med_in_msecs = static_cast<uint16_t>(REXCVAR_GET(xlive_web_qos_rtt_median_ms));
+      info.up_bits_per_sec  = static_cast<uint32_t>(REXCVAR_GET(xlive_web_qos_up_bits_per_second));
+      info.down_bits_per_sec= static_cast<uint32_t>(REXCVAR_GET(xlive_web_qos_down_bits_per_second));
+    }
+    *pqos = qos_guest;
+  }
+  if (event_handle) {
+    auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
+    if (ev) ev->Set(0, false);
+  }
+  return 0;
+}
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace rex
@@ -1027,7 +1185,10 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
 REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
 REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
 REX_EXPORT_STUB(__imp__NetDll_XNetConnect);
-REX_EXPORT_STUB(__imp__NetDll_XNetCreateKey);
+REX_EXPORT(__imp__NetDll_XNetCreateKey,     rex::kernel::xam::NetDll_XNetCreateKey_entry)
+REX_EXPORT(__imp__NetDll_XNetRegisterKey,   rex::kernel::xam::NetDll_XNetRegisterKey_entry)
+REX_EXPORT(__imp__NetDll_XNetUnregisterKey, rex::kernel::xam::NetDll_XNetUnregisterKey_entry)
+REX_EXPORT(__imp__NetDll_XNetQosLookup,     rex::kernel::xam::NetDll_XNetQosLookup_entry)
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseLookup);
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseRelease);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetBroadcastVersionStatus);
@@ -1036,15 +1197,12 @@ REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
 REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
 REX_EXPORT_STUB(__imp__NetDll_XNetQosGetListenStats);
-REX_EXPORT_STUB(__imp__NetDll_XNetQosLookup);
-REX_EXPORT_STUB(__imp__NetDll_XNetRegisterKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetReplaceKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetServerToInAddr);
 REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
 REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
 REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
 REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
-REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterKey);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);

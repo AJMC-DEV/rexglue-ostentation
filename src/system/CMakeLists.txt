@@ -21,6 +21,9 @@ set(REXSYSTEM_SOURCES
     xobject.cpp
     xmodule.cpp
     guest_path.cpp
+    xlive_flags.cpp
+    xlive_web_client.cpp
+    xsession.cpp
 
     # Utilities
     util/object_table.cpp
@@ -95,7 +98,7 @@ if(REXGLUE_ENABLE_TEXTURES)
 endif()
 
 if(WIN32)
-    target_link_libraries(rexruntime PRIVATE rexdiscord ws2_32)
+    target_link_libraries(rexruntime PRIVATE rexdiscord ws2_32 winhttp)
     target_compile_definitions(rexruntime PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
 elseif(LINUX)
     target_link_libraries(rexruntime PRIVATE rexdiscord)

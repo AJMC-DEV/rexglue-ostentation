@@ -13,9 +13,13 @@
 
 #include <fmt/format.h>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
+
+REXCVAR_DECLARE(std::string, user_xuid);
+REXCVAR_DECLARE(std::string, user_gamertag);
 
 namespace rex {
 namespace system {
@@ -25,8 +29,15 @@ UserProfile::UserProfile() {
   // 58410A1F checks the user XUID against a mask of 0x00C0000000000000 (3<<54),
   // if non-zero, it prevents the user from playing the game.
   // "You do not have permissions to perform this operation."
-  xuid_ = 0xB13EBABEBABEBABE;
-  name_ = "User";
+  const std::string& xuid_str = REXCVAR_GET(user_xuid);
+  if (!xuid_str.empty()) {
+    try { xuid_ = std::stoull(xuid_str, nullptr, 16); } catch (...) { xuid_ = 0xB13EBABEBABEBABE; }
+  } else {
+    xuid_ = 0xB13EBABEBABEBABE;
+  }
+
+  const std::string& gamertag = REXCVAR_GET(user_gamertag);
+  name_ = gamertag.empty() ? "Player" : gamertag;
 
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=gfwl+live&start=195
   // https://github.com/arkem/py360/blob/master/py360/constants.py

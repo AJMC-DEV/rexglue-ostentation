@@ -22,11 +22,15 @@
 #include <rex/runtime.h>
 #include <rex/system/export_resolver.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/xlive_web_client.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/user_module.h>
 #include <rex/system/xmemory.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
+
+REXCVAR_DECLARE(bool, xlive_web_enabled);
+REXCVAR_DECLARE(bool, xlive_web_prune_public_ip_on_shutdown);
 
 REXCVAR_DEFINE_STRING(game_data_root, "", "Runtime", "Override game data path");
 REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
@@ -270,6 +274,10 @@ void Runtime::Shutdown() {
   if (input_system_) {
     input_system_->Shutdown();
     input_system_.reset();
+  }
+  if (REXCVAR_GET(xlive_web_enabled) && REXCVAR_GET(xlive_web_prune_public_ip_on_shutdown)) {
+    system::XLiveWebClient::Get().DeleteStaleSessions(
+        true, system::XLiveWebClient::Get().public_address());
   }
   kernel_state_.reset();
   function_dispatcher_.reset();

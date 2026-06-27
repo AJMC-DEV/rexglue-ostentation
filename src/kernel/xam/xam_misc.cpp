@@ -8,9 +8,37 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <rex/cvar.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
+#include <rex/system/kernel_state.h>
+
+REXCVAR_DECLARE(bool, xlive_web_enabled);
+
+namespace rex {
+namespace kernel {
+namespace xam {
+
+u32 XNetLogonGetUserPrivileges_impl(u32 user_index, u32 privilege_mask, mapped_u32 out_result) {
+  uint32_t mask = static_cast<uint32_t>(privilege_mask);
+  uint32_t result = REXCVAR_GET(xlive_web_enabled) ? mask : 0u;
+  REXKRNL_INFO("XNetLogonGetUserPrivileges: user={} mask={:08X} -> {:08X}",
+               static_cast<uint32_t>(user_index), mask, result);
+  if (out_result) *out_result = result;
+  return 0;
+}
+
+u32 XNetLogonSetTitleID_impl(u32 title_id) {
+  uint32_t kernel_title_id = REX_KERNEL_STATE()->title_id();
+  REXKRNL_INFO("XNetLogonSetTitleID: game={:08X} kernel={:08X}",
+               (uint32_t)title_id, kernel_title_id);
+  return 0;
+}
+
+}  // namespace xam
+}  // namespace kernel
+}  // namespace rex
 
 // kinda gross but oh well
 REX_EXPORT_STUB(__imp__CancelWaitableTimer);
@@ -245,11 +273,11 @@ REX_EXPORT_STUB(__imp__XNetLogonGetState);
 REX_EXPORT_STUB(__imp__XNetLogonGetTicketOpt);
 REX_EXPORT_STUB(__imp__XNetLogonGetTitleID);
 REX_EXPORT_STUB(__imp__XNetLogonGetTitleVersion);
-REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
+REX_EXPORT(__imp__XNetLogonGetUserPrivileges, rex::kernel::xam::XNetLogonGetUserPrivileges_impl);
 REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 REX_EXPORT_STUB(__imp__XNetLogonSetConsoleCertificate);
 REX_EXPORT_STUB(__imp__XNetLogonSetTicketOpt);
-REX_EXPORT_STUB(__imp__XNetLogonSetTitleID);
+REX_EXPORT(__imp__XNetLogonSetTitleID, rex::kernel::xam::XNetLogonSetTitleID_impl);
 REX_EXPORT_STUB(__imp__XNetLogonTaskClose);
 REX_EXPORT_STUB(__imp__XNetLogonTaskContinue);
 REX_EXPORT_STUB(__imp__XNetLogonTaskStart);
