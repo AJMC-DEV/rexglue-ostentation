@@ -25,6 +25,13 @@
 
 namespace rex::codegen {
 
+/// Global variable definition for guest memory access.
+/// Parsed from [globals] TOML table. Codegen generates accessor macros.
+struct GlobalVariable {
+  std::string name;  ///< Variable name (e.g. "g_TestGlobal")
+  std::string type;  ///< C++ type (e.g. "int32_t", "float", "uint32_t")
+};
+
 struct MidAsmHook {
   std::string name;
   std::vector<std::string> registers;
@@ -102,6 +109,7 @@ struct RecompilerConfig {
   std::unordered_map<uint32_t, FunctionConfig> functions;  ///< Function/chunk configuration
   std::unordered_map<uint32_t, JumpTable> switchTables;
   std::unordered_map<uint32_t, MidAsmHook> midAsmHooks;
+  std::unordered_map<uint32_t, GlobalVariable> globals;
   uint32_t longJmpAddress = 0;
   uint32_t setJmpAddress = 0;
 

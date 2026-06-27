@@ -13,6 +13,10 @@
 
 #include <rex/system/xtypes.h>
 
+namespace rex::input {
+class IRawInput;
+}
+
 namespace rex::system {
 
 class IInputSystem {
@@ -20,6 +24,10 @@ class IInputSystem {
   virtual ~IInputSystem() = default;
   virtual X_STATUS Setup() = 0;
   virtual void Shutdown() = 0;
+
+  /// Get raw keyboard/mouse input interface for direct game access.
+  /// Returns nullptr if no MnK driver is available.
+  virtual rex::input::IRawInput* GetRawInput() const { return nullptr; }
 };
 
 }  // namespace rex::system

@@ -41,12 +41,24 @@ LONG CALLBACK ExceptionHandlerCallback(PEXCEPTION_POINTERS ex_info) {
   }
 
   HostThreadContext thread_context;
+#if defined(_M_X64) || defined(REX_ARCH_AMD64)
   thread_context.rip = ex_info->ContextRecord->Rip;
   thread_context.eflags = ex_info->ContextRecord->EFlags;
   std::memcpy(thread_context.int_registers, &ex_info->ContextRecord->Rax,
               sizeof(thread_context.int_registers));
   std::memcpy(thread_context.xmm_registers, &ex_info->ContextRecord->Xmm0,
               sizeof(thread_context.xmm_registers));
+#elif defined(_M_ARM64) || defined(REX_ARCH_ARM64)
+  // ARM64: Map CONTEXT fields to HostThreadContext (no Pstate field)
+  for (int i = 0; i < 31; ++i) {
+    thread_context.x[i] = ex_info->ContextRecord->X[i];
+  }
+  thread_context.sp = ex_info->ContextRecord->Sp;
+  thread_context.pc = ex_info->ContextRecord->Pc;
+  thread_context.fpsr = ex_info->ContextRecord->Fpsr;
+  thread_context.fpcr = ex_info->ContextRecord->Fpcr;
+  std::memcpy(thread_context.v, ex_info->ContextRecord->V, sizeof(thread_context.v));
+#endif
 
   // https://msdn.microsoft.com/en-us/library/ms679331(v=vs.85).aspx
   // https://msdn.microsoft.com/en-us/library/aa363082(v=vs.85).aspx
@@ -80,6 +92,7 @@ LONG CALLBACK ExceptionHandlerCallback(PEXCEPTION_POINTERS ex_info) {
   for (size_t i = 0; i < rex::countof(handlers_) && handlers_[i].first; ++i) {
     if (handlers_[i].first(&ex, handlers_[i].second)) {
       // Exception handled.
+#if defined(_M_X64) || defined(REX_ARCH_AMD64)
       ex_info->ContextRecord->Rip = thread_context.rip;
       ex_info->ContextRecord->EFlags = thread_context.eflags;
       uint32_t modified_register_index;
@@ -95,6 +108,16 @@ LONG CALLBACK ExceptionHandlerCallback(PEXCEPTION_POINTERS ex_info) {
         std::memcpy(&ex_info->ContextRecord->Xmm0 + modified_register_index,
                     &thread_context.xmm_registers[modified_register_index], sizeof(vec128_t));
       }
+#elif defined(_M_ARM64) || defined(REX_ARCH_ARM64)
+      ex_info->ContextRecord->Pc = thread_context.pc;
+      ex_info->ContextRecord->Sp = thread_context.sp;
+      ex_info->ContextRecord->Fpsr = thread_context.fpsr;
+      ex_info->ContextRecord->Fpcr = thread_context.fpcr;
+      for (int i = 0; i < 31; ++i) {
+        ex_info->ContextRecord->X[i] = thread_context.x[i];
+      }
+      std::memcpy(ex_info->ContextRecord->V, thread_context.v, sizeof(thread_context.v));
+#endif
       return EXCEPTION_CONTINUE_EXECUTION;
     }
   }

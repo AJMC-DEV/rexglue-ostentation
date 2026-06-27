@@ -25,6 +25,11 @@
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
+#ifdef REXGLUE_ENABLE_SHADERS
+#include <rex/ui/overlay/shader_debugger_overlay.h>
+#include <rex/graphics/command_processor.h>
+#include <rex/graphics/graphics_system.h>
+#endif
 #include <rex/audio/audio_system.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
 #include <rex/input/input_system.h>
@@ -239,6 +244,21 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     return false;
   }
 
+#ifdef REXGLUE_ENABLE_SHADERS
+  // Apply the persistent shader blacklist here — after Setup() so the command
+  // processor exists. (SetupPresentation is too early: command_processor() is
+  // null until the guest GPU is wired up by Setup().)
+  if (auto* gs = runtime_->graphics_system()) {
+    if (auto* cp = gs->command_processor()) {
+      auto blacklist = ui::ShaderDebuggerDialog::ReadShaderBlacklistFromToml(
+          std::filesystem::path("shaders.toml"));
+      for (uint64_t hash : blacklist) {
+        cp->AddShaderBlacklist(hash);
+      }
+    }
+  }
+#endif
+
   if (window_ && runtime_->input_system()) {
     static_cast<rex::input::InputSystem*>(runtime_->input_system())->AttachWindow(window_.get());
   }
@@ -251,7 +271,11 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
     if (input_sys) {
       input_sys->SetActiveCallback([this]() {
-        if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_)
+        if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_
+#ifdef REXGLUE_ENABLE_SHADERS
+            && !shader_debugger_overlay_
+#endif
+        )
           return true;
         return !imgui_drawer_->GetIO().WantCaptureMouse;
       });
@@ -352,6 +376,7 @@ bool ReXApp::SetupPresentation() {
   window_->Open();
 
   auto* graphics_system = config_.graphics.get();
+
   if (graphics_system && graphics_system->presenter()) {
     // SDK mode: the emulated-Xenos presenter drives the overlays.
     auto* presenter = graphics_system->presenter();
@@ -385,6 +410,105 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
   // gated eager font upload in SetImmediateDrawer is skipped (font uploads
   // lazily on the first Draw instead).
   imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
+#ifdef REXGLUE_ENABLE_SHADERS
+  rex::ui::RegisterBind("bind_shader_debugger", "F2", "Toggle shader debugger", [this] {
+    if (shader_debugger_overlay_) {
+      shader_debugger_overlay_.reset();
+      UpdateBuiltinOverlayInputMode();
+    } else {
+      auto* gs = runtime_ ? runtime_->graphics_system() : nullptr;
+      if (!gs) return;
+      auto* cp = gs->command_processor();
+      if (!cp) return;
+
+      auto snapshot_provider = [gs]() -> std::vector<ui::ShaderDebuggerEntry> {
+        auto* cp = gs->command_processor();
+        if (!cp) return {};
+        auto raw = cp->GetShaderSnapshot();
+        std::vector<ui::ShaderDebuggerEntry> out;
+        out.reserve(raw.size());
+        for (const auto& s : raw) {
+          ui::ShaderDebuggerEntry e;
+          e.ucode_hash       = s.ucode_hash;
+          e.type             = static_cast<uint32_t>(s.type);
+          e.dword_count      = s.dword_count;
+          e.disabled         = s.disabled;
+          e.active           = s.active;
+          e.profile_total_ns = s.profile_total_ns;
+          e.profile_draw_count = s.profile_draw_count;
+          out.push_back(std::move(e));
+        }
+        return out;
+      };
+
+      auto disable_setter = [gs](uint64_t hash, bool disabled) {
+        if (auto* cp = gs->command_processor()) {
+          cp->SetShaderDisabledByHash(hash, disabled);
+        }
+      };
+
+      auto details_provider = [gs](uint64_t hash) -> ui::ShaderDebuggerDetails {
+        auto* cp = gs->command_processor();
+        if (!cp) return {};
+        auto raw = cp->GetShaderDetails(hash);
+        if (!raw.found) return {};
+        ui::ShaderDebuggerDetails out;
+        out.found = true;
+        out.info.ucode_hash  = raw.info.ucode_hash;
+        out.info.type        = static_cast<uint32_t>(raw.info.type);
+        out.info.dword_count = raw.info.dword_count;
+        out.info.disabled    = raw.info.disabled;
+        out.ucode_disassembly = std::move(raw.ucode_disassembly);
+        out.translations.reserve(raw.translations.size());
+        for (auto& t : raw.translations) {
+          ui::ShaderDebuggerTranslation tr;
+          tr.modification       = t.modification;
+          tr.host_disassembly   = std::move(t.host_disassembly);
+          tr.translated_binary  = std::move(t.translated_binary);
+          tr.is_translated      = t.is_translated;
+          tr.is_valid           = t.is_valid;
+          out.translations.push_back(std::move(tr));
+        }
+        return out;
+      };
+
+      auto binary_replacer = [gs](uint64_t hash, uint64_t mod, std::vector<uint8_t> binary) -> bool {
+        auto* cp = gs->command_processor();
+        if (!cp) return false;
+        return cp->ReplaceShaderTranslationBinary(hash, mod, std::move(binary));
+      };
+
+      auto profiling_toggle = [gs](bool enabled) {
+        if (auto* cp = gs->command_processor()) {
+          cp->SetShaderProfilingEnabled(enabled);
+        }
+      };
+
+      auto profiling_resetter = [gs]() {
+        if (auto* cp = gs->command_processor()) {
+          cp->ResetShaderProfiling();
+        }
+      };
+
+      shader_debugger_overlay_ = std::make_unique<ui::ShaderDebuggerDialog>(
+          imgui_drawer_.get(), std::move(snapshot_provider), std::move(disable_setter),
+          std::move(details_provider), std::move(binary_replacer),
+          std::move(profiling_toggle), std::move(profiling_resetter),
+          std::filesystem::path("shaders.toml"));
+      // When the user closes the shader debugger via its in-window X button
+      // the dialog deletes itself via Close() without going through the F2
+      // callback, so UpdateBuiltinOverlayInputMode() would never be called.
+      // This callback runs just before delete-this; release() the unique_ptr
+      // (no double-free) then restore input mode.
+      shader_debugger_overlay_->SetOnDestroyedCallback([this]() {
+        (void)shader_debugger_overlay_.release();
+        UpdateBuiltinOverlayInputMode();
+      });
+      UpdateBuiltinOverlayInputMode();
+    }
+  });
+#endif
+
   rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
     if (debug_overlay_) {
       debug_overlay_.reset();
@@ -392,6 +516,7 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
       debug_overlay_ =
           std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
     }
+    UpdateBuiltinOverlayInputMode();
   });
   rex::ui::RegisterBind("bind_console", "Backtick", "Toggle console overlay", [this] {
     if (console_overlay_) {
@@ -399,6 +524,7 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
     } else {
       console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
     }
+    UpdateBuiltinOverlayInputMode();
   });
   rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay", [this] {
     if (settings_overlay_) {
@@ -406,6 +532,7 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
     } else {
       settings_overlay_ = std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
     }
+    UpdateBuiltinOverlayInputMode();
   });
   rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
     if (achievements_overlay_) {
@@ -413,6 +540,7 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
     } else {
       achievements_overlay_ = CreateAchievementsOverlay();
     }
+    UpdateBuiltinOverlayInputMode();
   });
 
   OnCreateDialogs(imgui_drawer_.get());
@@ -544,11 +672,33 @@ void ReXApp::OnRestored(ui::UIEvent& e) {
   OnWindowRestored();
 }
 
+void ReXApp::UpdateBuiltinOverlayInputMode() {
+  auto* input_sys = runtime_
+      ? static_cast<rex::input::InputSystem*>(runtime_->input_system())
+      : nullptr;
+  if (!input_sys) return;
+  bool ui_mode = debug_overlay_ || console_overlay_ || settings_overlay_ || achievements_overlay_
+#ifdef REXGLUE_ENABLE_SHADERS
+      || shader_debugger_overlay_
+#endif
+      ;
+  if (ui_mode) {
+    input_sys->SetInputModeUIOnly();
+    input_sys->SetShowMouseCursor(true);
+  } else {
+    input_sys->SetInputModeGame();
+    input_sys->SetShowMouseCursor(false);
+  }
+}
+
 void ReXApp::OnDestroy() {
   // Notify subclass before cleanup
   OnShutdown();
 
   // Unregister overlay keybinds before destroying dialogs
+#ifdef REXGLUE_ENABLE_SHADERS
+  rex::ui::UnregisterBind("bind_shader_debugger");
+#endif
   rex::ui::UnregisterBind("bind_debug_overlay");
   rex::ui::UnregisterBind("bind_console");
   rex::ui::UnregisterBind("bind_settings");
@@ -566,6 +716,9 @@ void ReXApp::OnDestroy() {
   settings_overlay_.reset();
   console_overlay_.reset();
   debug_overlay_.reset();
+#ifdef REXGLUE_ENABLE_SHADERS
+  shader_debugger_overlay_.reset();
+#endif
   if (imgui_drawer_) {
     imgui_drawer_->SetPresenterAndImmediateDrawer(nullptr, nullptr);
     imgui_drawer_.reset();

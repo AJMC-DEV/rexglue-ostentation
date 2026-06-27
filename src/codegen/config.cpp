@@ -369,6 +369,48 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
     }
   }
 
+  // [globals] -- inline table keyed by hex address string
+  // Example: [globals]
+  //          0x82BF4F38 = { name = "g_TestGlobal", type = "int32_t" }
+  if (auto globalsTable = toml["globals"].as_table()) {
+    for (auto& [key, value] : *globalsTable) {
+      auto address_opt = ParseHexAddress(std::string(key.str()));
+      if (!address_opt) {
+        REXCODEGEN_ERROR("[globals] invalid address key: {}", key.str());
+        continue;
+      }
+
+      auto* table = value.as_table();
+      if (!table) {
+        REXCODEGEN_ERROR("[globals] 0x{:08X}: expected table value", *address_opt);
+        continue;
+      }
+
+      auto name_opt = (*table)["name"].value<std::string>();
+      auto type_opt = (*table)["type"].value<std::string>();
+
+      if (!name_opt) {
+        REXCODEGEN_ERROR("[globals] 0x{:08X}: missing 'name' field", *address_opt);
+        continue;
+      }
+      if (!type_opt) {
+        REXCODEGEN_ERROR("[globals] 0x{:08X}: missing 'type' field", *address_opt);
+        continue;
+      }
+
+      GlobalVariable global;
+      global.name = *name_opt;
+      global.type = *type_opt;
+
+      auto it = cfg.globals.find(*address_opt);
+      if (it != cfg.globals.end()) {
+        REXCODEGEN_DEBUG("[config]   [globals] 0x{:08X} overridden from {}", *address_opt,
+                         filePath);
+      }
+      cfg.globals.insert_or_assign(*address_opt, std::move(global));
+    }
+  }
+
   // --- Sets: additive ---
 
   // indirect_calls -> knownIndirectCallHints (set)

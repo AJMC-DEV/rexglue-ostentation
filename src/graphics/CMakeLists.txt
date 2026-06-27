@@ -26,6 +26,7 @@ set(REXGPU_XENOS_SOURCES
     pipeline/render_target/cache.cpp
     shared_memory.cpp
     pipeline/texture/cache.cpp
+    $<$<BOOL:${REXGLUE_ENABLE_TEXTURES}>:pipeline/texture/replacement.cpp>
     pipeline/shader/interpreter.cpp
     pipeline/shader/translator.cpp
     pipeline/shader/translator_disasm.cpp
@@ -109,6 +110,7 @@ set_target_properties(rexgpu-xenos PROPERTIES
 target_include_directories(rexgpu-xenos PRIVATE
     ${REXGLUE_ROOT}/thirdparty/renderdoc
     ${REXGLUE_ROOT}  # For thirdparty/dxbc/DXBCChecksum.h include
+    ${REXGLUE_ROOT}/thirdparty/stb
 )
 
 target_compile_options(rexgpu-xenos PRIVATE -Wno-unused-variable)
@@ -140,5 +142,6 @@ if(REXGLUE_USE_D3D12)
         d3d12
         dxgi
         dxguid
+        d3dcompiler
     )
 endif()

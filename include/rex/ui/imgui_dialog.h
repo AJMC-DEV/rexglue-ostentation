@@ -12,6 +12,7 @@
 #ifndef REX_UI_IMGUI_DIALOG_H_
 #define REX_UI_IMGUI_DIALOG_H_
 
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -37,6 +38,12 @@ class ImGuiDialog {
   // A fence to signal when the dialog is closed.
   void Then(rex::thread::Fence* fence);
 
+  // Optional callback invoked just before the dialog deletes itself (i.e. when
+  // it self-closes via Close()). Useful for dialogs owned by a unique_ptr that
+  // also support an in-window close button: the owner can call release() on the
+  // unique_ptr here to avoid a double-free and restore any locked state.
+  void SetOnDestroyedCallback(std::function<void()> callback);
+
   void Draw();
 
  protected:
@@ -56,6 +63,7 @@ class ImGuiDialog {
   ImGuiDrawer* imgui_drawer_ = nullptr;
   bool has_close_pending_ = false;
   std::vector<rex::thread::Fence*> waiting_fences_;
+  std::function<void()> on_destroyed_callback_;
 };
 
 }  // namespace ui

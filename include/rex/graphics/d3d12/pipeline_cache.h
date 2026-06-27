@@ -20,12 +20,14 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/graphics/command_processor.h>
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
@@ -96,6 +98,23 @@ class PipelineCache {
   ID3D12PipelineState* GetD3D12PipelineByHandle(void* handle) const {
     return reinterpret_cast<const Pipeline*>(handle)->state.load(std::memory_order_acquire);
   }
+
+#ifdef REXGLUE_ENABLE_SHADERS
+  std::vector<CommandProcessor::ShaderInfo> GetShaderSnapshot(uint64_t active_vertex_hash,
+                                                              uint64_t active_pixel_hash) const;
+  void SetShaderDisabledByHash(uint64_t ucode_hash, bool disabled);
+  CommandProcessor::ShaderDetails GetShaderDetails(uint64_t ucode_hash) const;
+  bool ReplaceShaderTranslationBinary(uint64_t ucode_hash, uint64_t modification,
+                                      std::vector<uint8_t> binary);
+  bool ReplaceShaderTranslationHLSL(uint64_t ucode_hash, uint64_t modification,
+                                    std::string_view source,
+                                    std::string_view entry_point,
+                                    std::string_view target_profile,
+                                    std::string* out_error);
+  void ResetShaderProfiling();
+
+  mutable std::mutex shaders_mutex_;
+#endif  // REXGLUE_ENABLE_SHADERS
 
  private:
   REXPACKEDSTRUCT(ShaderStoredHeader, {

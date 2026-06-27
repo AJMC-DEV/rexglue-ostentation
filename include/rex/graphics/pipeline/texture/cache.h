@@ -14,11 +14,15 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <unordered_map>
 #include <vector>
 
 #include <rex/assert.h>
+#ifdef REXGLUE_ENABLE_TEXTURES
+#include <rex/graphics/pipeline/texture/replacement.h>
+#endif
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/shared_memory.h>
@@ -73,6 +77,18 @@ class TextureCache {
   bool IsDrawResolutionScaled() const {
     return draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1;
   }
+
+#ifdef REXGLUE_ENABLE_TEXTURES
+  // Texture replacement pipeline access. May be nullptr when disabled.
+  TextureReplacement* texture_replacement() const { return replacement_.get(); }
+
+  // Re-index the textures/replace/ directory at runtime.
+  void RescanTextureReplacements();
+
+  // Initialise the replacement pipeline with the given root directory.
+  // Safe to call multiple times (reinitialises with a new root).
+  void InitTextureReplacement(const std::filesystem::path& root);
+#endif
 
   virtual void ClearCache();
 
@@ -207,6 +223,15 @@ class TextureCache {
     uint32_t GetGuestBaseSize() const { return guest_layout().base.level_data_extent_bytes; }
     uint32_t GetGuestMipsSize() const { return guest_layout().mips_total_extent_bytes; }
 
+#ifdef REXGLUE_ENABLE_TEXTURES
+    // Override the guest layout used for shared-memory watches and size
+    // queries. Called when the host key is mutated (e.g. for replacements)
+    // so that guest-side bookkeeping still uses the original memory extents.
+    void OverrideGuestLayout(const texture_util::TextureGuestLayout& layout) {
+      guest_layout_ = layout;
+    }
+#endif
+
     // For 3D-as-2D wrappers: the host texture is 2D, but guest memory tiling
     // may still need to be interpreted as 3D.
     bool force_load_3d_tiling() const { return force_load_3d_tiling_; }
@@ -237,6 +262,13 @@ class TextureCache {
     void MarkAsUsed();
 
     void LogAction(const char* action) const;
+
+#ifdef REXGLUE_ENABLE_TEXTURES
+    // Content hash of the guest texture that matched a replacement.
+    // Non-zero means this texture has a replacement in TextureReplacement's
+    // cache; the upload path fetches a const pointer directly — no owned copy.
+    uint64_t replacement_content_hash_ = 0;
+#endif
 
    protected:
     // If track_usage is false, the texture won't be added to the LRU list.
@@ -526,6 +558,20 @@ class TextureCache {
   virtual bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                      bool load_mips) = 0;
 
+#ifdef REXGLUE_ENABLE_TEXTURES
+  // Uploads CPU-side RGBA8 replacement pixels to the host texture resource.
+  // Only base mip (level 0) is uploaded. Returns false if unsupported or failed
+  // (caller falls back to the resident memory path).
+  virtual bool LoadTextureDataFromReplacementImpl(Texture& texture,
+                                                  const TextureReplacementData& data) {
+    return false;
+  }
+
+  void InvalidateHashCache(uint32_t base_page) {
+    base_page_hash_cache_.erase(base_page);
+  }
+#endif
+
   // Converts a texture fetch constant to a texture key, normalizing and
   // validating the values, or creating an invalid key, and also gets the
   // post-guest-swizzle signedness.
@@ -617,6 +663,16 @@ class TextureCache {
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch
   // constants again and again.
   uint32_t texture_bindings_in_sync_ = 0;
+
+#ifdef REXGLUE_ENABLE_TEXTURES
+  // Texture dump/replacement pipeline. Null when the feature is disabled.
+  std::unique_ptr<TextureReplacement> replacement_;
+
+  // Cache: base_page -> XXH3 content hash, populated by FindOrCreateTexture.
+  // Entries are erased when the shared-memory watch fires for that page, so
+  // the hash is only recomputed when guest memory actually changes.
+  std::unordered_map<uint32_t, uint64_t> base_page_hash_cache_;
+#endif
 };
 
 }  // namespace rex::graphics

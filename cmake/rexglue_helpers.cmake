@@ -53,6 +53,16 @@ function(rexglue_configure_target target_name)
     target_compile_definitions(${target_name} PRIVATE
         REXGLUE_BUILD_CONFIG="$<CONFIG>")
 
+    # rex_app.cpp is compiled as part of the consumer target, so feature flags
+    # must be explicitly set here — the SDK's add_compile_definitions() is
+    # directory-scoped to the SDK subtree and does not reach the consumer.
+    if(REXGLUE_ENABLE_SHADERS)
+        target_compile_definitions(${target_name} PRIVATE REXGLUE_ENABLE_SHADERS)
+    endif()
+    if(REXGLUE_ENABLE_TEXTURES)
+        target_compile_definitions(${target_name} PRIVATE REXGLUE_ENABLE_TEXTURES)
+    endif()
+
     if(UNIX AND NOT APPLE)
         set_target_properties(${target_name} PROPERTIES
             INSTALL_RPATH "$ORIGIN"

@@ -28,6 +28,9 @@ class WindowedAppContext;
 namespace rex::system {
 class KernelState;
 }
+namespace rex::graphics {
+class CommandProcessor;
+}
 
 namespace rex::system {
 
@@ -56,6 +59,7 @@ class IGraphicsSystem {
   // leave these null.
   virtual ui::GraphicsProvider* provider() const { return nullptr; }
   virtual ui::Presenter* presenter() const { return nullptr; }
+  virtual rex::graphics::CommandProcessor* command_processor() const { return nullptr; }
 
   // Guest GPU services reached from the xboxkrnl Vd* exports.
   virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data) {

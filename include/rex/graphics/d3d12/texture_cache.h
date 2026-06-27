@@ -12,6 +12,7 @@
 #pragma once
 
 #include <array>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <unordered_map>
@@ -175,6 +176,11 @@ class D3D12TextureCache final : public TextureCache {
   // This binds pipelines, allocates descriptors, and copies!
   bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                              bool load_mips) override;
+
+#ifdef REXGLUE_ENABLE_TEXTURES
+  bool LoadTextureDataFromReplacementImpl(Texture& texture,
+                                          const TextureReplacementData& data) override;
+#endif
 
   void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) override;
 
@@ -539,6 +545,14 @@ class D3D12TextureCache final : public TextureCache {
   // Range used in the last successful MakeScaledResolveRangeCurrent call.
   uint64_t scaled_resolve_current_range_start_scaled_;
   uint64_t scaled_resolve_current_range_length_scaled_;
+
+#ifdef REXGLUE_ENABLE_TEXTURES
+  // Upload buffers created for replacement texture uploads, paired with the
+  // submission index they were recorded in. Released only once the GPU has
+  // signalled completion of that submission (checked in BeginSubmission).
+  std::deque<std::pair<uint64_t, Microsoft::WRL::ComPtr<ID3D12Resource>>>
+      retained_upload_buffers_;
+#endif
 };
 
 }  // namespace rex::graphics::d3d12

@@ -36,6 +36,8 @@
 #include <rex/perf/counter.h>
 #include <rex/thread/mutex.h>
 #include <rex/system/mmio_handler.h>
+{% if config_flags.generate_exception_handlers %}#include <rex/platform/exceptions.h>
+{% endif %}
 
 #include <atomic>
 #include <cassert>

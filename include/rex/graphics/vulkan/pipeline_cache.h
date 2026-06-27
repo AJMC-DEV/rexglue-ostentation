@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include <rex/graphics/command_processor.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/hash.h>
 #include <rex/platform.h>
@@ -97,6 +98,18 @@ class VulkanPipelineCache {
   void GetPipelineAndLayoutByHandle(void* handle, VkPipeline& pipeline_out,
                                     const PipelineLayoutProvider*& pipeline_layout_out,
                                     bool* is_placeholder_out = nullptr) const;
+
+#ifdef REXGLUE_ENABLE_SHADERS
+  std::vector<CommandProcessor::ShaderInfo> GetShaderSnapshot(uint64_t active_vertex_hash,
+                                                              uint64_t active_pixel_hash) const;
+  void SetShaderDisabledByHash(uint64_t ucode_hash, bool disabled);
+  CommandProcessor::ShaderDetails GetShaderDetails(uint64_t ucode_hash) const;
+  bool ReplaceShaderTranslationBinary(uint64_t ucode_hash, uint64_t modification,
+                                      std::vector<uint8_t> binary);
+  void ResetShaderProfiling();
+
+  mutable std::mutex shaders_mutex_;
+#endif  // REXGLUE_ENABLE_SHADERS
 
  private:
   REXPACKEDSTRUCT(ShaderStoredHeader, {

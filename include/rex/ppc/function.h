@@ -56,7 +56,19 @@ struct PPCFuncRegistrar {
     GetPPCFuncRegistry().emplace_back(name, func);
   }
 };
+
+/// Thread-local address of the most recent guest LR seen by HostToGuestFunction.
+/// Lets host-side hooks discover which guest address invoked them.
+inline thread_local uint32_t g_guest_caller_address = 0;
 }  // namespace detail
+
+/// Returns the guest LR (link register) at the point the current host hook
+/// was called. Only valid inside a function bound via HostToGuestFunction.
+/// Returns 0 when called outside a hook context or when LR tracking is
+/// disabled (PPC_CONFIG_SKIP_LR).
+inline uint32_t GetGuestCallerAddress() {
+  return detail::g_guest_caller_address;
+}
 
 //=============================================================================
 // Type Traits (additional, types.h has is_be_type)
@@ -409,6 +421,12 @@ __attribute__((noinline)) void HostToGuestFunction(PPCContext& ctx, uint8_t* bas
   auto args = function_args(Func);
   _translate_args_to_host<Func>(ctx, base, args);
 
+  // Capture guest LR so hooks can call GetGuestCallerAddress()
+#ifndef PPC_CONFIG_SKIP_LR
+  auto prev_caller = detail::g_guest_caller_address;
+  detail::g_guest_caller_address = static_cast<uint32_t>(ctx.lr);
+#endif
+
   if constexpr (std::is_same_v<ret_t, void>) {
     std::apply(Func, args);
   } else {
@@ -430,6 +448,10 @@ __attribute__((noinline)) void HostToGuestFunction(PPCContext& ctx, uint8_t* bas
       ctx.r3.u64 = static_cast<uint64_t>(v);
     }
   }
+
+#ifndef PPC_CONFIG_SKIP_LR
+  detail::g_guest_caller_address = prev_caller;
+#endif
 }
 
 //=============================================================================

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 #include <rex/dbg.h>
 #include <rex/input/flags.h>
@@ -41,6 +42,8 @@ void InputSystem::Shutdown() {
 }
 
 void InputSystem::AddDriver(std::unique_ptr<InputDriver> driver) {
+  driver->set_is_active_callback([this]() { return IsGameInputActive(); });
+  driver->OnInputModeChanged(input_mode_, show_mouse_cursor_);
   drivers_.push_back(std::move(driver));
 }
 
@@ -52,8 +55,42 @@ void InputSystem::AttachWindow(rex::ui::Window* window) {
 }
 
 void InputSystem::SetActiveCallback(std::function<bool()> callback) {
+  active_callback_ = std::move(callback);
+  RefreshDriverActiveCallbacks();
+}
+
+void InputSystem::SetInputMode(InputMode mode) {
+  if (input_mode_ == mode) {
+    return;
+  }
+  input_mode_ = mode;
+  NotifyInputModeChanged();
+}
+
+void InputSystem::SetShowMouseCursor(bool show) {
+  if (show_mouse_cursor_ == show) {
+    return;
+  }
+  show_mouse_cursor_ = show;
+  NotifyInputModeChanged();
+}
+
+bool InputSystem::IsGameInputActive() const {
+  if (input_mode_ != InputMode::kGame) {
+    return false;
+  }
+  return !active_callback_ || active_callback_();
+}
+
+void InputSystem::RefreshDriverActiveCallbacks() {
   for (auto& driver : drivers_) {
-    driver->set_is_active_callback(callback);
+    driver->set_is_active_callback([this]() { return IsGameInputActive(); });
+  }
+}
+
+void InputSystem::NotifyInputModeChanged() {
+  for (auto& driver : drivers_) {
+    driver->OnInputModeChanged(input_mode_, show_mouse_cursor_);
   }
 }
 
@@ -147,16 +184,30 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
   SCOPE_profile_cpu_f("hid");
 
   bool any_connected = false;
+  bool saw_empty = false;
+  X_RESULT first_error = X_ERROR_DEVICE_NOT_CONNECTED;
   for (auto& driver : drivers_) {
     X_RESULT result = driver->GetKeystroke(user_index, flags, out_keystroke);
-    if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
-      any_connected = true;
-    }
-    if (result == X_ERROR_SUCCESS || result == X_ERROR_EMPTY) {
+    if (result == X_ERROR_SUCCESS) {
       return result;
     }
+    if (result == X_ERROR_DEVICE_NOT_CONNECTED) {
+      continue;
+    }
+    if (result == X_ERROR_BAD_ARGUMENTS) {
+      return result;
+    }
+    any_connected = true;
+    if (result == X_ERROR_EMPTY) {
+      saw_empty = true;
+    } else if (first_error == X_ERROR_DEVICE_NOT_CONNECTED) {
+      first_error = result;
+    }
   }
-  return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
+  if (saw_empty) {
+    return X_ERROR_EMPTY;
+  }
+  return any_connected ? first_error : X_ERROR_DEVICE_NOT_CONNECTED;
 }
 
 std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {

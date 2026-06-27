@@ -23,6 +23,11 @@ class Window;
 
 namespace rex::input {
 
+enum class InputMode {
+  kGame,
+  kUIOnly,
+};
+
 class InputSystem;
 
 class InputDriver {
@@ -39,6 +44,7 @@ class InputDriver {
                                 X_INPUT_KEYSTROKE* out_keystroke) = 0;
 
   virtual void OnWindowAvailable(rex::ui::Window* /*window*/) {}
+  virtual void OnInputModeChanged(InputMode /*mode*/, bool /*show_mouse_cursor*/) {}
 
   void set_is_active_callback(std::function<bool()> is_active_callback) {
     is_active_callback_ = is_active_callback;

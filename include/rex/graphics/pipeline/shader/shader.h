@@ -793,6 +793,14 @@ class Shader {
       host_disassembly_ = std::move(disassembly);
     }
 
+#ifdef REXGLUE_ENABLE_SHADERS
+    // Overwrites the translated binary in-place for runtime shader replacement.
+    // Callers must invalidate pipeline state objects that referenced the old binary.
+    void set_translated_binary(std::vector<uint8_t> binary) {
+      translated_binary_ = std::move(binary);
+    }
+#endif
+
     // For dumping after translation. Dumps the shader's translated code, and,
     // if available, translated disassembly, to files in the given directory
     // based on ucode hash. Returns {binary path, disassembly path if written}.
@@ -1049,6 +1057,32 @@ class Shader {
   void GatherOperandInformation(const InstructionOperand& operand);
   void GatherFetchResultInformation(const InstructionResult& result);
   void GatherAluResultInformation(const InstructionResult& result, uint32_t exec_cf_index);
+
+#ifdef REXGLUE_ENABLE_SHADERS
+ public:
+  bool disabled() const { return disabled_.load(std::memory_order_relaxed); }
+  void set_disabled(bool value) { disabled_.store(value, std::memory_order_relaxed); }
+
+  uint64_t profile_total_ns() const {
+    return profile_total_ns_.load(std::memory_order_relaxed);
+  }
+  uint64_t profile_draw_count() const {
+    return profile_draw_count_.load(std::memory_order_relaxed);
+  }
+  void profile_add_sample(uint64_t ns) {
+    profile_total_ns_.fetch_add(ns, std::memory_order_relaxed);
+    profile_draw_count_.fetch_add(1, std::memory_order_relaxed);
+  }
+  void profile_reset() {
+    profile_total_ns_.store(0, std::memory_order_relaxed);
+    profile_draw_count_.store(0, std::memory_order_relaxed);
+  }
+
+ private:
+  std::atomic<bool> disabled_{false};
+  std::atomic<uint64_t> profile_total_ns_{0};
+  std::atomic<uint64_t> profile_draw_count_{0};
+#endif  // REXGLUE_ENABLE_SHADERS
 };
 
 }  // namespace rex::graphics

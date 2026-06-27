@@ -24,6 +24,14 @@
 
 #include <fmt/format.h>
 
+#ifdef REXGLUE_ENABLE_SHADERS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <d3dcompiler.h>
+#include <wrl/client.h>
+#endif
+
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
@@ -801,6 +809,9 @@ D3D12Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type, const uint
 
 D3D12Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                                        uint32_t dword_count, uint64_t data_hash) {
+#ifdef REXGLUE_ENABLE_SHADERS
+  std::lock_guard<std::mutex> lock(shaders_mutex_);
+#endif
   auto it = shaders_.find(data_hash);
   if (it != shaders_.end()) {
     // Shader has been previously loaded.
@@ -810,6 +821,11 @@ D3D12Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type, const uint
   // We need to track it even if it fails translation so we know not to try
   // again.
   D3D12Shader* shader = new D3D12Shader(shader_type, data_hash, host_address, dword_count);
+#ifdef REXGLUE_ENABLE_SHADERS
+  if (command_processor_.IsShaderBlacklisted(data_hash)) {
+    shader->set_disabled(true);
+  }
+#endif
   shaders_.emplace(data_hash, shader);
   return shader;
 }
@@ -1228,6 +1244,33 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
                                                     ? (edram_rov_used ? "d3d12_rov" : "d3d12_rtv")
                                                     : "d3d12");
   }
+
+#ifdef REXGLUE_ENABLE_SHADERS
+  if (REXCVAR_GET(shader_load_enabled)) {
+    const auto mod_path =
+        rex::filesystem::GetExecutableFolder() / "mods" / "shaders" /
+        fmt::format("{:016X}_{:016X}.dxbc", shader.ucode_data_hash(),
+                    translation.modification());
+    if (std::filesystem::exists(mod_path)) {
+      FILE* f = rex::filesystem::OpenFile(mod_path, "rb");
+      if (f) {
+        rex::filesystem::Seek(f, 0, SEEK_END);
+        const int64_t size = rex::filesystem::Tell(f);
+        rex::filesystem::Seek(f, 0, SEEK_SET);
+        if (size > 0) {
+          std::vector<uint8_t> replacement(static_cast<size_t>(size));
+          if (fread(replacement.data(), 1, replacement.size(), f) ==
+              replacement.size()) {
+            translation.set_translated_binary(std::move(replacement));
+            REXGPU_INFO("Loaded replacement DXBC {:016X} mod {:016X} from mods/shaders/",
+                        shader.ucode_data_hash(), translation.modification());
+          }
+        }
+        fclose(f);
+      }
+    }
+  }
+#endif  // REXGLUE_ENABLE_SHADERS
 
   return translation.is_valid();
 }
@@ -3264,5 +3307,165 @@ void PipelineCache::CreateQueuedPipelinesOnProcessorThread() {
                                     std::memory_order_release);
   }
 }
+
+#ifdef REXGLUE_ENABLE_SHADERS
+std::vector<CommandProcessor::ShaderInfo> PipelineCache::GetShaderSnapshot(
+    uint64_t active_vertex_hash, uint64_t active_pixel_hash) const {
+  std::vector<CommandProcessor::ShaderInfo> result;
+  std::lock_guard<std::mutex> lock(shaders_mutex_);
+  result.reserve(shaders_.size());
+  for (const auto& kv : shaders_) {
+    const D3D12Shader* shader = kv.second;
+    if (!shader) continue;
+    CommandProcessor::ShaderInfo info;
+    info.ucode_hash = kv.first;
+    info.type = shader->type();
+    info.dword_count = static_cast<uint32_t>(shader->ucode_dword_count());
+    info.disabled = shader->disabled();
+    info.active = (kv.first == active_vertex_hash) || (kv.first == active_pixel_hash);
+    info.profile_total_ns = shader->profile_total_ns();
+    info.profile_draw_count = shader->profile_draw_count();
+    result.push_back(info);
+  }
+  return result;
+}
+
+void PipelineCache::ResetShaderProfiling() {
+  std::lock_guard<std::mutex> lock(shaders_mutex_);
+  for (const auto& kv : shaders_) {
+    if (kv.second) kv.second->profile_reset();
+  }
+}
+
+void PipelineCache::SetShaderDisabledByHash(uint64_t ucode_hash, bool disabled) {
+  std::lock_guard<std::mutex> lock(shaders_mutex_);
+  auto it = shaders_.find(ucode_hash);
+  if (it != shaders_.end() && it->second) {
+    it->second->set_disabled(disabled);
+  }
+}
+
+CommandProcessor::ShaderDetails PipelineCache::GetShaderDetails(uint64_t ucode_hash) const {
+  CommandProcessor::ShaderDetails details;
+  D3D12Shader* shader = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(shaders_mutex_);
+    auto it = shaders_.find(ucode_hash);
+    if (it == shaders_.end() || !it->second) return details;
+    shader = it->second;
+  }
+  if (!shader->is_ucode_analyzed()) {
+    string::StringBuffer scratch;
+    shader->AnalyzeUcode(scratch);
+  }
+  details.found = true;
+  details.info.ucode_hash = ucode_hash;
+  details.info.type = shader->type();
+  details.info.dword_count = static_cast<uint32_t>(shader->ucode_dword_count());
+  details.info.disabled = shader->disabled();
+  details.ucode_disassembly = shader->ucode_disassembly();
+  details.ucode_dwords = shader->ucode_data();
+  for (const auto& tr_kv : shader->translations()) {
+    const auto* translation = tr_kv.second;
+    if (!translation) continue;
+    CommandProcessor::ShaderTranslationInfo ti;
+    ti.modification = translation->modification();
+    ti.is_translated = translation->is_translated();
+    ti.is_valid = translation->is_valid();
+    ti.host_disassembly = translation->host_disassembly();
+    ti.translated_binary = translation->translated_binary();
+    details.translations.push_back(std::move(ti));
+  }
+  return details;
+}
+
+bool PipelineCache::ReplaceShaderTranslationBinary(uint64_t ucode_hash, uint64_t modification,
+                                                   std::vector<uint8_t> binary) {
+  D3D12Shader::D3D12Translation* translation = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(shaders_mutex_);
+    auto it = shaders_.find(ucode_hash);
+    if (it == shaders_.end() || !it->second) return false;
+    translation = static_cast<D3D12Shader::D3D12Translation*>(
+        it->second->GetTranslation(modification));
+  }
+  if (!translation) return false;
+  command_processor_.CallInThread([this, ucode_hash, modification, binary = std::move(binary)]() {
+    D3D12Shader::D3D12Translation* tr = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(shaders_mutex_);
+      auto it = shaders_.find(ucode_hash);
+      if (it == shaders_.end() || !it->second) return;
+      tr = static_cast<D3D12Shader::D3D12Translation*>(it->second->GetTranslation(modification));
+    }
+    if (!tr) return;
+    tr->set_translated_binary(std::move(const_cast<std::vector<uint8_t>&>(binary)));
+    current_pipeline_ = nullptr;
+    for (auto it = pipelines_.begin(); it != pipelines_.end();) {
+      const auto& desc = it->second->description.description;
+      if (desc.vertex_shader_hash == ucode_hash || desc.pixel_shader_hash == ucode_hash) {
+        ID3D12PipelineState* state = it->second->state.load(std::memory_order_acquire);
+        if (state) state->Release();
+        delete it->second;
+        it = pipelines_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    COUNT_profile_set("gpu/pipeline_cache/pipelines", pipelines_.size());
+  });
+  return true;
+}
+
+bool PipelineCache::ReplaceShaderTranslationHLSL(uint64_t ucode_hash, uint64_t modification,
+                                                 std::string_view source,
+                                                 std::string_view entry_point,
+                                                 std::string_view target_profile,
+                                                 std::string* out_error) {
+  xenos::ShaderType stage = xenos::ShaderType::kVertex;
+  {
+    std::lock_guard<std::mutex> lock(shaders_mutex_);
+    auto it = shaders_.find(ucode_hash);
+    if (it == shaders_.end() || !it->second) {
+      if (out_error) *out_error = "Shader hash not loaded by the GPU yet.";
+      return false;
+    }
+    stage = it->second->type();
+  }
+  std::string entry_storage(entry_point.empty() ? "main" : entry_point);
+  std::string profile_storage(target_profile.empty()
+                                  ? (stage == xenos::ShaderType::kPixel ? "ps_5_1" : "vs_5_1")
+                                  : std::string(target_profile));
+
+  Microsoft::WRL::ComPtr<ID3DBlob> code_blob;
+  Microsoft::WRL::ComPtr<ID3DBlob> error_blob;
+  UINT flags = D3DCOMPILE_ENABLE_STRICTNESS;
+#if !defined(NDEBUG)
+  flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#else
+  flags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
+#endif
+  HRESULT hr = D3DCompile(source.data(), source.size(), nullptr, nullptr,
+                          D3D_COMPILE_STANDARD_FILE_INCLUDE,
+                          entry_storage.c_str(), profile_storage.c_str(), flags, 0,
+                          &code_blob, &error_blob);
+  if (FAILED(hr) || !code_blob) {
+    if (out_error) {
+      if (error_blob && error_blob->GetBufferSize() > 0) {
+        *out_error = std::string(static_cast<const char*>(error_blob->GetBufferPointer()),
+                                 error_blob->GetBufferSize());
+      } else {
+        *out_error = fmt::format("D3DCompile failed (HRESULT 0x{:08X}).",
+                                 static_cast<uint32_t>(hr));
+      }
+    }
+    return false;
+  }
+  std::vector<uint8_t> binary(static_cast<const uint8_t*>(code_blob->GetBufferPointer()),
+                              static_cast<const uint8_t*>(code_blob->GetBufferPointer()) +
+                                  code_blob->GetBufferSize());
+  return ReplaceShaderTranslationBinary(ucode_hash, modification, std::move(binary));
+}
+#endif  // REXGLUE_ENABLE_SHADERS
 
 }  // namespace rex::graphics::d3d12

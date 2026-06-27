@@ -86,7 +86,18 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
       {"cr_as_local", cfg.crRegistersAsLocalVariables},
       {"non_argument_as_local", cfg.nonArgumentRegistersAsLocalVariables},
       {"non_volatile_as_local", cfg.nonVolatileRegistersAsLocalVariables},
+      {"generate_exception_handlers", cfg.generateExceptionHandlers},
   };
+
+  // Build globals JSON array
+  nlohmann::json globalsJson = nlohmann::json::array();
+  for (const auto& [addr, global] : cfg.globals) {
+    globalsJson.push_back({
+        {"address", fmt::format("{:08X}", addr)},
+        {"name", global.name},
+        {"type", global.type},
+    });
+  }
 
   return {
       {"project", cfg.projectName},
@@ -100,6 +111,7 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
       {"is_dll", ctx.isDllModule()},
       {"config_flags", configFlags},
       {"functions", functionsJson},
+      {"globals", globalsJson},
       {"recomp_files", nlohmann::json::array()},
   };
 }
@@ -204,6 +216,14 @@ bool CodegenWriter::write(bool force) {
   REXCODEGEN_TRACE("Recompile: generating {}_init.cpp", projectName);
   out = renderWithJson(registry, "codegen/init_cpp", tmplData);
   SaveCurrentOutData(fmt::format("{}_init.cpp", projectName));
+
+  // Generate {project}_globals.h (if any globals are defined)
+  if (!config().globals.empty()) {
+    REXCODEGEN_TRACE("Recompile: generating {}_globals.h ({} globals)", projectName,
+                     config().globals.size());
+    out = renderWithJson(registry, "codegen/globals_h", tmplData);
+    SaveCurrentOutData(fmt::format("{}_globals.h", projectName));
+  }
 
   // Generate {project}_register.cpp (registration function for hash-based dispatch)
   REXCODEGEN_TRACE("Recompile: generating {}_register.cpp", projectName);

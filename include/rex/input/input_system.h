@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -37,13 +38,28 @@ class InputSystem : public system::IInputSystem {
   void AttachWindow(rex::ui::Window* window);
   void SetActiveCallback(std::function<bool()> callback);
 
+  void SetInputMode(InputMode mode);
+  void SetInputModeGame() { SetInputMode(InputMode::kGame); }
+  void SetInputModeUIOnly() { SetInputMode(InputMode::kUIOnly); }
+  InputMode input_mode() const { return input_mode_; }
+
+  void SetShowMouseCursor(bool show);
+  bool show_mouse_cursor() const { return show_mouse_cursor_; }
+  bool IsGameInputActive() const;
+
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
 
  private:
+  void RefreshDriverActiveCallbacks();
+  void NotifyInputModeChanged();
+
   rex::ui::Window* window_ = nullptr;
+  std::function<bool()> active_callback_;
+  InputMode input_mode_ = InputMode::kGame;
+  bool show_mouse_cursor_ = false;
 
   std::vector<std::unique_ptr<InputDriver>> drivers_;
 };

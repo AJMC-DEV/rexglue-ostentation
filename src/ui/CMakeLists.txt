@@ -1,7 +1,14 @@
 # rexui
 
 # Core UI sources
+set(REXUI_TOGGLE_SOURCES
+    ${REXGLUE_ROOT}/thirdparty/imgui_toggle/imgui_toggle.cpp
+    ${REXGLUE_ROOT}/thirdparty/imgui_toggle/imgui_toggle_palette.cpp
+    ${REXGLUE_ROOT}/thirdparty/imgui_toggle/imgui_toggle_renderer.cpp
+)
+
 set(REXUI_CORE_SOURCES
+    adobe_clean_regular_font.cpp
     graphics_upload_buffer_pool.cpp
     graphics_util.cpp
     image_decode.cpp
@@ -30,6 +37,10 @@ set(REXUI_OVERLAY_SOURCES
     overlay/console_commands.cpp
     overlay/settings_overlay.cpp
 )
+
+if(REXGLUE_ENABLE_SHADERS)
+    list(APPEND REXUI_OVERLAY_SOURCES overlay/shader_debugger_overlay.cpp)
+endif()
 
 # Vulkan UI backend
 set(REXUI_VULKAN_SOURCES
@@ -75,6 +86,7 @@ endif()
 
 # Combine sources
 set(REXUI_SOURCES
+    ${REXUI_TOGGLE_SOURCES}
     ${REXUI_CORE_SOURCES}
     ${REXUI_OVERLAY_SOURCES}
     ${REXUI_PLATFORM_SOURCES}
@@ -98,6 +110,7 @@ target_include_directories(rexui PUBLIC
 target_include_directories(rexui PRIVATE
     ${REXGLUE_ROOT}/src  # For ui/shaders/bytecode includes
     ${REXGLUE_ROOT}/thirdparty/stb  # stb_image.h for icon decoding
+    ${REXGLUE_ROOT}/thirdparty/imgui_toggle
 )
 
 target_link_libraries(rexui PUBLIC

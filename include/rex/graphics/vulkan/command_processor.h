@@ -139,6 +139,15 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   void RestoreEdramSnapshot(const void* snapshot) override;
 
+#ifdef REXGLUE_ENABLE_SHADERS
+  std::vector<ShaderInfo> GetShaderSnapshot() const override;
+  void SetShaderDisabledByHash(uint64_t ucode_hash, bool disabled) override;
+  ShaderDetails GetShaderDetails(uint64_t ucode_hash) const override;
+  bool ReplaceShaderTranslationBinary(uint64_t ucode_hash, uint64_t modification,
+                                      std::vector<uint8_t> binary) override;
+  void ResetShaderProfiling() override;
+#endif  // REXGLUE_ENABLE_SHADERS
+
   ui::vulkan::VulkanDevice* GetVulkanDevice() const {
     return static_cast<const ui::vulkan::VulkanProvider*>(graphics_system_->provider())
         ->vulkan_device();

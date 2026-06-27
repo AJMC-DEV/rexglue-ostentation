@@ -889,6 +889,9 @@ VulkanShader* VulkanPipelineCache::LoadShader(xenos::ShaderType shader_type,
 VulkanShader* VulkanPipelineCache::LoadShader(xenos::ShaderType shader_type,
                                               const uint32_t* host_address, uint32_t dword_count,
                                               uint64_t data_hash) {
+#ifdef REXGLUE_ENABLE_SHADERS
+  std::lock_guard<std::mutex> lock(shaders_mutex_);
+#endif
   auto it = shaders_.find(data_hash);
   if (it != shaders_.end()) {
     // Shader has been previously loaded.
@@ -899,6 +902,11 @@ VulkanShader* VulkanPipelineCache::LoadShader(xenos::ShaderType shader_type,
   // again.
   VulkanShader* shader = new VulkanShader(command_processor_.GetVulkanDevice(), shader_type,
                                           data_hash, host_address, dword_count);
+#ifdef REXGLUE_ENABLE_SHADERS
+  if (command_processor_.IsShaderBlacklisted(data_hash)) {
+    shader->set_disabled(true);
+  }
+#endif
   shaders_.emplace(data_hash, shader);
   return shader;
 }
@@ -3698,5 +3706,111 @@ void VulkanPipelineCache::StorageWriteThread() {
     }
   }
 }
+
+#ifdef REXGLUE_ENABLE_SHADERS
+std::vector<CommandProcessor::ShaderInfo> VulkanPipelineCache::GetShaderSnapshot(
+    uint64_t active_vertex_hash, uint64_t active_pixel_hash) const {
+  std::vector<CommandProcessor::ShaderInfo> result;
+  std::lock_guard<std::mutex> lock(shaders_mutex_);
+  result.reserve(shaders_.size());
+  for (const auto& kv : shaders_) {
+    const VulkanShader* shader = kv.second;
+    if (!shader) continue;
+    CommandProcessor::ShaderInfo info;
+    info.ucode_hash = kv.first;
+    info.type = shader->type();
+    info.dword_count = static_cast<uint32_t>(shader->ucode_dword_count());
+    info.disabled = shader->disabled();
+    info.active = (kv.first == active_vertex_hash) || (kv.first == active_pixel_hash);
+    info.profile_total_ns = shader->profile_total_ns();
+    info.profile_draw_count = shader->profile_draw_count();
+    result.push_back(info);
+  }
+  return result;
+}
+
+void VulkanPipelineCache::ResetShaderProfiling() {
+  std::lock_guard<std::mutex> lock(shaders_mutex_);
+  for (const auto& kv : shaders_) {
+    if (kv.second) kv.second->profile_reset();
+  }
+}
+
+void VulkanPipelineCache::SetShaderDisabledByHash(uint64_t ucode_hash, bool disabled) {
+  std::lock_guard<std::mutex> lock(shaders_mutex_);
+  auto it = shaders_.find(ucode_hash);
+  if (it != shaders_.end() && it->second) it->second->set_disabled(disabled);
+}
+
+CommandProcessor::ShaderDetails VulkanPipelineCache::GetShaderDetails(uint64_t ucode_hash) const {
+  CommandProcessor::ShaderDetails details;
+  VulkanShader* shader = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(shaders_mutex_);
+    auto it = shaders_.find(ucode_hash);
+    if (it == shaders_.end() || !it->second) return details;
+    shader = it->second;
+  }
+  if (!shader->is_ucode_analyzed()) {
+    string::StringBuffer scratch;
+    shader->AnalyzeUcode(scratch);
+  }
+  details.found = true;
+  details.info.ucode_hash = ucode_hash;
+  details.info.type = shader->type();
+  details.info.dword_count = static_cast<uint32_t>(shader->ucode_dword_count());
+  details.info.disabled = shader->disabled();
+  details.ucode_disassembly = shader->ucode_disassembly();
+  details.ucode_dwords = shader->ucode_data();
+  for (const auto& tr_kv : shader->translations()) {
+    const auto* translation = tr_kv.second;
+    if (!translation) continue;
+    CommandProcessor::ShaderTranslationInfo ti;
+    ti.modification = translation->modification();
+    ti.is_translated = translation->is_translated();
+    ti.is_valid = translation->is_valid();
+    ti.host_disassembly = translation->host_disassembly();
+    ti.translated_binary = translation->translated_binary();
+    details.translations.push_back(std::move(ti));
+  }
+  return details;
+}
+
+bool VulkanPipelineCache::ReplaceShaderTranslationBinary(uint64_t ucode_hash, uint64_t modification,
+                                                         std::vector<uint8_t> binary) {
+  {
+    std::lock_guard<std::mutex> lock(shaders_mutex_);
+    auto it = shaders_.find(ucode_hash);
+    if (it == shaders_.end() || !it->second) return false;
+    if (!it->second->GetTranslation(modification)) return false;
+  }
+  command_processor_.CallInThread([this, ucode_hash, modification, binary = std::move(binary)]() {
+    VulkanShader::VulkanTranslation* tr = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(shaders_mutex_);
+      auto it = shaders_.find(ucode_hash);
+      if (it == shaders_.end() || !it->second) return;
+      tr = static_cast<VulkanShader::VulkanTranslation*>(it->second->GetTranslation(modification));
+    }
+    if (!tr) return;
+    tr->set_translated_binary(std::move(const_cast<std::vector<uint8_t>&>(binary)));
+    last_pipeline_ = nullptr;
+    for (auto it = pipelines_.begin(); it != pipelines_.end();) {
+      if (it->first.vertex_shader_hash == ucode_hash ||
+          it->first.pixel_shader_hash == ucode_hash) {
+        VkPipeline old = it->second.pipeline.load(std::memory_order_acquire);
+        if (old != VK_NULL_HANDLE) {
+          std::lock_guard<std::mutex> lock(deferred_destroy_lock_);
+          deferred_destroy_pipelines_.emplace_back(command_processor_.GetCurrentSubmission(), old);
+        }
+        it = pipelines_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  });
+  return true;
+}
+#endif  // REXGLUE_ENABLE_SHADERS
 
 }  // namespace rex::graphics::vulkan

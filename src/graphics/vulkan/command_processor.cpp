@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
@@ -3642,6 +3643,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     return draw_fail("missing_vertex_shader");
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+#ifdef REXGLUE_ENABLE_SHADERS
+  if (vertex_shader->disabled()) return true;
+#endif
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
   if (memexport_used_vertex) {
     if (!device_properties.vertexPipelineStoresAndAtomics) {
@@ -3669,6 +3673,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       pixel_shader = static_cast<VulkanShader*>(active_pixel_shader());
       if (pixel_shader) {
         pipeline_cache_->AnalyzeShaderUcode(*pixel_shader);
+#ifdef REXGLUE_ENABLE_SHADERS
+        if (pixel_shader->disabled()) return true;
+#endif
         if (!draw_util::IsPixelShaderNeededWithRasterization(*pixel_shader, regs)) {
           pixel_shader = nullptr;
         }
@@ -3693,6 +3700,25 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
   }
   reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
+
+#ifdef REXGLUE_ENABLE_SHADERS
+  struct ShaderDrawTimer {
+    VulkanShader* vs;
+    VulkanShader* ps;
+    bool enabled;
+    std::chrono::steady_clock::time_point start;
+    ~ShaderDrawTimer() {
+      if (!enabled) return;
+      auto ns = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - start)
+              .count());
+      if (vs) vs->profile_add_sample(ns);
+      if (ps) ps->profile_add_sample(ns);
+    }
+  } shader_draw_timer{vertex_shader, pixel_shader, IsShaderProfilingEnabled(),
+                      std::chrono::steady_clock::now()};
+#endif  // REXGLUE_ENABLE_SHADERS
 
   uint32_t ps_param_gen_pos = UINT32_MAX;
   uint32_t interpolator_mask =
@@ -6856,5 +6882,38 @@ uint32_t VulkanCommandProcessor::WriteTransientTextureBindings(
   assert_not_zero(descriptor_set_write_count);
   return descriptor_set_write_count;
 }
+
+#ifdef REXGLUE_ENABLE_SHADERS
+std::vector<CommandProcessor::ShaderInfo> VulkanCommandProcessor::GetShaderSnapshot() const {
+  if (!pipeline_cache_) return {};
+  uint64_t active_vs_hash = active_vertex_shader_ ? active_vertex_shader_->ucode_data_hash() : 0;
+  uint64_t active_ps_hash = active_pixel_shader_ ? active_pixel_shader_->ucode_data_hash() : 0;
+  return pipeline_cache_->GetShaderSnapshot(active_vs_hash, active_ps_hash);
+}
+
+void VulkanCommandProcessor::SetShaderDisabledByHash(uint64_t ucode_hash, bool disabled) {
+  if (!pipeline_cache_) return;
+  pipeline_cache_->SetShaderDisabledByHash(ucode_hash, disabled);
+}
+
+CommandProcessor::ShaderDetails VulkanCommandProcessor::GetShaderDetails(
+    uint64_t ucode_hash) const {
+  if (!pipeline_cache_) return {};
+  return pipeline_cache_->GetShaderDetails(ucode_hash);
+}
+
+bool VulkanCommandProcessor::ReplaceShaderTranslationBinary(uint64_t ucode_hash,
+                                                            uint64_t modification,
+                                                            std::vector<uint8_t> binary) {
+  if (!pipeline_cache_) return false;
+  return pipeline_cache_->ReplaceShaderTranslationBinary(ucode_hash, modification,
+                                                          std::move(binary));
+}
+
+void VulkanCommandProcessor::ResetShaderProfiling() {
+  if (!pipeline_cache_) return;
+  pipeline_cache_->ResetShaderProfiling();
+}
+#endif  // REXGLUE_ENABLE_SHADERS
 
 }  // namespace rex::graphics::vulkan

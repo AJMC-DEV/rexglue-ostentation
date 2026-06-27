@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -2317,6 +2318,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     return false;
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+#ifdef REXGLUE_ENABLE_SHADERS
+  if (vertex_shader->disabled()) {
+    return true;
+  }
+#endif
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
 
   // Pixel shader analysis.
@@ -2335,6 +2341,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       pixel_shader = static_cast<D3D12Shader*>(active_pixel_shader());
       if (pixel_shader) {
         pipeline_cache_->AnalyzeShaderUcode(*pixel_shader);
+#ifdef REXGLUE_ENABLE_SHADERS
+        if (pixel_shader->disabled()) {
+          return true;
+        }
+#endif
         if (!draw_util::IsPixelShaderNeededWithRasterization(*pixel_shader, regs)) {
           pixel_shader = nullptr;
         }
@@ -2350,6 +2361,25 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
+
+#ifdef REXGLUE_ENABLE_SHADERS
+  struct ShaderDrawTimer {
+    D3D12Shader* vs;
+    D3D12Shader* ps;
+    bool enabled;
+    std::chrono::steady_clock::time_point start;
+    ~ShaderDrawTimer() {
+      if (!enabled) return;
+      auto ns = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - start)
+              .count());
+      if (vs) vs->profile_add_sample(ns);
+      if (ps) ps->profile_add_sample(ns);
+    }
+  } shader_draw_timer{vertex_shader, pixel_shader, IsShaderProfilingEnabled(),
+                      std::chrono::steady_clock::now()};
+#endif  // REXGLUE_ENABLE_SHADERS
 
   if (!BeginSubmission(true)) {
     return false;
@@ -5067,5 +5097,52 @@ void D3D12CommandProcessor::WriteGammaRampSRV(bool is_pwl,
   }
   device->CreateShaderResourceView(gamma_ramp_buffer_.Get(), &desc, handle);
 }
+
+#ifdef REXGLUE_ENABLE_SHADERS
+std::vector<CommandProcessor::ShaderInfo> D3D12CommandProcessor::GetShaderSnapshot() const {
+  if (!pipeline_cache_) return {};
+  uint64_t active_vs_hash = active_vertex_shader_ ? active_vertex_shader_->ucode_data_hash() : 0;
+  uint64_t active_ps_hash = active_pixel_shader_ ? active_pixel_shader_->ucode_data_hash() : 0;
+  return pipeline_cache_->GetShaderSnapshot(active_vs_hash, active_ps_hash);
+}
+
+void D3D12CommandProcessor::SetShaderDisabledByHash(uint64_t ucode_hash, bool disabled) {
+  if (!pipeline_cache_) return;
+  pipeline_cache_->SetShaderDisabledByHash(ucode_hash, disabled);
+}
+
+CommandProcessor::ShaderDetails D3D12CommandProcessor::GetShaderDetails(
+    uint64_t ucode_hash) const {
+  if (!pipeline_cache_) return {};
+  return pipeline_cache_->GetShaderDetails(ucode_hash);
+}
+
+bool D3D12CommandProcessor::ReplaceShaderTranslationBinary(uint64_t ucode_hash,
+                                                            uint64_t modification,
+                                                            std::vector<uint8_t> binary) {
+  if (!pipeline_cache_) return false;
+  return pipeline_cache_->ReplaceShaderTranslationBinary(ucode_hash, modification,
+                                                          std::move(binary));
+}
+
+bool D3D12CommandProcessor::ReplaceShaderTranslationHLSL(uint64_t ucode_hash,
+                                                         uint64_t modification,
+                                                         std::string_view source,
+                                                         std::string_view entry_point,
+                                                         std::string_view target_profile,
+                                                         std::string* out_error) {
+  if (!pipeline_cache_) {
+    if (out_error) *out_error = "Pipeline cache not initialized.";
+    return false;
+  }
+  return pipeline_cache_->ReplaceShaderTranslationHLSL(
+      ucode_hash, modification, source, entry_point, target_profile, out_error);
+}
+
+void D3D12CommandProcessor::ResetShaderProfiling() {
+  if (!pipeline_cache_) return;
+  pipeline_cache_->ResetShaderProfiling();
+}
+#endif  // REXGLUE_ENABLE_SHADERS
 
 }  // namespace rex::graphics::d3d12

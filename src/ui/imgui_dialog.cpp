@@ -37,6 +37,10 @@ void ImGuiDialog::Close() {
   has_close_pending_ = true;
 }
 
+void ImGuiDialog::SetOnDestroyedCallback(std::function<void()> callback) {
+  on_destroyed_callback_ = std::move(callback);
+}
+
 ImGuiIO& ImGuiDialog::GetIO() {
   return imgui_drawer()->GetIO();
 }
@@ -48,6 +52,11 @@ void ImGuiDialog::Draw() {
   // Check to see if the UI closed itself and needs to be deleted.
   if (has_close_pending_) {
     OnClose();
+    // Notify any owner (e.g. a unique_ptr holder) *before* delete so it can
+    // release ownership and restore state (e.g. unlock game input).
+    if (on_destroyed_callback_) {
+      on_destroyed_callback_();
+    }
     delete this;
   }
 }

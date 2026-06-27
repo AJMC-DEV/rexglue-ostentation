@@ -29,6 +29,12 @@
 // TODO(benvanik): move xbox.h out
 #include <rex/system/xtypes.h>
 
+#if REX_PLATFORM_WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <psapi.h>
+#endif
+
 REXCVAR_DEFINE_BOOL(protect_zero, true, "Memory", "Protect the zero page from reads and writes")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -129,6 +135,48 @@ Memory::~Memory() {
 
 bool Memory::Initialize() {
   file_name_ = fmt::format("xenia_memory_{}", chrono::Clock::QueryHostTickCount());
+
+#if REX_PLATFORM_WIN32
+  // Detect problematic overlay DLLs (passive detection only - no blocking)
+  // These overlays can reserve memory addresses needed for Xbox 360 memory mapping
+  const char* known_overlays[] = {
+      "RTSSHooks64.dll",      // RivaTuner Statistics Server
+      "RTSSHooks.dll",        // RivaTuner (32-bit)
+      "MSIAfterburner.dll",   // MSI Afterburner
+      "DiscordHook64.dll",    // Discord overlay
+      "discord_hook.dll",     // Discord overlay (legacy)
+  };
+
+  bool found_overlay = false;
+  for (const char* dll_name : known_overlays) {
+    HMODULE hMod = GetModuleHandleA(dll_name);
+    if (hMod != nullptr) {
+      found_overlay = true;
+
+      char mod_path[MAX_PATH] = {0};
+      GetModuleFileNameA(hMod, mod_path, sizeof(mod_path));
+
+      MODULEINFO mod_info = {};
+      if (GetModuleInformation(GetCurrentProcess(), hMod, &mod_info, sizeof(mod_info))) {
+        uintptr_t base = reinterpret_cast<uintptr_t>(mod_info.lpBaseOfDll);
+        size_t size = mod_info.SizeOfImage;
+
+        REXSYS_WARN("Overlay detected: {} at 0x{:016X} (size: 0x{:08X})",
+                    dll_name, base, size);
+
+        // Check if overlay conflicts with Xbox 360 physical memory range (0x100000000+)
+        if (base >= 0x100000000ull && base < 0x200000000ull) {
+          REXSYS_ERROR("CRITICAL: {} is blocking memory addresses needed for Xbox 360 emulation!", dll_name);
+          REXSYS_ERROR("The game will likely crash. Please close RivaTuner/MSI Afterburner and restart.");
+        }
+      }
+    }
+  }
+
+  if (found_overlay) {
+    REXSYS_WARN("Overlay software detected. If the game crashes, close overlay programs and restart.");
+  }
+#endif
 
   // Create main page file-backed mapping. This is all reserved but
   // uncommitted (so it shouldn't expand page file).

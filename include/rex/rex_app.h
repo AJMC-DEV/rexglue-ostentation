@@ -52,6 +52,9 @@ namespace ui {
 class AchievementNotificationDialog;
 class ConsoleDialog;
 class SettingsDialog;
+#ifdef REXGLUE_ENABLE_SHADERS
+class ShaderDebuggerDialog;
+#endif
 }  // namespace ui
 
 /// Base class for recompiled Xbox 360 applications.
@@ -278,6 +281,10 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   // WindowInputListener overrides
   void OnKeyDown(ui::KeyEvent& e) override;
 
+#ifdef REXGLUE_ENABLE_SHADERS
+  void UpdateBuiltinOverlayInputMode();
+#endif
+
   PPCImageInfo ppc_info_;
   PathConfig resolved_defaults_;
   RuntimeConfig config_;
@@ -298,6 +305,9 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<ui::DebugOverlayDialog> debug_overlay_;
   std::unique_ptr<ui::ConsoleDialog> console_overlay_;
   std::unique_ptr<ui::SettingsDialog> settings_overlay_;
+#ifdef REXGLUE_ENABLE_SHADERS
+  std::unique_ptr<ui::ShaderDebuggerDialog> shader_debugger_overlay_;
+#endif
   std::unique_ptr<ui::ImGuiDialog> achievements_overlay_;
   std::shared_ptr<ui::AchievementNotificationDialog> achievement_notification_;
   uint64_t achievement_notification_listener_ = 0;

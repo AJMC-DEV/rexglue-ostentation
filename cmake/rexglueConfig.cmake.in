@@ -17,6 +17,9 @@ find_dependency(utf8cpp CONFIG)
 find_dependency(SDL3 CONFIG)
 
 set(REXGLUE_USE_VULKAN @REXGLUE_USE_VULKAN@)
+set(REXGLUE_ENABLE_SHADERS @REXGLUE_ENABLE_SHADERS@)
+set(REXGLUE_ENABLE_TEXTURES @REXGLUE_ENABLE_TEXTURES@)
+
 if(REXGLUE_USE_VULKAN)
     find_dependency(VulkanHeaders CONFIG)
     find_dependency(volk CONFIG)

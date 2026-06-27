@@ -1,0 +1,20 @@
+/**
+ * @file        {{ project }}_globals.h
+ * @brief       Auto-generated guest global variable definitions.
+ *
+ * Generated from TOML [globals] configuration.
+ * DO NOT EDIT - changes will be overwritten by codegen.
+ */
+
+#pragma once
+
+#include <rex/ppc/guest_global.h>
+
+namespace {{ project }}::globals {
+
+{% for global in globals %}
+/// {{ global.name }} @ 0x{{ global.address }}
+DEFINE_GUEST_GLOBAL({{ global.name }}, {{ global.type }}, 0x{{ global.address }});
+{% endfor %}
+
+}  // namespace {{ project }}::globals

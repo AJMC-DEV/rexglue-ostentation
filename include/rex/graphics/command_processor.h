@@ -18,7 +18,9 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <rex/graphics/register_file.h>
@@ -142,6 +144,88 @@ class CommandProcessor {
 
   bool Save(::rex::stream::ByteStream* stream);
   bool Restore(::rex::stream::ByteStream* stream);
+
+#ifdef REXGLUE_ENABLE_SHADERS
+  // Snapshot of a single tracked shader for the debugger UI.
+  struct ShaderInfo {
+    uint64_t ucode_hash = 0;
+    xenos::ShaderType type = xenos::ShaderType::kVertex;
+    uint32_t dword_count = 0;
+    bool disabled = false;
+    bool active = false;
+    uint64_t profile_total_ns = 0;
+    uint64_t profile_draw_count = 0;
+  };
+
+  // Per-translation snapshot (one per host pipeline permutation).
+  struct ShaderTranslationInfo {
+    uint64_t modification = 0;
+    bool is_translated = false;
+    bool is_valid = false;
+    std::string host_disassembly;
+    std::vector<uint8_t> translated_binary;
+  };
+
+  // Full detail for a single shader, used by the debugger viewer pane.
+  struct ShaderDetails {
+    bool found = false;
+    ShaderInfo info;
+    std::string ucode_disassembly;
+    std::vector<uint32_t> ucode_dwords;
+    std::vector<ShaderTranslationInfo> translations;
+  };
+
+  virtual std::vector<ShaderInfo> GetShaderSnapshot() const { return {}; }
+  virtual void SetShaderDisabledByHash(uint64_t ucode_hash, bool disabled) {
+    (void)ucode_hash;
+    (void)disabled;
+  }
+  virtual ShaderDetails GetShaderDetails(uint64_t ucode_hash) const {
+    (void)ucode_hash;
+    return {};
+  }
+  virtual bool ReplaceShaderTranslationBinary(uint64_t ucode_hash, uint64_t modification,
+                                              std::vector<uint8_t> binary) {
+    (void)ucode_hash;
+    (void)modification;
+    (void)binary;
+    return false;
+  }
+  virtual bool ReplaceShaderTranslationHLSL(uint64_t ucode_hash, uint64_t modification,
+                                            std::string_view source,
+                                            std::string_view entry_point = {},
+                                            std::string_view target_profile = {},
+                                            std::string* out_error = nullptr) {
+    (void)ucode_hash;
+    (void)modification;
+    (void)source;
+    (void)entry_point;
+    (void)target_profile;
+    if (out_error) *out_error = "HLSL replacement not supported by this backend.";
+    return false;
+  }
+
+  // Compile HLSL and apply to every translation of `ucode_hash`. Returns true
+  // if at least one translation was replaced; sets *out_replaced_count if non-null.
+  bool ReplaceShaderHLSL(uint64_t ucode_hash, std::string_view source,
+                         std::string_view entry_point = {},
+                         std::string_view target_profile = {},
+                         std::string* out_error = nullptr,
+                         size_t* out_replaced_count = nullptr);
+
+  virtual void AddShaderBlacklist(uint64_t ucode_hash);
+  virtual void RemoveShaderBlacklist(uint64_t ucode_hash);
+  virtual bool IsShaderBlacklisted(uint64_t ucode_hash) const;
+  virtual std::vector<uint64_t> GetShaderBlacklist() const;
+
+  bool IsShaderProfilingEnabled() const {
+    return shader_profiling_enabled_.load(std::memory_order_relaxed);
+  }
+  void SetShaderProfilingEnabled(bool enabled) {
+    shader_profiling_enabled_.store(enabled, std::memory_order_relaxed);
+  }
+  virtual void ResetShaderProfiling() {}
+#endif  // REXGLUE_ENABLE_SHADERS
 
  protected:
   struct IndexBufferInfo {
@@ -307,6 +391,12 @@ class CommandProcessor {
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
   reg::DC_LUT_PWL_DATA gamma_ramp_pwl_rgb_[128][3] = {};
   uint32_t gamma_ramp_rw_component_ = 0;
+
+#ifdef REXGLUE_ENABLE_SHADERS
+  mutable std::mutex shader_blacklist_mutex_;
+  std::unordered_set<uint64_t> shader_blacklist_;
+  std::atomic<bool> shader_profiling_enabled_{false};
+#endif
 };
 
 }  // namespace rex::graphics

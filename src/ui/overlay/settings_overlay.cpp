@@ -14,6 +14,8 @@
 #include <rex/string.h>
 #include <rex/ui/keybinds.h>
 #include <imgui.h>
+#include <imgui_toggle.h>
+#include <imgui_toggle_palette.h>
 
 #include <algorithm>
 #include <map>
@@ -41,15 +43,20 @@ static const char* LifecycleBadge(rex::cvar::Lifecycle lc) {
 }
 
 static ImVec4 LifecycleColor(rex::cvar::Lifecycle lc) {
+  // Detect light vs dark theme by window background luminance and pick
+  // a variant that has enough contrast on either background.
+  const auto& bg = ImGui::GetStyle().Colors[ImGuiCol_WindowBg];
+  const float lum = 0.299f * bg.x + 0.587f * bg.y + 0.114f * bg.z;
+  const bool light = lum > 0.5f;
   switch (lc) {
     case rex::cvar::Lifecycle::kHotReload:
-      return {0.4f, 1.0f, 0.4f, 1.0f};
+      return light ? ImVec4(0.05f, 0.50f, 0.05f, 1.0f) : ImVec4(0.4f, 1.0f, 0.4f, 1.0f);
     case rex::cvar::Lifecycle::kRequiresRestart:
-      return {1.0f, 1.0f, 0.4f, 1.0f};
+      return light ? ImVec4(0.65f, 0.50f, 0.00f, 1.0f) : ImVec4(1.0f, 1.0f, 0.4f, 1.0f);
     case rex::cvar::Lifecycle::kInitOnly:
-      return {1.0f, 0.4f, 0.4f, 1.0f};
+      return light ? ImVec4(0.70f, 0.10f, 0.10f, 1.0f) : ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
   }
-  return {1.0f, 1.0f, 1.0f, 1.0f};
+  return light ? ImVec4(0.1f, 0.1f, 0.1f, 1.0f) : ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
 }
 
 static rex::ui::VirtualKey ImGuiKeyToVirtualKey(ImGuiKey key) {
@@ -432,7 +439,22 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
       ImGui::SetNextItemWidth(160.0f);
       if (entry.type == rex::cvar::FlagType::Boolean) {
         bool v = (current_val == "true");
-        if (ImGui::Checkbox("##v", &v)) {
+        ImGuiTogglePalette on_pal = {};
+        on_pal.Frame      = ImVec4(0.10f, 0.60f, 0.10f, 1.0f);
+        on_pal.FrameHover = ImVec4(0.15f, 0.75f, 0.15f, 1.0f);
+        on_pal.Knob       = ImVec4(1.00f, 1.00f, 1.00f, 1.0f);
+        on_pal.KnobHover  = ImVec4(1.00f, 1.00f, 1.00f, 1.0f);
+        ImGuiTogglePalette off_pal = {};
+        off_pal.Frame      = ImVec4(0.60f, 0.10f, 0.10f, 1.0f);
+        off_pal.FrameHover = ImVec4(0.75f, 0.15f, 0.15f, 1.0f);
+        off_pal.Knob       = ImVec4(1.00f, 1.00f, 1.00f, 1.0f);
+        off_pal.KnobHover  = ImVec4(1.00f, 1.00f, 1.00f, 1.0f);
+        ImGuiToggleConfig cfg = {};
+        cfg.Flags       = ImGuiToggleFlags_Animated;
+        cfg.On.Palette  = &on_pal;
+        cfg.Off.Palette = &off_pal;
+        ImGui::SameLine(360.0f);
+        if (ImGui::Toggle("##v", &v, cfg)) {
           rex::cvar::SetFlagByName(entry.name, v ? "true" : "false");
         }
       } else if (entry.type == rex::cvar::FlagType::String &&

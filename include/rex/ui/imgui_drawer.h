@@ -56,6 +56,8 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
     SetImmediateDrawer(new_immediate_drawer);
   }
 
+  ImmediateDrawer* immediate_drawer() const { return immediate_drawer_; }
+
   void Draw(UIDrawContext& ui_draw_context) override;
 
  protected:
