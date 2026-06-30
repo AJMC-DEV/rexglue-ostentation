@@ -12,6 +12,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -268,6 +269,13 @@ class TextureCache {
     // Non-zero means this texture has a replacement in TextureReplacement's
     // cache; the upload path fetches a const pointer directly — no owned copy.
     uint64_t replacement_content_hash_ = 0;
+
+    // Mark this texture so it will be re-uploaded on the next draw call.
+    // Called every frame for video-backed textures to push the new decoded frame.
+    void MarkVideoFrameOutdated() {
+      base_outdated_ = true;
+      outdated_mask_.fetch_or(kOutdatedBitBase, std::memory_order_release);
+    }
 #endif
 
    protected:
@@ -672,6 +680,14 @@ class TextureCache {
   // Entries are erased when the shared-memory watch fires for that page, so
   // the hash is only recomputed when guest memory actually changes.
   std::unordered_map<uint32_t, uint64_t> base_page_hash_cache_;
+
+  // Non-owning pointers to GPU Texture objects whose pixel data comes from a
+  // video replacement.  Every BeginFrame these are marked outdated so the new
+  // decoded frame is re-uploaded.  Cleared in DestroyAllTextures.
+  std::vector<Texture*> video_textures_;
+
+  // Wall-clock timestamp of the previous BeginFrame call (for delta_ms).
+  std::chrono::steady_clock::time_point last_frame_time_{};
 #endif
 };
 

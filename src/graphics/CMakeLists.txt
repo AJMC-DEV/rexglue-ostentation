@@ -124,6 +124,10 @@ target_link_libraries(rexgpu-xenos PRIVATE
     snappy
 )
 
+if(REXGLUE_ENABLE_TEXTURES)
+    target_link_libraries(rexgpu-xenos PRIVATE libavcodec libavutil)
+endif()
+
 if(REXGLUE_USE_VULKAN)
     target_link_libraries(rexgpu-xenos PRIVATE
         volk::volk

@@ -575,6 +575,7 @@ struct XEthernetStatus {
 };
 
 u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
+  return 1;
   uint32_t status = REXCVAR_GET(xlive_web_enabled) ? 0x0Bu : 0u;
   REXKRNL_INFO("XNetGetEthernetLinkStatus -> {:02X}", status);
   return status;

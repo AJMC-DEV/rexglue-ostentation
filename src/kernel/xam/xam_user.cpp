@@ -39,10 +39,16 @@ namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
 
+// Online XUIDs on Xbox Live have high word 0x0009. Offline XUIDs have 0xE... or 0xB...
+// We synthesize an online XUID by replacing the high 2 bytes with the Live prefix
+// while keeping the lower 6 bytes as the unique user identifier.
+static inline uint64_t MakeSyntheticOnlineXuid(uint64_t offline_xuid) {
+  return 0x0009000000000000ULL | (offline_xuid & 0x0000FFFFFFFFFFFFULL);
+}
+
 i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
-  assert_true(type_mask == 1 || type_mask == 2 || type_mask == 3 || type_mask == 4 ||
-              type_mask == 7);
   if (!xuid_ptr) {
+    REXKRNL_INFO("XamUserGetXUID_entry: X_E_INVALIDARG");
     return X_E_INVALIDARG;
   }
   uint32_t result = X_E_NO_SUCH_USER;
@@ -52,11 +58,14 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
       auto type = user_profile->type() & type_mask;
       if (type & (2 | 4)) {
-        // maybe online profile?
         xuid = user_profile->xuid();
+        // type_mask=2 means "online XUID only" — synthesize the 0x0009... prefix
+        // so the game's XUID high-word check passes.
+        //if ((type_mask & X_USER_GET_SIGNIN_INFO_ONLINE_XUID_ONLY) && REXCVAR_GET(xlive_web_enabled)) {
+          xuid = MakeSyntheticOnlineXuid(xuid);
+        //}
         result = X_E_SUCCESS;
       } else if (type & 1) {
-        // maybe offline profile?
         xuid = user_profile->xuid();
         result = X_E_SUCCESS;
       }
@@ -64,11 +73,14 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   } else {
     result = X_E_INVALIDARG;
   }
+  REXKRNL_INFO("XamUserGetXUID: user={} type_mask={:08X} -> {:016X} result={:08X}",
+               (uint32_t)user_index, (uint32_t)type_mask, xuid, result);
   *xuid_ptr = xuid;
   return result;
 }
 
 u32 XamUserGetSigninState_entry(u32 user_index) {
+  return 2;
   uint32_t signin_state = 0;
   if (user_index < 4) {
     if (user_index == 0) {
@@ -91,30 +103,32 @@ u32 XamUserGetSigninState_entry(u32 user_index) {
 constexpr uint32_t X_USER_GET_SIGNIN_INFO_OFFLINE_XUID_ONLY = 0x01;
 constexpr uint32_t X_USER_GET_SIGNIN_INFO_ONLINE_XUID_ONLY  = 0x02;
 
-// Online XUIDs on Xbox Live have high word 0x0009. Offline XUIDs have 0xE... or 0xB...
-// We synthesize an online XUID by replacing the high 2 bytes with the Live prefix
-// while keeping the lower 6 bytes as the unique user identifier.
-static inline uint64_t MakeSyntheticOnlineXuid(uint64_t offline_xuid) {
-  return 0x0009000000000000ULL | (offline_xuid & 0x0000FFFFFFFFFFFFULL);
-}
+enum _XUSER_SIGNIN_STATE
+{
+  eXUserSigninState_NotSignedIn    = 0x0,
+  eXUserSigninState_SignedInLocally = 0x1,
+  eXUserSigninState_SignedInToLive = 0x2,
+};
 
 typedef struct {
   rex::be<uint64_t> xuid;
   rex::be<uint32_t> info_flags;
   rex::be<uint32_t> signin_state;
-  rex::be<uint32_t> unk10;  // ?
-  rex::be<uint32_t> unk14;  // ?
+  rex::be<uint32_t> dwGuestNumber;  // ?
+  rex::be<uint32_t> dwSponsorUserIndex;  // ?
   char name[16];
 } X_USER_SIGNIN_INFO;
 static_assert_size(X_USER_SIGNIN_INFO, 40);
 
 i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNIN_INFO> info) {
   if (!info) {
+    REXKRNL_INFO("XamUserGetSigninInfo: X_E_INVALIDARG");
     return X_E_INVALIDARG;
   }
 
   std::memset(info, 0, sizeof(X_USER_SIGNIN_INFO));
   if (user_index) {
+    REXKRNL_INFO("XamUserGetSigninInfo: X_E_NO_SUCH_USER");
     return X_E_NO_SUCH_USER;
   }
 
@@ -125,14 +139,14 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
   // return a synthetic online XUID (0x0009... prefix). Games use the high word to
   // decide whether the user has an Xbox Live account; an offline 0xB13E... XUID
   // causes the game to hide the Xbox Live option and only show System Link.
-  if ((flags & X_USER_GET_SIGNIN_INFO_ONLINE_XUID_ONLY) && REXCVAR_GET(xlive_web_enabled)) {
+  if (REXCVAR_GET(xlive_web_enabled)) {
     xuid = MakeSyntheticOnlineXuid(xuid);
   }
   info->xuid = xuid;
 
   uint32_t state = user_profile->signin_state();
   if (REXCVAR_GET(xlive_web_enabled) && state == 1) state = 2;
-  info->signin_state = state;
+  info->signin_state = 2;
   // Only LIVE_ENABLED belongs in info_flags. Tier lives in cached_user_flags
   // (returned separately via XamUserGetCachedUserFlags / XamUserGetUserFlags).
   info->info_flags = REXCVAR_GET(xlive_web_enabled) ? XUSER_INFO_FLAG_LIVE_ENABLED : 0u;
@@ -144,13 +158,9 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
 
 u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
   if (user_index >= 4) {
+    REXKRNL_INFO("XamUserGetName_entry: X_E_INVALIDARG");
     return X_E_INVALIDARG;
   }
-
-  if (user_index) {
-    return X_E_NO_SUCH_USER;
-  }
-
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   const auto& user_name = user_profile->name();
   rex::string::copy_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
@@ -159,14 +169,17 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
 
 u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_len) {
   if (user_index >= 4) {
+    REXKRNL_INFO("XamUserGetGamerTag_entry: X_E_INVALIDARG");
     return X_E_INVALIDARG;
   }
 
   if (user_index) {
+    REXKRNL_INFO("XamUserGetGamerTag_entry: X_E_NO_SUCH_USER");
     return X_E_NO_SUCH_USER;
   }
 
   if (!buffer || buffer_len < 16) {
+    REXKRNL_INFO("XamUserGetGamerTag_entry: X_E_INVALIDARG");
     return X_E_INVALIDARG;
   }
 
@@ -409,14 +422,43 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
   return X_ERROR_SUCCESS;
 }
 
+enum _XPRIVILEGE_TYPE : __int32
+{
+  XPRIVILEGE_MULTIPLAYER_SESSIONS  = 0xFE,
+  XPRIVILEGE_COMMUNICATIONS        = 0xFC,
+  XPRIVILEGE_COMMUNICATIONS_FRIENDS_ONLY = 0xFB,
+  XPRIVILEGE_PROFILE_VIEWING       = 0xF9,
+  XPRIVILEGE_PROFILE_VIEWING_FRIENDS_ONLY = 0xF8,
+  XPRIVILEGE_USER_CREATED_CONTENT  = 0xF7,
+  XPRIVILEGE_USER_CREATED_CONTENT_FRIENDS_ONLY = 0xF6,
+  XPRIVILEGE_PURCHASE_CONTENT      = 0xF5,
+  XPRIVILEGE_PRESENCE              = 0xF4,
+  XPRIVILEGE_PRESENCE_FRIENDS_ONLY = 0xF3,
+  XPRIVILEGE_TRADE_CONTENT         = 0xEE,
+  XPRIVILEGE_VIDEO_COMMUNICATIONS  = 0xEB,
+  XPRIVILEGE_VIDEO_COMMUNICATIONS_FRIENDS_ONLY = 0xEA,
+};
+
+enum liveUserPrivilegeResult_e : __int32
+{
+  liveUserPrivilegeResult_Yes = 0x0,
+  liveUserPrivilegeResult_No  = 0x1,
+  liveUserPrivilegeResult_FriendsOnly = 0x2,
+  liveUserPrivilegeResult_MAX = 0x3,
+};
+
 u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) {
+  *out_value = 0;
+  return 0; // liveUserPrivilegeResult_Yes
   // checking all users?
   if (user_index != 0xFF) {
     if (user_index >= 4) {
+      REXKRNL_INFO("XamUserCheckPrivilege: X_ERROR_INVALID_PARAMETER");
       return X_ERROR_INVALID_PARAMETER;
     }
 
     if (user_index) {
+      REXKRNL_INFO("XamUserCheckPrivilege: X_ERROR_NO_SUCH_USER");
       return X_ERROR_NO_SUCH_USER;
     }
   }
@@ -427,9 +469,12 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
     *out_value = 0;
     return X_ERROR_NOT_LOGGED_ON;
   }
-  REXKRNL_INFO("XamUserCheckPrivilege: user={} mask={:08X} -> 1 (allowed)",
+  // pfResult=0 means "NOT restricted by parental controls" = allowed.
+  // pfResult=1 means "restricted". The game checks (pfResult == 0) to decide
+  // if the Xbox Live option is available — returning 1 hides it entirely.
+  REXKRNL_INFO("XamUserCheckPrivilege: user={} mask={:08X} -> 0 (not restricted)",
                (uint32_t)user_index, (uint32_t)mask);
-  *out_value = 1;
+  *out_value = 0;
   return X_ERROR_SUCCESS;
 }
 
@@ -478,6 +523,14 @@ static uint32_t GetUserOnlineFlags() {
   return static_cast<uint32_t>(XONLINE_USER_MEMBERSHIP_TIER_GOLD) << 20;
 }
 
+// Returns true if `xuid` refers to the same account as `profile_xuid`, regardless
+// of whether the caller holds the raw offline XUID or the synthesized online XUID
+// (0x0009... prefix).  The low 48 bits uniquely identify the account.
+static bool IsOurXuid(uint64_t xuid, uint64_t profile_xuid) {
+  return xuid == profile_xuid ||
+         (xuid & 0x0000FFFFFFFFFFFFULL) == (profile_xuid & 0x0000FFFFFFFFFFFFULL);
+}
+
 u32 XamUserGetCachedUserFlags_entry(u32 user_index) {
   uint32_t flags = (user_index == 0) ? GetUserOnlineFlags() : 0;
   REXKRNL_INFO("XamUserGetCachedUserFlags: user={} -> {:08X}", (uint32_t)user_index, flags);
@@ -492,14 +545,14 @@ u32 XamUserGetUserFlags_entry(u32 user_index) {
 
 u32 XamUserGetUserFlagsFromXUID_entry(u64 xuid) {
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  uint32_t flags = (user_profile->xuid() == (uint64_t)xuid) ? GetUserOnlineFlags() : 0;
+  uint32_t flags = IsOurXuid((uint64_t)xuid, user_profile->xuid()) ? GetUserOnlineFlags() : 0;
   REXKRNL_INFO("XamUserGetUserFlagsFromXUID: xuid={:016X} -> {:08X}", (uint64_t)xuid, flags);
   return flags;
 }
 
 u32 XamUserGetMembershipTierFromXUID_entry(u64 xuid) {
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  uint32_t tier = (user_profile->xuid() == (uint64_t)xuid) ? XONLINE_USER_MEMBERSHIP_TIER_GOLD : 0;
+  uint32_t tier = IsOurXuid((uint64_t)xuid, user_profile->xuid()) ? XONLINE_USER_MEMBERSHIP_TIER_GOLD : 0;
   REXKRNL_INFO("XamUserGetMembershipTierFromXUID: xuid={:016X} -> {}", (uint64_t)xuid, tier);
   return tier;
 }

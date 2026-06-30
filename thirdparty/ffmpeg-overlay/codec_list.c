@@ -14,4 +14,5 @@ static const AVCodec* const codec_list[] = {
 #if CONFIG_XMAFRAMES_DECODER
     &ff_xmaframes_decoder,
 #endif
+    &ff_h264_decoder,  // For video texture replacement (.mp4)
     NULL};

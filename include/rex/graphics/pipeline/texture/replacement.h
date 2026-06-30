@@ -35,6 +35,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -63,13 +64,16 @@ struct TextureReplacementData {
   uint32_t mip_levels = 1;
 };
 
+// Internal video decoder — definition lives in replacement.cpp.
+class VideoDecoder;
+
 // ---------------------------------------------------------------------------
 // TextureReplacement
 // ---------------------------------------------------------------------------
 class TextureReplacement {
  public:
   explicit TextureReplacement(std::filesystem::path root);
-  ~TextureReplacement() = default;
+  ~TextureReplacement();
 
   TextureReplacement(const TextureReplacement&)            = delete;
   TextureReplacement& operator=(const TextureReplacement&) = delete;
@@ -101,8 +105,17 @@ class TextureReplacement {
   // Injection path
   // ---------------------------------------------------------------------------
   // Returns a pointer into the internal cache, or nullptr if not found.
-  // The pointer is valid until the next call to Rescan().
+  // For static textures: pointer is valid until the next call to Rescan().
+  // For video textures: pointer is valid until the next AdvanceVideoFrames().
   [[nodiscard]] const TextureReplacementData* FindReplacement(uint64_t content_hash) const;
+
+  // Returns true if content_hash corresponds to an .mp4 video replacement.
+  [[nodiscard]] bool IsVideoReplacement(uint64_t content_hash) const;
+
+  // Advance all video textures by delta_ms milliseconds.
+  // Returns true if at least one video frame changed (caller should
+  // re-upload all video-backed GPU textures for this frame).
+  bool AdvanceVideoFrames(double delta_ms);
 
   // ---------------------------------------------------------------------------
   // Hash
@@ -123,6 +136,10 @@ class TextureReplacement {
   mutable std::unordered_map<uint64_t, TextureReplacementData> pixel_cache_;
   // Hashes that failed to load are remembered so we don't retry every frame.
   mutable std::unordered_set<uint64_t> failed_cache_;
+
+  // Video texture decoders — one per .mp4 file, keyed by content hash.
+  // FindReplacement returns a pointer into VideoDecoder::current_data_.
+  std::unordered_map<uint64_t, std::unique_ptr<VideoDecoder>> video_decoders_;
 
   static bool WriteDDS_RGBA8(const std::filesystem::path& path,
                              uint32_t width, uint32_t height,

@@ -359,6 +359,40 @@ void TextureCache::BeginFrame() {
   // sure bindings are reset so a new attempt will surely be made if the texture
   // is requested again.
   ResetTextureBindings();
+
+#ifdef REXGLUE_ENABLE_TEXTURES
+  if (replacement_ && !video_textures_.empty()) {
+    // Compute wall-clock delta since the last frame.
+    auto now = std::chrono::steady_clock::now();
+    double delta_ms = 0.0;
+    if (last_frame_time_.time_since_epoch().count() != 0) {
+      delta_ms = std::chrono::duration<double, std::milli>(now - last_frame_time_).count();
+    }
+    last_frame_time_ = now;
+
+    if (replacement_->AdvanceVideoFrames(delta_ms)) {
+      // At least one video texture has a new decoded frame. The guest samples
+      // the resident host texture every frame through cached descriptors and
+      // only re-fetches it occasionally (e.g. on a menu transition), so the
+      // binding-driven upload path in RequestTextures won't refresh the
+      // contents in between. Copy the freshly decoded frame straight into each
+      // video-backed host texture now so playback is visible every frame
+      // without waiting for the guest to re-fetch the texture.
+      for (Texture* tex : video_textures_) {
+        if (tex == nullptr || tex->replacement_content_hash_ == 0) {
+          continue;
+        }
+        const TextureReplacementData* repl =
+            replacement_->FindReplacement(tex->replacement_content_hash_);
+        if (repl) {
+          LoadTextureDataFromReplacementImpl(*tex, *repl);
+        }
+      }
+    }
+  } else {
+    last_frame_time_ = std::chrono::steady_clock::now();
+  }
+#endif
 }
 
 void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
@@ -854,6 +888,9 @@ void TextureCache::DestroyAllTextures(bool from_destructor) {
   ResetTextureBindings(from_destructor);
   textures_.clear();
   COUNT_profile_set("gpu/texture_cache/textures", 0);
+#ifdef REXGLUE_ENABLE_TEXTURES
+  video_textures_.clear();
+#endif
 }
 
 TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
@@ -1034,6 +1071,14 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     }
 #endif
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
+
+#ifdef REXGLUE_ENABLE_TEXTURES
+    // Track video-backed textures so BeginFrame can re-upload each new frame.
+    if (has_replacement && replacement_ &&
+        replacement_->IsVideoReplacement(replacement_content_hash)) {
+      video_textures_.push_back(texture);
+    }
+#endif
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");

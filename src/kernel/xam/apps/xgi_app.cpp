@@ -16,6 +16,16 @@
 #include <rex/system/xsession.h>
 #include <rex/thread.h>
 
+#include <cstdio>
+#include <cstring>
+
+#if REX_PLATFORM_WIN32
+#include <WinSock2.h>
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#endif
+
 REXCVAR_DECLARE(bool,    xlive_web_enabled);
 REXCVAR_DECLARE(int32_t, systemlink_base_port);
 REXCVAR_DECLARE(int32_t, systemlink_port_offset);
@@ -27,6 +37,30 @@ using namespace rex::system;
 using namespace rex::system::xam;
 namespace apps {
 using namespace rex::system;
+
+// Parse a hex string (must be exactly 2*out_len chars) into raw bytes.
+static bool HexToBytes(const std::string& hex, uint8_t* out, size_t out_len) {
+  if (hex.size() != out_len * 2) return false;
+  for (size_t i = 0; i < out_len; ++i) {
+    unsigned byte = 0;
+    if (std::sscanf(hex.c_str() + i * 2, "%02x", &byte) != 1) return false;
+    out[i] = static_cast<uint8_t>(byte);
+  }
+  return true;
+}
+
+// Write an IPv4 address string to 4 bytes in network byte order (big-endian).
+static void WriteIPNBO(uint8_t* dst, const std::string& ip_str) {
+  unsigned a = 0, b = 0, c = 0, d = 0;
+  if (std::sscanf(ip_str.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
+    dst[0] = static_cast<uint8_t>(a);
+    dst[1] = static_cast<uint8_t>(b);
+    dst[2] = static_cast<uint8_t>(c);
+    dst[3] = static_cast<uint8_t>(d);
+  } else {
+    std::memset(dst, 0, 4);
+  }
+}
 
 XgiApp::XgiApp(KernelState* kernel_state) : App(kernel_state, 0xFB) {}
 
@@ -252,19 +286,113 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
     case 0x000B0016: {
       assert_true(!buffer_length || buffer_length == 32);
 
-      uint32_t proc_index = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 4);
-      uint32_t num_results = memory::load_and_swap<uint32_t>(buffer + 8);
-      uint16_t num_props = memory::load_and_swap<uint16_t>(buffer + 12);
-      uint16_t num_ctx = memory::load_and_swap<uint16_t>(buffer + 14);
-      uint32_t props_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
-      uint32_t ctx_ptr = memory::load_and_swap<uint32_t>(buffer + 20);
+      uint32_t proc_index          = memory::load_and_swap<uint32_t>(buffer + 0);
+      uint32_t user_index          = memory::load_and_swap<uint32_t>(buffer + 4);
+      uint32_t num_results         = memory::load_and_swap<uint32_t>(buffer + 8);
+      uint16_t num_props           = memory::load_and_swap<uint16_t>(buffer + 12);
+      uint16_t num_ctx             = memory::load_and_swap<uint16_t>(buffer + 14);
+      uint32_t props_ptr           = memory::load_and_swap<uint32_t>(buffer + 16);
+      uint32_t ctx_ptr             = memory::load_and_swap<uint32_t>(buffer + 20);
       uint32_t results_buffer_size = memory::load_and_swap<uint32_t>(buffer + 24);
-      uint32_t search_results_ptr = memory::load_and_swap<uint32_t>(buffer + 28);
+      uint32_t search_results_ptr  = memory::load_and_swap<uint32_t>(buffer + 28);
 
-      REXKRNL_DEBUG("XSessionSearch({}, {}, {}, {}, {}, {:08X}, {:08X}, {}, {:08X})", proc_index,
-                    user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
-                    results_buffer_size, search_results_ptr);
+      REXKRNL_INFO("XSessionSearch({}, {}, {}, {}, {}, {:08X}, {:08X}, {}, {:08X})", proc_index,
+                   user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
+                   results_buffer_size, search_results_ptr);
+
+      if (!REXCVAR_GET(xlive_web_enabled) || !search_results_ptr) {
+        return X_E_SUCCESS;
+      }
+
+      auto& wc = system::XLiveWebClient::Get();
+      wc.EnsureReady();
+      std::vector<system::WebSession> sessions;
+      bool ok = wc.SearchSessions(kernel_state_->title_id(), sessions);
+      REXKRNL_INFO("XSessionSearch: SearchSessions ok={} count={}", ok, sessions.size());
+      if (!ok) {
+        return X_E_SUCCESS;
+      }
+
+      // Cap to what the game allocated for and what fits in the results buffer.
+      // _XSESSION_SEARCHRESULT = 92 bytes; header = 8 bytes.
+      constexpr uint32_t kResultSize = 92;
+      constexpr uint32_t kHeaderSize = 8;
+      uint32_t max_by_alloc = num_results;
+      if (results_buffer_size >= kHeaderSize) {
+        uint32_t max_by_buf = (results_buffer_size - kHeaderSize) / kResultSize;
+        if (max_by_buf < max_by_alloc) max_by_alloc = max_by_buf;
+      }
+
+      uint32_t count = static_cast<uint32_t>(sessions.size());
+      if (count > max_by_alloc) count = max_by_alloc;
+
+      auto* out = memory_->TranslateVirtual(search_results_ptr);
+      if (!out) {
+        REXKRNL_WARN("XSessionSearch: search_results_ptr {:08X} unmapped", search_results_ptr);
+        return X_E_SUCCESS;
+      }
+
+      // _XSESSION_SEARCHRESULT_HEADER: dwSearchResults (u32) + pResults (guest ptr, u32)
+      // pResults points to the array immediately after the 8-byte header.
+      uint32_t results_guest_ptr = search_results_ptr + kHeaderSize;
+      memory::store_and_swap<uint32_t>(out + 0, count);
+      memory::store_and_swap<uint32_t>(out + 4, count > 0 ? results_guest_ptr : 0u);
+
+      uint8_t* r = out + kHeaderSize;
+      for (uint32_t i = 0; i < count; ++i, r += kResultSize) {
+        const auto& ws = sessions[i];
+        std::memset(r, 0, kResultSize);
+
+        // _XSESSION_INFO starts at offset 0:
+        //   XNKID  sessionID  [0x00, 8 bytes]
+        //   XNADDR hostAddress[0x08, 36 bytes]
+        //   XNKEY  keyExchange[0x2C, 16 bytes]
+        // Total _XSESSION_INFO = 60 bytes
+
+        // XNKID (8 bytes at 0x00): 16 hex chars from xnkid_hex
+        if (!HexToBytes(ws.xnkid_hex, r + 0x00, 8)) {
+          REXKRNL_WARN("XSessionSearch: bad xnkid_hex '{}' for session {}", ws.xnkid_hex, i);
+        }
+
+        // XNADDR (36 bytes at 0x08):
+        //   ina         u32  [0x08] — LAN address, unknown; leave 0
+        //   inaOnline   u32  [0x0C] — public IP in NBO (written raw, no swap)
+        //   wPortOnline u16  [0x10] — port in NBO
+        //   abEnet      [6]  [0x12] — Ethernet MAC / pseudo-MAC from host_xuid low bytes
+        //   abOnline    [20] [0x18] — zeros
+        WriteIPNBO(r + 0x0C, ws.host_address);
+        memory::store_and_swap<uint16_t>(r + 0x10, ws.port);
+        // Use the low 6 bytes of host_xuid as a pseudo-MAC for abEnet
+        uint64_t xuid = ws.host_xuid;
+        r[0x12] = static_cast<uint8_t>((xuid >> 40) & 0xFF);
+        r[0x13] = static_cast<uint8_t>((xuid >> 32) & 0xFF);
+        r[0x14] = static_cast<uint8_t>((xuid >> 24) & 0xFF);
+        r[0x15] = static_cast<uint8_t>((xuid >> 16) & 0xFF);
+        r[0x16] = static_cast<uint8_t>((xuid >>  8) & 0xFF);
+        r[0x17] = static_cast<uint8_t>((xuid >>  0) & 0xFF);
+
+        // XNKEY (16 bytes at 0x2C): 32 hex chars from xnkey_hex
+        if (!HexToBytes(ws.xnkey_hex, r + 0x2C, 16)) {
+          REXKRNL_WARN("XSessionSearch: bad xnkey_hex '{}' for session {}", ws.xnkey_hex, i);
+        }
+
+        // Slot counts at 0x3C–0x4B (all u32 big-endian):
+        //   dwOpenPublicSlots   [0x3C]
+        //   dwOpenPrivateSlots  [0x40]
+        //   dwFilledPublicSlots [0x44]
+        //   dwFilledPrivateSlots[0x48]
+        memory::store_and_swap<uint32_t>(r + 0x3C, ws.slots_public);
+        memory::store_and_swap<uint32_t>(r + 0x40, ws.slots_private);
+        // Filled slots unknown; leave as 0.
+
+        // cProperties, cContexts, pProperties, pContexts at 0x4C–0x58: all 0 (no props/ctx)
+
+        REXKRNL_INFO("XSessionSearch: result[{}] xnkid={} host={} port={} pub={} priv={}",
+                     i, ws.xnkid_hex, ws.host_address, ws.port,
+                     ws.slots_public, ws.slots_private);
+      }
+
+      REXKRNL_INFO("XSessionSearch: wrote {} results to {:08X}", count, search_results_ptr);
       return X_E_SUCCESS;
     }
     case 0x000B0018: {
@@ -283,23 +411,84 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
     case 0x000B001C: {
       assert_true(!buffer_length || buffer_length == 36);
 
-      // session_search
-      uint32_t proc_index = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 4);
-      uint32_t num_results = memory::load_and_swap<uint32_t>(buffer + 8);
-      uint16_t num_props = memory::load_and_swap<uint16_t>(buffer + 12);
-      uint16_t num_ctx = memory::load_and_swap<uint16_t>(buffer + 14);
-      uint32_t props_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
-      uint32_t ctx_ptr = memory::load_and_swap<uint32_t>(buffer + 20);
+      uint32_t proc_index          = memory::load_and_swap<uint32_t>(buffer + 0);
+      uint32_t user_index          = memory::load_and_swap<uint32_t>(buffer + 4);
+      uint32_t num_results         = memory::load_and_swap<uint32_t>(buffer + 8);
+      uint16_t num_props           = memory::load_and_swap<uint16_t>(buffer + 12);
+      uint16_t num_ctx             = memory::load_and_swap<uint16_t>(buffer + 14);
+      uint32_t props_ptr           = memory::load_and_swap<uint32_t>(buffer + 16);
+      uint32_t ctx_ptr             = memory::load_and_swap<uint32_t>(buffer + 20);
       uint32_t results_buffer_size = memory::load_and_swap<uint32_t>(buffer + 24);
-      uint32_t search_results_ptr = memory::load_and_swap<uint32_t>(buffer + 28);
-      //
-      uint32_t num_users = memory::load_and_swap<uint32_t>(buffer + 32);
+      uint32_t search_results_ptr  = memory::load_and_swap<uint32_t>(buffer + 28);
+      uint32_t num_users           = memory::load_and_swap<uint32_t>(buffer + 32);
 
-      REXKRNL_DEBUG("XSessionSearchEx({}, {}, {}, {}, {}, {:08X}, {:08X}, {}, {:08X}, {})",
-                    proc_index, user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
-                    results_buffer_size, search_results_ptr, num_users);
+      REXKRNL_INFO("XSessionSearchEx({}, {}, {}, {}, {}, {:08X}, {:08X}, {}, {:08X}, {})",
+                   proc_index, user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
+                   results_buffer_size, search_results_ptr, num_users);
 
+      if (!REXCVAR_GET(xlive_web_enabled) || !search_results_ptr) {
+        return X_E_SUCCESS;
+      }
+
+      auto& wc = system::XLiveWebClient::Get();
+      wc.EnsureReady();
+      std::vector<system::WebSession> sessions;
+      bool ok = wc.SearchSessions(kernel_state_->title_id(), sessions);
+      REXKRNL_INFO("XSessionSearchEx: SearchSessions ok={} count={}", ok, sessions.size());
+      if (!ok) {
+        return X_E_SUCCESS;
+      }
+
+      constexpr uint32_t kResultSize = 92;
+      constexpr uint32_t kHeaderSize = 8;
+      uint32_t max_by_alloc = num_results;
+      if (results_buffer_size >= kHeaderSize) {
+        uint32_t max_by_buf = (results_buffer_size - kHeaderSize) / kResultSize;
+        if (max_by_buf < max_by_alloc) max_by_alloc = max_by_buf;
+      }
+
+      uint32_t count = static_cast<uint32_t>(sessions.size());
+      if (count > max_by_alloc) count = max_by_alloc;
+
+      auto* out = memory_->TranslateVirtual(search_results_ptr);
+      if (!out) {
+        REXKRNL_WARN("XSessionSearchEx: search_results_ptr {:08X} unmapped", search_results_ptr);
+        return X_E_SUCCESS;
+      }
+
+      uint32_t results_guest_ptr = search_results_ptr + kHeaderSize;
+      memory::store_and_swap<uint32_t>(out + 0, count);
+      memory::store_and_swap<uint32_t>(out + 4, count > 0 ? results_guest_ptr : 0u);
+
+      uint8_t* r = out + kHeaderSize;
+      for (uint32_t i = 0; i < count; ++i, r += kResultSize) {
+        const auto& ws = sessions[i];
+        std::memset(r, 0, kResultSize);
+
+        if (!HexToBytes(ws.xnkid_hex, r + 0x00, 8)) {
+          REXKRNL_WARN("XSessionSearchEx: bad xnkid_hex '{}' for session {}", ws.xnkid_hex, i);
+        }
+        WriteIPNBO(r + 0x0C, ws.host_address);
+        memory::store_and_swap<uint16_t>(r + 0x10, ws.port);
+        uint64_t xuid = ws.host_xuid;
+        r[0x12] = static_cast<uint8_t>((xuid >> 40) & 0xFF);
+        r[0x13] = static_cast<uint8_t>((xuid >> 32) & 0xFF);
+        r[0x14] = static_cast<uint8_t>((xuid >> 24) & 0xFF);
+        r[0x15] = static_cast<uint8_t>((xuid >> 16) & 0xFF);
+        r[0x16] = static_cast<uint8_t>((xuid >>  8) & 0xFF);
+        r[0x17] = static_cast<uint8_t>((xuid >>  0) & 0xFF);
+        if (!HexToBytes(ws.xnkey_hex, r + 0x2C, 16)) {
+          REXKRNL_WARN("XSessionSearchEx: bad xnkey_hex '{}' for session {}", ws.xnkey_hex, i);
+        }
+        memory::store_and_swap<uint32_t>(r + 0x3C, ws.slots_public);
+        memory::store_and_swap<uint32_t>(r + 0x40, ws.slots_private);
+
+        REXKRNL_INFO("XSessionSearchEx: result[{}] xnkid={} host={} port={} pub={} priv={}",
+                     i, ws.xnkid_hex, ws.host_address, ws.port,
+                     ws.slots_public, ws.slots_private);
+      }
+
+      REXKRNL_INFO("XSessionSearchEx: wrote {} results to {:08X}", count, search_results_ptr);
       return X_E_SUCCESS;
     }
     case 0x000B001D: {

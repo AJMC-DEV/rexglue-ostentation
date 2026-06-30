@@ -672,6 +672,61 @@ endif()
 # Hidden visibility is required on aarch64. The NEON .S files use ADRP/ADD
 # PC-relative addressing (movrel) for symbols like ff_cos_*, which the linker
 # only accepts against locally bound symbols when emitting a shared object.
+# H264 software decoder — needed for .mp4 animated texture replacement
+# (REXGLUE_ENABLE_TEXTURES). Compiled into the same libavcodec target.
+# No NASM assembler required: HAVE_X86ASM=0 in config.h guards all .asm paths.
+if(REXGLUE_ENABLE_TEXTURES)
+    target_sources(libavcodec PRIVATE
+        ${FFMPEG_DIR}/libavcodec/atsc_a53.c
+        ${FFMPEG_DIR}/libavcodec/cabac.c
+        ${FFMPEG_DIR}/libavcodec/error_resilience.c
+        ${FFMPEG_DIR}/libavcodec/golomb.c
+        ${FFMPEG_DIR}/libavcodec/me_cmp.c
+        ${FFMPEG_DIR}/libavcodec/mpegutils.c
+        ${FFMPEG_DIR}/libavcodec/startcode.c
+        ${FFMPEG_DIR}/libavcodec/videodsp.c
+        ${FFMPEG_DIR}/libavcodec/h2645_parse.c
+        ${FFMPEG_DIR}/libavcodec/h264_cabac.c
+        ${FFMPEG_DIR}/libavcodec/h264_cavlc.c
+        ${FFMPEG_DIR}/libavcodec/h264_direct.c
+        ${FFMPEG_DIR}/libavcodec/h264_levels.c
+        ${FFMPEG_DIR}/libavcodec/h264_loopfilter.c
+        ${FFMPEG_DIR}/libavcodec/h264_mb.c
+        ${FFMPEG_DIR}/libavcodec/h264_parse.c
+        ${FFMPEG_DIR}/libavcodec/h264_parser.c
+        ${FFMPEG_DIR}/libavcodec/h264_picture.c
+        ${FFMPEG_DIR}/libavcodec/h264_ps.c
+        ${FFMPEG_DIR}/libavcodec/h264_refs.c
+        ${FFMPEG_DIR}/libavcodec/h264_sei.c
+        ${FFMPEG_DIR}/libavcodec/h264_slice.c
+        ${FFMPEG_DIR}/libavcodec/h264chroma.c
+        ${FFMPEG_DIR}/libavcodec/h264data.c
+        ${FFMPEG_DIR}/libavcodec/h264dec.c
+        ${FFMPEG_DIR}/libavcodec/h264dsp.c
+        ${FFMPEG_DIR}/libavcodec/h264idct.c
+        ${FFMPEG_DIR}/libavcodec/h264pred.c
+        ${FFMPEG_DIR}/libavcodec/h264qpel.c
+    )
+    if(IS_X86_64)
+        target_sources(libavcodec PRIVATE
+            ${FFMPEG_DIR}/libavcodec/x86/h264chroma_init.c
+            ${FFMPEG_DIR}/libavcodec/x86/h264dsp_init.c
+            ${FFMPEG_DIR}/libavcodec/x86/h264_intrapred_init.c
+            ${FFMPEG_DIR}/libavcodec/x86/h264_qpel.c
+            ${FFMPEG_DIR}/libavcodec/x86/me_cmp_init.c
+            ${FFMPEG_DIR}/libavcodec/x86/videodsp_init.c
+        )
+    endif()
+    if(IS_ARM64)
+        target_sources(libavcodec PRIVATE
+            ${FFMPEG_DIR}/libavcodec/aarch64/h264chroma_init.c
+            ${FFMPEG_DIR}/libavcodec/aarch64/h264dsp_init.c
+            ${FFMPEG_DIR}/libavcodec/aarch64/h264pred_init.c
+            ${FFMPEG_DIR}/libavcodec/aarch64/videodsp_init.c
+        )
+    endif()
+endif()
+
 set_target_properties(libavutil libavcodec PROPERTIES
     C_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
