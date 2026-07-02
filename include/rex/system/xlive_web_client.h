@@ -70,6 +70,13 @@ class XLiveWebClient {
   /// True once EnsureReady() has succeeded.
   bool is_ready() const { return ready_; }
 
+  /// True once the player has been successfully registered on the backend.
+  bool is_registered() const { return registered_ok_; }
+
+  /// Identity used for the last registration (empty until EnsureReady()).
+  const std::string& registered_xuid() const { return registered_xuid_; }
+  const std::string& registered_mac() const { return registered_mac_; }
+
   /// Public IPv4 address (dotted decimal) from /whoami.
   const std::string& public_address() const { return public_address_; }
   uint32_t           public_address_net() const;  ///< network byte order
@@ -143,6 +150,7 @@ class XLiveWebClient {
   mutable std::mutex mtx_;
   bool ready_         = false;
   bool startup_tried_ = false;
+  bool registered_ok_ = false;
 
   std::string public_address_;
   std::string registered_xuid_;

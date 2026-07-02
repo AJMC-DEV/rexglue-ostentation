@@ -64,14 +64,18 @@ KernelState::KernelState(Runtime* emulator)
   file_system_ = emulator->file_system();
 
   app_manager_ = std::make_unique<xam::AppManager>();
-  user_profile_ = std::make_unique<xam::UserProfile>();
-  user_profile_->set_kernel_state(this);
 
   auto user_data_root = emulator_->user_data_root();
   if (!user_data_root.empty()) {
     user_data_root = std::filesystem::absolute(user_data_root);
   }
   content_manager_ = std::make_unique<xam::ContentManager>(this, user_data_root);
+
+  // Profile manager scans the content root for xenia-format profiles and
+  // signs one in to slot 0 (creating a default live-enabled profile when
+  // none exist yet).
+  profile_manager_ = std::make_unique<xam::ProfileManager>(this);
+  profile_manager_->Initialize();
 
   if (shared_kernel_state_ != nullptr) {
     REXSYS_ERROR("KernelState constructed but shared_kernel_state_ already set");
@@ -1076,20 +1080,53 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
   // Games seem to expect a few notifications on startup, only for the first
   // listener.
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=resident+evil+5&start=375
+  const uint32_t signed_in_players = profile_manager_
+      ? static_cast<uint32_t>(profile_manager_->GetUsedUserSlots().to_ulong())
+      : 1u;
+
   if (!has_notified_startup_ && listener->mask() & 0x00000001) {
     has_notified_startup_ = true;
     // XN_SYS_UI (on, off)
     listener->EnqueueNotification(0x00000009, 1);
     listener->EnqueueNotification(0x00000009, 0);
     // XN_SYS_SIGNINCHANGED x2
-    listener->EnqueueNotification(0x0000000A, 1);
-    listener->EnqueueNotification(0x0000000A, 1);
+    listener->EnqueueNotification(0x0000000A, signed_in_players);
+    listener->EnqueueNotification(0x0000000A, signed_in_players);
     // XN_SYS_INPUTDEVICESCHANGED x2
     listener->EnqueueNotification(0x00000012, 0);
     listener->EnqueueNotification(0x00000012, 0);
     // XN_SYS_INPUTDEVICECONFIGCHANGED x2
     listener->EnqueueNotification(0x00000013, 0);
     listener->EnqueueNotification(0x00000013, 0);
+  }
+
+  // Games listening on the LIVE notification area (mask bit 1) expect
+  // XN_LIVE_CONNECTIONCHANGED before they enable Xbox LIVE functionality
+  // (ported from xenia netplay KernelState::RegisterNotifyListener; e.g.
+  // 4D5307D4 requires these to open its Xbox Live menus).
+  constexpr uint32_t kXNotifyLiveMask = 0x00000002;
+  constexpr uint32_t kXNotificationLiveConnectionChanged = 0x02000001;
+  constexpr uint32_t kXOnlineLogonConnectionEstablished = 0x001510F0;
+  constexpr uint32_t kXOnlineLogonDisconnected = 0x001510F1;
+
+  if (!has_notified_live_startup_ && listener->mask() & kXNotifyLiveMask) {
+    has_notified_live_startup_ = true;
+
+    const bool live_enabled =
+        profile_manager_ && profile_manager_->GetProfile(uint8_t(0)) &&
+        profile_manager_->GetProfile(uint8_t(0))->signin_state() ==
+            xam::X_USER_SIGNIN_STATE::SignedInToLive;
+
+    listener->EnqueueNotification(kXNotificationLiveConnectionChanged,
+                                  live_enabled
+                                      ? kXOnlineLogonConnectionEstablished
+                                      : kXOnlineLogonDisconnected);
+  }
+
+  // 4E4D07ED, 58410869. Fixes creating Xbox Live sessions.
+  // 4D5307D4 expects multiple notifications to access Xbox Live menus.
+  if (listener->mask() == (0x00000001 | kXNotifyLiveMask)) {
+    listener->EnqueueNotification(0x0000000A, signed_in_players);
   }
 }
 

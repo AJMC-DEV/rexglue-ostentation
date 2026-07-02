@@ -36,6 +36,27 @@ u32 XNetLogonSetTitleID_impl(u32 title_id) {
   return 0;
 }
 
+u32 XNetLogonGetMachineID_impl(mapped_u64 machine_id_ptr) {
+  if (!machine_id_ptr) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  // Netplay: machine id = 0xFA00000000000000 | console mac. Our synthetic
+  // console MAC is the low 6 bytes of the offline XUID (same bytes the
+  // XNADDR abEnet carries).
+  uint64_t xuid = 0xB13EBABEBABEBABE;
+  if (auto* profile = REX_KERNEL_STATE()->user_profile()) {
+    xuid = profile->xuid();
+  }
+
+  const uint64_t mac = xuid & 0x0000FFFFFFFFFFFFULL;
+  const uint64_t machine_id = 0xFA00000000000000ULL | mac;
+  *machine_id_ptr = machine_id;
+
+  REXKRNL_INFO("XNetLogonGetMachineID: -> {:016X}", machine_id);
+  return X_STATUS_SUCCESS;
+}
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace rex
@@ -265,7 +286,7 @@ REX_EXPORT_STUB(__imp__XNetLogonGetExtendedStatus);
 REX_EXPORT_STUB(__imp__XNetLogonGetFlowToken);
 REX_EXPORT_STUB(__imp__XNetLogonGetLastUPnPStatus);
 REX_EXPORT_STUB(__imp__XNetLogonGetLoggedOnUsers);
-REX_EXPORT_STUB(__imp__XNetLogonGetMachineID);
+REX_EXPORT(__imp__XNetLogonGetMachineID, rex::kernel::xam::XNetLogonGetMachineID_impl);
 REX_EXPORT_STUB(__imp__XNetLogonGetNatType);
 REX_EXPORT_STUB(__imp__XNetLogonGetServiceInfo);
 REX_EXPORT_STUB(__imp__XNetLogonGetServiceNetworkID);

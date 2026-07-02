@@ -542,6 +542,14 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
     }
     UpdateBuiltinOverlayInputMode();
   });
+  rex::ui::RegisterBind("bind_netplay", "F6", "Toggle netplay/Xbox LIVE overlay", [this] {
+    if (netplay_overlay_) {
+      netplay_overlay_.reset();
+    } else {
+      netplay_overlay_ = std::make_unique<ui::NetplayOverlayDialog>(imgui_drawer_.get());
+    }
+    UpdateBuiltinOverlayInputMode();
+  });
 
   OnCreateDialogs(imgui_drawer_.get());
 }
@@ -678,6 +686,7 @@ void ReXApp::UpdateBuiltinOverlayInputMode() {
       : nullptr;
   if (!input_sys) return;
   bool ui_mode = debug_overlay_ || console_overlay_ || settings_overlay_ || achievements_overlay_
+      || netplay_overlay_
 #ifdef REXGLUE_ENABLE_SHADERS
       || shader_debugger_overlay_
 #endif
@@ -703,6 +712,7 @@ void ReXApp::OnDestroy() {
   rex::ui::UnregisterBind("bind_console");
   rex::ui::UnregisterBind("bind_settings");
   rex::ui::UnregisterBind("bind_achievements");
+  rex::ui::UnregisterBind("bind_netplay");
 
   // ImGui cleanup (reverse of setup)
   if (achievement_notification_listener_ != 0) {

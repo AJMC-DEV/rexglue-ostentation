@@ -7,8 +7,11 @@
  ******************************************************************************
  *
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ * @modified    2026 - Account-based profile model ported from xenia-canary
+ *              netplay (src/xenia/kernel/xam/user_profile.cc).
  */
 
+#include <fstream>
 #include <sstream>
 
 #include <fmt/format.h>
@@ -18,27 +21,105 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
 
-REXCVAR_DECLARE(std::string, user_xuid);
-REXCVAR_DECLARE(std::string, user_gamertag);
+REXCVAR_DECLARE(bool, xlive_web_enabled);
 
 namespace rex {
 namespace system {
 namespace xam {
 
-UserProfile::UserProfile() {
+UserProfile::UserProfile(uint64_t xuid, const X_XAMACCOUNTINFO* account_info,
+                         std::filesystem::path profile_path)
+    : xuid_(xuid),
+      account_info_(*account_info),
+      profile_path_(std::move(profile_path)),
+      profile_images_() {
   // 58410A1F checks the user XUID against a mask of 0x00C0000000000000 (3<<54),
   // if non-zero, it prevents the user from playing the game.
   // "You do not have permissions to perform this operation."
-  const std::string& xuid_str = REXCVAR_GET(user_xuid);
-  if (!xuid_str.empty()) {
-    try { xuid_ = std::stoull(xuid_str, nullptr, 16); } catch (...) { xuid_ = 0xB13EBABEBABEBABE; }
-  } else {
-    xuid_ = 0xB13EBABEBABEBABE;
+  LoadProfileIcon(XTileType::kGamerTile);
+  LoadProfileIcon(XTileType::kGamerTileSmall);
+  LoadProfileIcon(XTileType::kAvatarGamerTile);
+  LoadProfileIcon(XTileType::kAvatarGamerTileSmall);
+
+  AddDefaultSettings();
+}
+
+X_USER_SIGNIN_STATE UserProfile::signin_state() const {
+  return IsLiveEnabled() && REXCVAR_GET(xlive_web_enabled)
+             ? X_USER_SIGNIN_STATE::SignedInToLive
+             : X_USER_SIGNIN_STATE::SignedInLocally;
+}
+
+std::span<const uint8_t> UserProfile::GetProfileIcon(XTileType icon_type) {
+  // Coalesce equivalent tile types, like netplay does.
+  if (icon_type == XTileType::kPersonalGamerTile ||
+      icon_type == XTileType::kLocalGamerTile ||
+      icon_type == XTileType::kGamerTileByImageId ||
+      icon_type == XTileType::kGamerTileByKey) {
+    icon_type = XTileType::kGamerTile;
   }
 
-  const std::string& gamertag = REXCVAR_GET(user_gamertag);
-  name_ = gamertag.empty() ? "Player" : gamertag;
+  if (icon_type == XTileType::kPersonalGamerTileSmall ||
+      icon_type == XTileType::kLocalGamerTileSmall) {
+    icon_type = XTileType::kGamerTileSmall;
+  }
 
+  if (profile_images_.find(icon_type) == profile_images_.cend()) {
+    return {};
+  }
+
+  return {profile_images_[icon_type].data(), profile_images_[icon_type].size()};
+}
+
+void UserProfile::LoadProfileIcon(XTileType tile_type) {
+  if (!kTileFileNames.count(tile_type)) {
+    return;
+  }
+
+  const std::filesystem::path path =
+      profile_path_ / kTileFileNames.at(tile_type);
+
+  std::ifstream file(path, std::ios::binary | std::ios::ate);
+  if (!file) {
+    return;
+  }
+
+  const auto size = file.tellg();
+  file.seekg(0, std::ios::beg);
+
+  std::vector<uint8_t> data(static_cast<size_t>(size));
+  file.read(reinterpret_cast<char*>(data.data()), size);
+  if (!file.good()) {
+    return;
+  }
+
+  profile_images_.insert_or_assign(tile_type, std::move(data));
+}
+
+void UserProfile::WriteProfileIcon(XTileType tile_type,
+                                   std::span<const uint8_t> icon_data) {
+  if (!kTileFileNames.count(tile_type)) {
+    return;
+  }
+
+  const std::filesystem::path path =
+      profile_path_ / kTileFileNames.at(tile_type);
+
+  std::error_code ec;
+  std::filesystem::create_directories(path.parent_path(), ec);
+
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  if (!file) {
+    return;
+  }
+  file.write(reinterpret_cast<const char*>(icon_data.data()),
+             icon_data.size());
+
+  profile_images_.insert_or_assign(
+      tile_type, std::vector<uint8_t>(icon_data.begin(), icon_data.end()));
+}
+
+void UserProfile::AddDefaultSettings() {
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=gfwl+live&start=195
   // https://github.com/arkem/py360/blob/master/py360/constants.py
   // XPROFILE_GAMER_YAXIS_INVERSION

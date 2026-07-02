@@ -7,6 +7,8 @@
  ******************************************************************************
  *
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ * @modified    2026 - User/account semantics ported from xenia-canary netplay
+ *              (src/xenia/kernel/xam/xam_user.cc).
  */
 
 // Disable warnings about unused parameters for kernel functions
@@ -25,11 +27,20 @@ REXCVAR_DECLARE(bool, xlive_web_enabled);
 #include <rex/types.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/xam/account_info.h>
+#include <rex/system/xam/profile_manager.h>
 #include <rex/system/xam/user_profile.h>
 #include <rex/system/xenumerator.h>
 #include <rex/system/xio.h>
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
+
+// stb_image implementation is compiled statically into this TU only; keep it
+// static so WINDOWS_EXPORT_ALL_SYMBOLS doesn't export stb symbols from the
+// runtime DLL (the graphics module vendors its own copy).
+#define STB_IMAGE_STATIC
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb/stb_image.h>
 
 REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
 
@@ -39,153 +50,206 @@ namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
 
-// Online XUIDs on Xbox Live have high word 0x0009. Offline XUIDs have 0xE... or 0xB...
-// We synthesize an online XUID by replacing the high 2 bytes with the Live prefix
-// while keeping the lower 6 bytes as the unique user identifier.
-static inline uint64_t MakeSyntheticOnlineXuid(uint64_t offline_xuid) {
-  return 0x0009000000000000ULL | (offline_xuid & 0x0000FFFFFFFFFFFFULL);
+namespace {
+
+UserProfile* GetUserProfile(uint32_t user_index) {
+  return REX_KERNEL_STATE()->profile_manager()->GetProfile(static_cast<uint8_t>(user_index));
 }
 
+bool IsUserSignedIn(uint32_t user_index) {
+  if(GetUserProfile(user_index) != nullptr) {
+    return true;
+  }else {
+    REXKRNL_ERROR("IsUserSignedIn: user={} -> false (no profile)", (uint32_t)user_index);
+    return false;
+  }
+}
+
+// Looks a profile up by either its offline or online XUID.
+UserProfile* GetUserProfileAny(uint64_t xuid) {
+  REXKRNL_INFO("GetUserProfileAny: xuid={:016X}", (uint64_t)xuid);
+  auto* profile_manager = REX_KERNEL_STATE()->profile_manager();
+  UserProfile* profile = profile_manager->GetProfile(xuid);
+  if (!profile) {
+    REXKRNL_INFO("GetUserProfileAny: xuid={:016X} -> not found in offline profiles, checking online profiles", (uint64_t)xuid);
+    profile = profile_manager->GetProfileLive(xuid);
+  }else {
+    REXKRNL_INFO("GetUserProfileAny: xuid={:016X} -> found in offline profiles", (uint64_t)xuid);
+  }
+  return profile;
+}
+
+}  // namespace
+
 i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
+  REXKRNL_INFO("XamUserGetXUID: user={} type_mask={:08X} xuid_ptr={:08X}", (uint32_t)user_index, (uint32_t)type_mask, (uint32_t)xuid_ptr);
   if (!xuid_ptr) {
-    REXKRNL_INFO("XamUserGetXUID_entry: X_E_INVALIDARG");
+    REXKRNL_ERROR("XamUserGetXUID: X_E_INVALIDARG (null pointer to xuid_ptr)");
     return X_E_INVALIDARG;
   }
+
+  *xuid_ptr = 0;
+
+  if (user_index >= XUserMaxUserCount) {
+    REXKRNL_ERROR("XamUserGetXUID: X_E_INVALIDARG (user_index out of range)");
+    return X_E_INVALIDARG;
+  }
+
+  const auto* user_profile = GetUserProfile(user_index);
+  if (!user_profile) {
+    REXKRNL_ERROR("XamUserGetXUID: X_E_NO_SUCH_USER (user_index {} not signed in)", (uint32_t)user_index);
+    return X_E_NO_SUCH_USER;
+  }
+
   uint32_t result = X_E_NO_SUCH_USER;
   uint64_t xuid = 0;
-  if (user_index < 4) {
-    if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-      auto type = user_profile->type() & type_mask;
-      if (type & (2 | 4)) {
-        xuid = user_profile->xuid();
-        // type_mask=2 means "online XUID only" — synthesize the 0x0009... prefix
-        // so the game's XUID high-word check passes.
-        //if ((type_mask & X_USER_GET_SIGNIN_INFO_ONLINE_XUID_ONLY) && REXCVAR_GET(xlive_web_enabled)) {
-          xuid = MakeSyntheticOnlineXuid(xuid);
-        //}
-        result = X_E_SUCCESS;
-      } else if (type & 1) {
-        xuid = user_profile->xuid();
-        result = X_E_SUCCESS;
-      }
-    }
-  } else {
-    result = X_E_INVALIDARG;
+
+  if (type_mask & X_USER_XUID_ONLINE) {
+    xuid = user_profile->GetLogonXUID();
+    REXKRNL_INFO("XamUserGetXUID: user={} type_mask={:08X} -> online xuid={:016X}", (uint32_t)user_index, (uint32_t)type_mask, xuid);
+    result = X_E_SUCCESS;
+  } else if (type_mask & X_USER_XUID_OFFLINE) {
+    xuid = user_profile->xuid();
+    REXKRNL_INFO("XamUserGetXUID: user={} type_mask={:08X} -> offline xuid={:016X}", (uint32_t)user_index, (uint32_t)type_mask, xuid);
+    result = X_E_SUCCESS;
   }
-  REXKRNL_INFO("XamUserGetXUID: user={} type_mask={:08X} -> {:016X} result={:08X}",
-               (uint32_t)user_index, (uint32_t)type_mask, xuid, result);
+
+  if (type_mask == X_USER_XUID_GUEST) {
+    REXKRNL_ERROR("XamUserGetXUID: X_E_NO_SUCH_USER (guest type_mask not supported)");
+    result = X_E_NO_SUCH_USER;
+  }
+
+  REXKRNL_INFO("XamUserGetXUID: user={} type_mask={:08X} -> {:016X} result={:08X}",(uint32_t)user_index, (uint32_t)type_mask, xuid, result);
   *xuid_ptr = xuid;
   return result;
 }
 
 u32 XamUserGetSigninState_entry(u32 user_index) {
-  return 2;
-  uint32_t signin_state = 0;
-  if (user_index < 4) {
-    if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-      signin_state = user_profile->signin_state();
-      if (REXCVAR_GET(xlive_web_enabled) && signin_state == 1) {
-        signin_state = 2;
-      }
-    }
+  X_USER_SIGNIN_STATE signin_state = X_USER_SIGNIN_STATE::NotSignedIn;
+  if (user_index >= XUserMaxUserCount) {
+    REXKRNL_ERROR("XamUserGetSigninState: user={} -> NotSignedIn (user_index out of range)", (uint32_t)user_index);
+    return static_cast<uint32_t>(signin_state);
   }
-  REXKRNL_INFO("XamUserGetSigninState: user={} -> {}", (uint32_t)user_index, signin_state);
-  return signin_state;
+
+  const auto* user_profile = GetUserProfile(user_index);
+  if (user_profile) {
+    REXKRNL_INFO("XamUserGetSigninState: user={} -> {}", (uint32_t)user_index, static_cast<uint32_t>(user_profile->signin_state()));
+    signin_state = user_profile->signin_state();
+  } else {
+    REXKRNL_INFO("XamUserGetSigninState: user={} -> NotSignedIn (no profile)", (uint32_t)user_index);
+  }
+
+  return static_cast<uint32_t>(signin_state);
 }
-
-#define XONLINE_USER_MEMBERSHIP_TIER_GOLD 6   // matches kSubscriptionTierGold in xenia
-#define XONLINE_USER_MEMBERSHIP_TIER_MASK 0x00F00000
-#define XUSER_INFO_FLAG_LIVE_ENABLED      0x00000001
-
-// XamUserGetSigninInfo flags
-constexpr uint32_t X_USER_GET_SIGNIN_INFO_OFFLINE_XUID_ONLY = 0x01;
-constexpr uint32_t X_USER_GET_SIGNIN_INFO_ONLINE_XUID_ONLY  = 0x02;
-
-enum _XUSER_SIGNIN_STATE
-{
-  eXUserSigninState_NotSignedIn    = 0x0,
-  eXUserSigninState_SignedInLocally = 0x1,
-  eXUserSigninState_SignedInToLive = 0x2,
-};
 
 typedef struct {
   rex::be<uint64_t> xuid;
   rex::be<uint32_t> info_flags;
   rex::be<uint32_t> signin_state;
-  rex::be<uint32_t> dwGuestNumber;  // ?
-  rex::be<uint32_t> dwSponsorUserIndex;  // ?
+  rex::be<uint32_t> dwGuestNumber;
+  rex::be<uint32_t> dwSponsorUserIndex;
   char name[16];
 } X_USER_SIGNIN_INFO;
 static_assert_size(X_USER_SIGNIN_INFO, 40);
 
 i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNIN_INFO> info) {
   if (!info) {
-    REXKRNL_INFO("XamUserGetSigninInfo: X_E_INVALIDARG");
+    REXKRNL_ERROR("XamUserGetSigninInfo: X_E_INVALIDARG (null pointer to info)");
     return X_E_INVALIDARG;
   }
 
   std::memset(info, 0, sizeof(X_USER_SIGNIN_INFO));
-  if (user_index) {
-    REXKRNL_INFO("XamUserGetSigninInfo: X_E_NO_SUCH_USER");
+
+  if (user_index >= XUserMaxUserCount) {
+    REXKRNL_ERROR("XamUserGetSigninInfo: X_E_INVALIDARG (user_index out of range)");
     return X_E_NO_SUCH_USER;
   }
 
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  uint64_t xuid = user_profile->xuid();
-
-  // When the game requests the online XUID specifically and we're in Live mode,
-  // return a synthetic online XUID (0x0009... prefix). Games use the high word to
-  // decide whether the user has an Xbox Live account; an offline 0xB13E... XUID
-  // causes the game to hide the Xbox Live option and only show System Link.
-  if (REXCVAR_GET(xlive_web_enabled)) {
-    xuid = MakeSyntheticOnlineXuid(xuid);
+  const auto* user_profile = GetUserProfile(user_index);
+  if (!user_profile) {
+    REXKRNL_ERROR("XamUserGetSigninInfo: X_E_NO_SUCH_USER (user_index {} not signed in)", (uint32_t)user_index);
+    return X_E_NO_SUCH_USER;
   }
-  info->xuid = xuid;
 
-  uint32_t state = user_profile->signin_state();
-  if (REXCVAR_GET(xlive_web_enabled) && state == 1) state = 2;
-  info->signin_state = 2;
-  // Only LIVE_ENABLED belongs in info_flags. Tier lives in cached_user_flags
-  // (returned separately via XamUserGetCachedUserFlags / XamUserGetUserFlags).
-  info->info_flags = REXCVAR_GET(xlive_web_enabled) ? XUSER_INFO_FLAG_LIVE_ENABLED : 0u;
-  rex::string::copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
-  REXKRNL_INFO("XamUserGetSigninInfo: user={} flags={:08X} -> state={} xuid={:016X} name='{}'",
-               (uint32_t)user_index, (uint32_t)flags, state, xuid, info->name);
+  rex::string::copy_truncating(info->name, user_profile->name(),
+                               rex::countof(info->name));
+
+  uint32_t info_flags = 0;
+  if (user_profile->IsLiveEnabled()) {
+    REXKRNL_INFO("XamUserGetSigninInfo: user={} -> LiveEnabled", (uint32_t)user_index);
+    info_flags |= X_USER_INFO_FLAG_LIVE_ENABLED;
+  }
+  info->info_flags = info_flags;
+
+  // Online XUID if connected to Xbox Live, otherwise offline XUID
+  uint64_t xuid = 0;
+  if (!flags) {
+    REXKRNL_INFO("XamUserGetSigninInfo: user={} -> no flags, returning offline xuid={:016X}", (uint32_t)user_index, user_profile->xuid());
+    xuid = user_profile->GetLogonXUID();
+  }
+
+  if (flags & X_USER_GET_SIGNIN_INFO_OFFLINE_XUID_ONLY) {
+    REXKRNL_INFO("XamUserGetSigninInfo: user={} -> OFFLINE_XUID_ONLY, returning offline xuid={:016X}", (uint32_t)user_index, user_profile->xuid());
+    //xuid = user_profile->xuid();
+    xuid = user_profile->GetOnlineXUID();
+  }
+
+  // If both OFFLINE_XUID_ONLY and ONLINE_XUID_ONLY are provided, return the
+  // online XUID.
+  if (flags & X_USER_GET_SIGNIN_INFO_ONLINE_XUID_ONLY) {
+    REXKRNL_INFO("XamUserGetSigninInfo: user={} -> ONLINE_XUID_ONLY, returning online xuid={:016X}", (uint32_t)user_index, user_profile->GetOnlineXUID());
+    xuid = user_profile->GetOnlineXUID();
+  }
+
+  info->xuid = xuid;
+  info->signin_state = static_cast<uint32_t>(user_profile->signin_state());
+
+  REXKRNL_INFO("XamUserGetSigninInfo: user={} flags={:08X} -> state={} xuid={:016X} name='{}'", (uint32_t)user_index, (uint32_t)flags,(uint32_t)info->signin_state, xuid, info->name);
   return X_E_SUCCESS;
 }
 
 u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
-  if (user_index >= 4) {
-    REXKRNL_INFO("XamUserGetName_entry: X_E_INVALIDARG");
-    return X_E_INVALIDARG;
+  if (user_index >= XUserMaxUserCount) {
+    REXKRNL_ERROR("XamUserGetName: user={} -> X_ERROR_INVALID_PARAMETER (user_index out of range)", (uint32_t)user_index);
+    return X_ERROR_INVALID_PARAMETER;
   }
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+
+  const auto* user_profile = GetUserProfile(user_index);
+  if (!user_profile) {
+    REXKRNL_ERROR("XamUserGetName: user={} -> X_ERROR_NO_SUCH_USER (no profile)", (uint32_t)user_index);
+    // Based on XAM only first byte is cleared in case of lack of user.
+    if (buffer && buffer_len) {
+      rex::string::copy_truncating(buffer, "", 1);
+    }
+    return X_ERROR_NO_SUCH_USER;
+  }
+
   const auto& user_name = user_profile->name();
   rex::string::copy_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
-  return X_E_SUCCESS;
+  REXKRNL_INFO("XamUserGetName: user={} -> name='{}'", (uint32_t)user_index, user_name);
+  return X_ERROR_SUCCESS;
 }
 
 u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_len) {
-  if (user_index >= 4) {
-    REXKRNL_INFO("XamUserGetGamerTag_entry: X_E_INVALIDARG");
+  if (user_index >= XUserMaxUserCount) {
+    REXKRNL_ERROR("XamUserGetGamerTag: user={} -> X_E_INVALIDARG (user_index out of range)", (uint32_t)user_index);
     return X_E_INVALIDARG;
-  }
-
-  if (user_index) {
-    REXKRNL_INFO("XamUserGetGamerTag_entry: X_E_NO_SUCH_USER");
-    return X_E_NO_SUCH_USER;
   }
 
   if (!buffer || buffer_len < 16) {
-    REXKRNL_INFO("XamUserGetGamerTag_entry: X_E_INVALIDARG");
+    REXKRNL_ERROR("XamUserGetGamerTag: user={} -> X_E_INVALIDARG (invalid buffer or buffer_len < 16)", (uint32_t)user_index);
     return X_E_INVALIDARG;
   }
 
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+  const auto* user_profile = GetUserProfile(user_index);
+  if (!user_profile) {
+    REXKRNL_ERROR("XamUserGetGamerTag: user={} -> X_E_NO_SUCH_USER (no profile)", (uint32_t)user_index);
+    return X_E_NO_SUCH_USER;
+  }
+
   auto user_name = rex::string::to_utf16(user_profile->name());
   rex::string::copy_and_swap_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
+  REXKRNL_INFO("XamUserGetGamerTag: user={} -> gamertag='{}'", (uint32_t)user_index, user_profile->name());
   return X_E_SUCCESS;
 }
 
@@ -201,42 +265,38 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
                                       be<uint32_t>* setting_ids, uint32_t unk,
                                       be<uint32_t>* buffer_size_ptr, uint8_t* buffer,
                                       XAM_OVERLAPPED* overlapped) {
-  if (!xuid_count) {
-    assert_null(xuids);
-  } else {
-    assert_true(xuid_count == 1);
-    assert_not_null(xuids);
-    // TODO(gibbed): allow proper lookup of arbitrary XUIDs
-    const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-    assert_true(static_cast<uint64_t>(xuids[0]) == user_profile->xuid());
-    // TODO(gibbed): we assert here, but in case a title passes xuid_count > 1
-    // until it's implemented for release builds...
-    xuid_count = 1;
-  }
-  assert_zero(unk);  // probably flags
-
   // must have at least 1 to 32 settings
   if (setting_count < 1 || setting_count > 32) {
+    REXKRNL_ERROR("XamUserReadProfileSettingsEx: X_E_INVALIDARG (setting_count out of range)");
     return X_ERROR_INVALID_PARAMETER;
   }
 
   // buffer size pointer must be valid
   if (!buffer_size_ptr) {
+    REXKRNL_ERROR("XamUserReadProfileSettingsEx: X_E_INVALIDARG (buffer_size_ptr is null)");
     return X_ERROR_INVALID_PARAMETER;
   }
 
   // if buffer size is non-zero, buffer pointer must be valid
   auto buffer_size = static_cast<uint32_t>(*buffer_size_ptr);
   if (buffer_size && !buffer) {
+    REXKRNL_ERROR("XamUserReadProfileSettingsEx: X_E_INVALIDARG (buffer_size is non-zero but buffer is null)");
     return X_ERROR_INVALID_PARAMETER;
   }
 
+  // Dashboard expects settings in order use vector to ensure insertion order
+  // is maintained.
+  const std::vector<uint32_t> settings_ids = {setting_ids, setting_ids + setting_count};
+  
+  // 454D07D2 reads settings from multiple XUIDs.
+  const std::vector<uint64_t> profile_xuids = {xuids, xuids + xuid_count};
+  
   uint32_t needed_header_size = 0;
   uint32_t needed_data_size = 0;
-  for (uint32_t i = 0; i < setting_count; ++i) {
+  for (const uint32_t setting_id : settings_ids) {
     needed_header_size += sizeof(X_USER_PROFILE_SETTING);
     UserProfile::Setting::Key setting_key;
-    setting_key.value = static_cast<uint32_t>(setting_ids[i]);
+    setting_key.value = static_cast<uint32_t>(setting_id);
     switch (static_cast<UserProfile::Setting::Type>(setting_key.type)) {
       case UserProfile::Setting::Type::WSTRING:
       case UserProfile::Setting::Type::BINARY:
@@ -263,17 +323,32 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   // Title ID = 0 means us.
   // 0xfffe07d1 = profile?
 
-  if (!xuids && user_index) {
-    // Only support user 0.
+  auto* user_profile = GetUserProfile(user_index);
+  if (!xuids && !user_profile) {
+    REXKRNL_ERROR("XamUserReadProfileSettingsEx: X_E_NO_SUCH_USER (no profile for user_index {})", (uint32_t)user_index);
     if (overlapped) {
-      REX_KERNEL_STATE()->CompleteOverlappedImmediate(
-          REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_NO_SUCH_USER);
+      REX_KERNEL_STATE()->CompleteOverlappedImmediate(REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_NO_SUCH_USER);
       return X_ERROR_IO_PENDING;
     }
     return X_ERROR_NO_SUCH_USER;
   }
 
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+  if (!user_profile) {
+    // XUID-based lookup; only the signed-in user is supported.
+    user_profile = GetUserProfileAny(static_cast<uint64_t>(xuids[0]));
+    if (!user_profile) {
+      REXKRNL_ERROR("XamUserReadProfileSettingsEx: X_E_NO_SUCH_USER (no profile for xuid {:016X})", static_cast<uint64_t>(xuids[0]));
+      user_profile = GetUserProfile(0);
+    }
+    if (!user_profile) {
+      if (overlapped) {
+        REXKRNL_ERROR("XamUserReadProfileSettingsEx: X_E_NO_SUCH_USER (no profile for xuid {:016X} and no profile for user_index 0)", static_cast<uint64_t>(xuids[0]));
+        REX_KERNEL_STATE()->CompleteOverlappedImmediate(REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_NO_SUCH_USER);
+        return X_ERROR_IO_PENDING;
+      }
+      return X_ERROR_NO_SUCH_USER;
+    }
+  }
 
   // First call asks for size (fill buffer_size_ptr).
   // Second call asks for buffer contents with that size.
@@ -281,22 +356,19 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   // TODO(gibbed): setting validity checking without needing a user profile
   // object.
   bool any_missing = false;
-  for (uint32_t i = 0; i < setting_count; ++i) {
-    auto setting_id = static_cast<uint32_t>(setting_ids[i]);
+  for (const uint32_t setting_id : settings_ids) {
     auto setting = user_profile->GetSetting(setting_id);
     if (!setting) {
       any_missing = true;
-      REXKRNL_ERROR(
-          "xeXamUserReadProfileSettingsEx requested unimplemented setting "
-          "{:08X}",
-          setting_id);
+      REXKRNL_ERROR("XamUserReadProfileSettingsEx requested unimplemented setting {:08X}", setting_id);
     }
   }
   if (any_missing) {
     // TODO(benvanik): don't fail? most games don't even check!
+    REXKRNL_ERROR("XamUserReadProfileSettingsEx: X_E_NOT_FOUND (one or more requested settings not found)");
     if (overlapped) {
-      REX_KERNEL_STATE()->CompleteOverlappedImmediate(
-          REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_INVALID_PARAMETER);
+      REX_KERNEL_STATE()->CompleteOverlappedImmediate(REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_INVALID_PARAMETER);
+      REXKRNL_ERROR("XamUserReadProfileSettingsEx: X_E_NOT_FOUND (one or more requested settings not found)");
       return X_ERROR_IO_PENDING;
     }
     return X_ERROR_INVALID_PARAMETER;
@@ -329,8 +401,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   }
 
   if (overlapped) {
-    REX_KERNEL_STATE()->CompleteOverlappedImmediate(
-        REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_SUCCESS);
+    REX_KERNEL_STATE()->CompleteOverlappedImmediate(REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_SUCCESS);
     return X_ERROR_IO_PENDING;
   }
   return X_ERROR_SUCCESS;
@@ -360,8 +431,9 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
     return X_ERROR_INVALID_PARAMETER;
   }
 
-  if (user_index) {
-    // Only support user 0.
+  // Update and save settings.
+  auto* user_profile = GetUserProfile(user_index);
+  if (!user_profile) {
     if (overlapped) {
       REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped.guest_address(),
                                                       X_ERROR_NO_SUCH_USER);
@@ -369,9 +441,6 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
     }
     return X_ERROR_NO_SUCH_USER;
   }
-
-  // Update and save settings.
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
 
   for (uint32_t n = 0; n < setting_count; ++n) {
     const X_USER_PROFILE_SETTING& setting = settings[n];
@@ -422,75 +491,64 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
   return X_ERROR_SUCCESS;
 }
 
-enum _XPRIVILEGE_TYPE : __int32
-{
-  XPRIVILEGE_MULTIPLAYER_SESSIONS  = 0xFE,
-  XPRIVILEGE_COMMUNICATIONS        = 0xFC,
-  XPRIVILEGE_COMMUNICATIONS_FRIENDS_ONLY = 0xFB,
-  XPRIVILEGE_PROFILE_VIEWING       = 0xF9,
-  XPRIVILEGE_PROFILE_VIEWING_FRIENDS_ONLY = 0xF8,
-  XPRIVILEGE_USER_CREATED_CONTENT  = 0xF7,
-  XPRIVILEGE_USER_CREATED_CONTENT_FRIENDS_ONLY = 0xF6,
-  XPRIVILEGE_PURCHASE_CONTENT      = 0xF5,
-  XPRIVILEGE_PRESENCE              = 0xF4,
-  XPRIVILEGE_PRESENCE_FRIENDS_ONLY = 0xF3,
-  XPRIVILEGE_TRADE_CONTENT         = 0xEE,
-  XPRIVILEGE_VIDEO_COMMUNICATIONS  = 0xEB,
-  XPRIVILEGE_VIDEO_COMMUNICATIONS_FRIENDS_ONLY = 0xEA,
-};
-
-enum liveUserPrivilegeResult_e : __int32
-{
-  liveUserPrivilegeResult_Yes = 0x0,
-  liveUserPrivilegeResult_No  = 0x1,
-  liveUserPrivilegeResult_FriendsOnly = 0x2,
-  liveUserPrivilegeResult_MAX = 0x3,
-};
-
 u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) {
-  *out_value = 0;
-  return 0; // liveUserPrivilegeResult_Yes
-  // checking all users?
-  if (user_index != 0xFF) {
-    if (user_index >= 4) {
-      REXKRNL_INFO("XamUserCheckPrivilege: X_ERROR_INVALID_PARAMETER");
-      return X_ERROR_INVALID_PARAMETER;
-    }
+  // XPRIVILEGE_PII_ACCESS == 221
+  REXKRNL_INFO("XamUserCheckPrivilege: user={} mask={:08X}", (uint32_t)user_index, (uint32_t)mask);
 
-    if (user_index) {
-      REXKRNL_INFO("XamUserCheckPrivilege: X_ERROR_NO_SUCH_USER");
-      return X_ERROR_NO_SUCH_USER;
+  *out_value = 0;
+
+  // 0xFF means "check all signed-in users".
+  if (user_index == XUserIndexAny) {
+    REXKRNL_INFO("XamUserCheckPrivilege: user=ANY mask={:08X}", (uint32_t)mask);
+    for (uint8_t i = 0; i < XUserMaxUserCount; ++i) {
+      const auto result = XamUserCheckPrivilege_entry(i, mask, out_value);
+      if (result != X_ERROR_NO_SUCH_USER) {
+        return result;
+      }
     }
+    REXKRNL_ERROR("XamUserCheckPrivilege: user=ANY mask={:08X} -> X_ERROR_NO_SUCH_USER (no signed-in users)", (uint32_t)mask);
+    return X_ERROR_NO_SUCH_USER;
   }
 
-  if (!REXCVAR_GET(xlive_web_enabled)) {
-    REXKRNL_INFO("XamUserCheckPrivilege: user={} mask={:08X} -> NOT_LOGGED_ON",
-                 (uint32_t)user_index, (uint32_t)mask);
-    *out_value = 0;
+  if (user_index >= XUserMaxUserCount) {
+    REXKRNL_ERROR("XamUserCheckPrivilege: user={} mask={:08X} -> X_ERROR_INVALID_PARAMETER (user_index out of range)", (uint32_t)user_index, (uint32_t)mask);
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  const auto* user_profile = GetUserProfile(user_index);
+  if (!user_profile) {
+    REXKRNL_ERROR("XamUserCheckPrivilege: user={} mask={:08X} -> X_ERROR_NO_SUCH_USER (no profile)", (uint32_t)user_index, (uint32_t)mask);
+    return X_ERROR_NO_SUCH_USER;
+  }
+
+  if (user_profile->signin_state() != X_USER_SIGNIN_STATE::SignedInToLive) {
+    REXKRNL_INFO("XamUserCheckPrivilege: user={} mask={:08X} -> NOT_LOGGED_ON", (uint32_t)user_index, (uint32_t)mask);
     return X_ERROR_NOT_LOGGED_ON;
   }
-  // pfResult=0 means "NOT restricted by parental controls" = allowed.
-  // pfResult=1 means "restricted". The game checks (pfResult == 0) to decide
-  // if the Xbox Live option is available — returning 1 hides it entirely.
-  REXKRNL_INFO("XamUserCheckPrivilege: user={} mask={:08X} -> 0 (not restricted)",
-               (uint32_t)user_index, (uint32_t)mask);
-  *out_value = 0;
+
+  // Allow all privileges including multiplayer.
+  // NOTE: pfResult is TRUE when the user HAS the privilege.
+  REXKRNL_INFO("XamUserCheckPrivilege: user={} mask={:08X} -> 1 (granted)", (uint32_t)user_index, (uint32_t)mask);
+  *out_value = 1;
   return X_ERROR_SUCCESS;
 }
 
 u32 XamUserContentRestrictionGetFlags_entry(u32 user_index, mapped_u32 out_flags) {
-  if (user_index) {
+  REXKRNL_INFO("XamUserContentRestrictionGetFlags: user={}", (uint32_t)user_index);
+  if (!IsUserSignedIn(user_index)) {
+    REXKRNL_ERROR("XamUserContentRestrictionGetFlags: user={} -> X_ERROR_NO_SUCH_USER (not signed in)", (uint32_t)user_index);
     return X_ERROR_NO_SUCH_USER;
   }
 
   // No restrictions?
   *out_flags = 0;
+  REXKRNL_INFO("XamUserContentRestrictionGetFlags: user={} -> {:08X}", (uint32_t)user_index, (uint32_t)*out_flags);
   return X_ERROR_SUCCESS;
 }
 
-u32 XamUserContentRestrictionGetRating_entry(u32 user_index, u32 unk1, mapped_u32 out_unk2,
-                                             mapped_u32 out_unk3) {
-  if (user_index) {
+u32 XamUserContentRestrictionGetRating_entry(u32 user_index, u32 unk1, mapped_u32 out_unk2, mapped_u32 out_unk3) {
+  if (!IsUserSignedIn(user_index)) {
+    REXKRNL_ERROR("XamUserContentRestrictionGetRating: user={} -> X_ERROR_NO_SUCH_USER (not signed in)", (uint32_t)user_index);
     return X_ERROR_NO_SUCH_USER;
   }
 
@@ -498,15 +556,16 @@ u32 XamUserContentRestrictionGetRating_entry(u32 user_index, u32 unk1, mapped_u3
   // path, so my guess is that's 'don't care'.
   *out_unk2 = 0x3F;
   *out_unk3 = 0;
+  REXKRNL_INFO("XamUserContentRestrictionGetRating: user={} -> unk2={:08X} unk3={:08X}", (uint32_t)user_index, (uint32_t)*out_unk2, (uint32_t)*out_unk3);
   return X_ERROR_SUCCESS;
 }
 
-u32 XamUserContentRestrictionCheckAccess_entry(u32 user_index, u32 unk1, u32 unk2, u32 unk3,
-                                               u32 unk4, mapped_u32 out_unk5, u32 overlapped_ptr) {
+u32 XamUserContentRestrictionCheckAccess_entry(u32 user_index, u32 unk1, u32 unk2, u32 unk3, u32 unk4, mapped_u32 out_unk5, u32 overlapped_ptr) {
   *out_unk5 = 1;
 
   if (overlapped_ptr) {
     // TODO(benvanik): does this need the access arg on it?
+    REXKRNL_INFO("XamUserContentRestrictionCheckAccess: user={} -> overlapped_ptr={:08X} completed with X_ERROR_SUCCESS", (uint32_t)user_index, (uint32_t)overlapped_ptr);
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr, X_ERROR_SUCCESS);
   }
 
@@ -514,71 +573,186 @@ u32 XamUserContentRestrictionCheckAccess_entry(u32 user_index, u32 unk1, u32 unk
 }
 
 u32 XamUserIsOnlineEnabled_entry(u32 user_index) {
-  uint32_t result = REXCVAR_GET(xlive_web_enabled) ? 1u : 0u;
+  REXKRNL_INFO("XamUserIsOnlineEnabled: user={}", (uint32_t)user_index);
+  if (user_index >= XUserMaxUserCount) {
+    REXKRNL_ERROR("XamUserIsOnlineEnabled: user={} -> 0 (user_index out of range)", (uint32_t)user_index);
+    return 0;
+  }
+
+  const auto* user_profile = GetUserProfile(user_index);
+  if (!user_profile) {
+    REXKRNL_ERROR("XamUserIsOnlineEnabled: user={} -> 0 (no profile)", (uint32_t)user_index);
+    return 0;
+  }
+
+  const uint32_t result = user_profile->IsLiveEnabled() ? 1u : 0u;
   REXKRNL_INFO("XamUserIsOnlineEnabled: user={} -> {}", (uint32_t)user_index, result);
   return result;
 }
 
-static uint32_t GetUserOnlineFlags() {
-  return static_cast<uint32_t>(XONLINE_USER_MEMBERSHIP_TIER_GOLD) << 20;
-}
-
-// Returns true if `xuid` refers to the same account as `profile_xuid`, regardless
-// of whether the caller holds the raw offline XUID or the synthesized online XUID
-// (0x0009... prefix).  The low 48 bits uniquely identify the account.
-static bool IsOurXuid(uint64_t xuid, uint64_t profile_xuid) {
-  return xuid == profile_xuid ||
-         (xuid & 0x0000FFFFFFFFFFFFULL) == (profile_xuid & 0x0000FFFFFFFFFFFFULL);
-}
-
 u32 XamUserGetCachedUserFlags_entry(u32 user_index) {
-  uint32_t flags = (user_index == 0) ? GetUserOnlineFlags() : 0;
+  const auto* user_profile = GetUserProfile(user_index);
+  if (!user_profile) {
+    REXKRNL_ERROR("XamUserGetCachedUserFlags: user={} -> 0 (no profile)", (uint32_t)user_index);
+    return 0;
+  }
+
+  const uint32_t flags = user_profile->GetCachedFlags();
   REXKRNL_INFO("XamUserGetCachedUserFlags: user={} -> {:08X}", (uint32_t)user_index, flags);
   return flags;
 }
 
 u32 XamUserGetUserFlags_entry(u32 user_index) {
-  uint32_t flags = (user_index == 0) ? GetUserOnlineFlags() : 0;
+  const auto* user_profile = GetUserProfile(user_index);
+  if (!user_profile) {
+    REXKRNL_ERROR("XamUserGetUserFlags: user={} -> 0 (no profile)", (uint32_t)user_index);
+    return 0;
+  }
+
+  const uint32_t flags = user_profile->GetCachedFlags();
   REXKRNL_INFO("XamUserGetUserFlags: user={} -> {:08X}", (uint32_t)user_index, flags);
   return flags;
 }
 
 u32 XamUserGetUserFlagsFromXUID_entry(u64 xuid) {
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  uint32_t flags = IsOurXuid((uint64_t)xuid, user_profile->xuid()) ? GetUserOnlineFlags() : 0;
+  const auto* user_profile = GetUserProfileAny(xuid);
+  if (!user_profile) {
+    REXKRNL_ERROR("XamUserGetUserFlagsFromXUID: xuid={:016X} -> 0 (no profile)", (uint64_t)xuid);
+    return 0;
+  }
+
+  const uint32_t flags = user_profile->GetCachedFlags();
   REXKRNL_INFO("XamUserGetUserFlagsFromXUID: xuid={:016X} -> {:08X}", (uint64_t)xuid, flags);
   return flags;
 }
 
 u32 XamUserGetMembershipTierFromXUID_entry(u64 xuid) {
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  uint32_t tier = IsOurXuid((uint64_t)xuid, user_profile->xuid()) ? XONLINE_USER_MEMBERSHIP_TIER_GOLD : 0;
+  const auto* user_profile = GetUserProfileAny(xuid);
+  if (!user_profile) {
+    REXKRNL_ERROR("XamUserGetMembershipTierFromXUID: xuid={:016X} -> X_XAMACCOUNTINFO::AccountSubscriptionTier::kSubscriptionTierNone (no profile)", (uint64_t)xuid);
+    return X_XAMACCOUNTINFO::AccountSubscriptionTier::kSubscriptionTierNone;
+  }
+
+  const uint32_t tier = user_profile->GetSubscriptionTier();
   REXKRNL_INFO("XamUserGetMembershipTierFromXUID: xuid={:016X} -> {}", (uint64_t)xuid, tier);
   return tier;
 }
 
 u32 XamUserGetMembershipTier_entry(u32 user_index) {
-  if (user_index >= 4) {
-    return X_ERROR_INVALID_PARAMETER;
+  if (user_index >= XUserMaxUserCount) {
+    REXKRNL_ERROR("XamUserGetMembershipTier: user={} -> X_XAMACCOUNTINFO::AccountSubscriptionTier::kSubscriptionTierNone (user_index out of range)", (uint32_t)user_index);
+    return X_XAMACCOUNTINFO::AccountSubscriptionTier::kSubscriptionTierNone;
   }
-  if (user_index) {
-    return X_ERROR_NO_SUCH_USER;
+
+  const auto* user_profile = GetUserProfile(user_index);
+  if (!user_profile) {
+    REXKRNL_ERROR("XamUserGetMembershipTier: user={} -> X_XAMACCOUNTINFO::AccountSubscriptionTier::kSubscriptionTierNone (no profile)", (uint32_t)user_index);
+    return X_XAMACCOUNTINFO::AccountSubscriptionTier::kSubscriptionTierNone;
   }
-  REXKRNL_INFO("XamUserGetMembershipTier: user={} -> 6 (Gold)", (uint32_t)user_index);
-  return 6; /* 6 appears to be Gold */
+
+  const uint32_t tier = user_profile->GetSubscriptionTier();
+  REXKRNL_INFO("XamUserGetMembershipTier: user={} -> {}", (uint32_t)user_index, tier);
+  return tier;
 }
 
-u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 out_value,
-                                 u32 overlapped_ptr) {
+u32 XamUserGetSubscriptionType_entry(u32 user_index, mapped_u32 subscription_ptr, mapped_u32 r5, u32 overlapped_ptr) {
+  if (user_index >= XUserMaxUserCount) {
+    REXKRNL_ERROR("XamUserGetSubscriptionType: user={} -> X_E_INVALIDARG (user_index out of range)", (uint32_t)user_index);
+    return X_E_INVALIDARG;
+  }
+
+  if (!subscription_ptr || !r5) {
+    REXKRNL_ERROR("XamUserGetSubscriptionType: user={} -> X_E_INVALIDARG (null pointer for subscription_ptr or r5)", (uint32_t)user_index);
+    return X_E_INVALIDARG;
+  }
+
+  const auto* user_profile = GetUserProfile(user_index);
+  if (!user_profile) {
+    REXKRNL_ERROR("XamUserGetSubscriptionType: user={} -> X_E_NO_SUCH_USER (no profile)", (uint32_t)user_index);
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  *subscription_ptr = user_profile->GetSubscriptionTier();
+  *r5 = 0;
+
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamUserGetIndexFromXUID_entry(u64 xuid, u32 flags, mapped_u32 index_ptr) {
+  if (!index_ptr) {
+    REXKRNL_ERROR("XamUserGetIndexFromXUID: X_E_INVALIDARG (null pointer for index_ptr)");
+    return X_E_INVALIDARG;
+  }
+
+  auto* profile_manager = REX_KERNEL_STATE()->profile_manager();
+  uint8_t user_index = profile_manager->GetUserIndexAssignedToProfile(xuid);
+  if (user_index == XUserIndexAny) {
+    REXKRNL_ERROR("XamUserGetIndexFromXUID: X_E_NO_SUCH_USER (no user index assigned to xuid {:016X})", (uint64_t)xuid);
+    user_index = profile_manager->GetUserIndexAssignedToLiveProfile(xuid);
+  }
+
+  if (user_index == XUserIndexAny) {
+    REXKRNL_ERROR("XamUserGetIndexFromXUID: X_E_NO_SUCH_USER (no user index assigned to live profile xuid {:016X})", (uint64_t)xuid);
+    return X_E_NO_SUCH_USER;
+  }
+
+  *index_ptr = user_index;
+  REXKRNL_INFO("XamUserGetIndexFromXUID: xuid={:016X} -> user_index={}", (uint64_t)xuid, (uint32_t)user_index);
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamUserGetAgeGroup_entry(u32 user_index, mapped_u32 age_ptr, u32 overlapped_ptr) {
+  // X_USER_AGE_GROUP::ADULT
+  constexpr uint32_t kAgeGroupAdult = 2;
+
+  if (!age_ptr) {
+    REXKRNL_ERROR("XamUserGetAgeGroup: user={} -> X_E_INVALIDARG (null pointer for age_ptr)", (uint32_t)user_index);
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  if (!IsUserSignedIn(user_index)) {
+    REXKRNL_ERROR("XamUserGetAgeGroup: user={} -> X_E_NO_SUCH_USER (not signed in)", (uint32_t)user_index);
+    return X_ERROR_NO_SUCH_USER;
+  }
+
+  *age_ptr = kAgeGroupAdult;
+
+  if (overlapped_ptr) {
+    REXKRNL_INFO("XamUserGetAgeGroup: user={} -> overlapped_ptr={:08X} completed with X_ERROR_SUCCESS", (uint32_t)user_index, (uint32_t)overlapped_ptr);
+    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr, X_ERROR_SUCCESS);
+    return X_ERROR_IO_PENDING;
+  }
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamUserIsUnsafeProgrammingAllowed_entry(u32 user_index, u32 unk, mapped_u32 result_ptr) {
+  if (!result_ptr) {
+    REXKRNL_ERROR("XamUserIsUnsafeProgrammingAllowed: user={} -> X_E_INVALIDARG (null pointer for result_ptr)", (uint32_t)user_index);
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  if (user_index != XUserIndexAny && user_index >= XUserMaxUserCount) {
+    REXKRNL_ERROR("XamUserIsUnsafeProgrammingAllowed: user={} -> X_E_INVALIDARG (user_index out of range)", (uint32_t)user_index);
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  *result_ptr = 1;
+  REXKRNL_INFO("XamUserIsUnsafeProgrammingAllowed: user={} -> result=1 (allowed)", (uint32_t)user_index);
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 out_value, u32 overlapped_ptr) {
   uint32_t are_friends = 0;
   X_RESULT result;
 
-  if (user_index >= 4) {
+  if (user_index >= XUserMaxUserCount) {
+    REXKRNL_ERROR("XamUserAreUsersFriends: user={} -> X_E_INVALIDARG (user_index out of range)", (uint32_t)user_index);
     result = X_ERROR_INVALID_PARAMETER;
   } else {
-    if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-      if (user_profile->signin_state() == 0) {
+    REXKRNL_INFO("XamUserAreUsersFriends: user={} -> checking friendship status", (uint32_t)user_index);
+    const auto* user_profile = GetUserProfile(user_index);
+    if (user_profile) {
+      if (user_profile->signin_state() == X_USER_SIGNIN_STATE::NotSignedIn) {
         result = X_ERROR_NOT_LOGGED_ON;
       } else {
         // No friends!
@@ -586,7 +760,6 @@ u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 
         result = X_ERROR_SUCCESS;
       }
     } else {
-      // Only support user 0.
       result = X_ERROR_NO_SUCH_USER;  // if user is local -> X_ERROR_NOT_LOGGED_ON
     }
   }
@@ -608,12 +781,16 @@ u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 
 }
 
 u32 XamShowSigninUI_entry(u32 unk, u32 unk_mask) {
+  REXKRNL_INFO("XamShowSigninUI: unk={:08X} unk_mask={:08X}", (uint32_t)unk, (uint32_t)unk_mask);
   // Mask values vary. Probably matching user types? Local/remote?
 
   // To fix game modes that display a 4 profile signin UI (even if playing
   // alone):
   // XN_SYS_SIGNINCHANGED
-  REX_KERNEL_STATE()->BroadcastNotification(0x0000000A, 1);
+  REX_KERNEL_STATE()->BroadcastNotification(
+      0x0000000A,
+      static_cast<uint32_t>(
+          REX_KERNEL_STATE()->profile_manager()->GetUsedUserSlots().to_ulong()));
   // Games seem to sit and loop until we trigger this notification:
   // XN_SYS_UI (off)
   REX_KERNEL_STATE()->BroadcastNotification(0x00000009, 0);
@@ -727,14 +904,14 @@ class XStaticAchievementEnumerator : public XEnumerator {
   size_t current_item_ = 0;
 };
 
-u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 xuid, u32 flags,
-                                             u32 offset, u32 count, mapped_u32 buffer_size_ptr,
-                                             mapped_u32 handle_ptr) {
+u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 xuid, u32 flags, u32 offset, u32 count, mapped_u32 buffer_size_ptr, mapped_u32 handle_ptr) {
   if (!count || !buffer_size_ptr || !handle_ptr) {
+    REXKRNL_ERROR("XamUserCreateAchievementEnumerator: X_E_INVALIDARG (null pointer for buffer_size_ptr or handle_ptr, or count is zero)");
     return X_ERROR_INVALID_PARAMETER;
   }
 
-  if (user_index >= 4) {
+  if (user_index >= XUserMaxUserCount) {
+    REXKRNL_ERROR("XamUserCreateAchievementEnumerator: X_E_INVALIDARG (user_index out of range)");
     return X_ERROR_INVALID_PARAMETER;
   }
 
@@ -751,6 +928,7 @@ u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 x
       new XStaticAchievementEnumerator(REX_KERNEL_STATE(), count, flags));
   auto result = e->Initialize(user_index, 0xFB, 0xB000A, 0xB000B, 0);
   if (XFAILED(result)) {
+    REXKRNL_ERROR("XamUserCreateAchievementEnumerator: X_E_OUTOFMEMORY (failed to initialize enumerator)");
     return result;
   }
 
@@ -816,18 +994,79 @@ u32 XamParseGamerTileKey_entry(mapped_u32 key_ptr, mapped_u32 out1_ptr, mapped_u
   *out1_ptr = 0xC0DE0001;
   *out2_ptr = 0xC0DE0002;
   *out3_ptr = 0xC0DE0003;
+  REXKRNL_INFO("XamParseGamerTileKey: key={:08X} -> out1={:08X} out2={:08X} out3={:08X}", (uint32_t)*key_ptr, (uint32_t)*out1_ptr, (uint32_t)*out2_ptr, (uint32_t)*out3_ptr);
   return X_ERROR_SUCCESS;
 }
 
-u32 XamReadTileToTexture_entry(u32 unknown, u32 title_id, u64 tile_id, u32 user_index,
-                               mapped_void buffer_ptr, u32 stride, u32 height, u32 overlapped_ptr) {
-  // TODO(gibbed): unknown=0,2,3,9
-  if (!tile_id) {
+// Ported from netplay XamReadTileToTexture: decodes the user's gamer pic PNG
+// into the destination texture (BGRA/ARGB, row stride padded). Falls back to
+// a solid black tile when the profile has no picture.
+u32 XamReadTileToTexture_entry(u32 tile_type, u32 title_id, u64 tile_id, u32 user_index, mapped_void buffer_ptr, u32 stride, u32 height, u32 overlapped_ptr) {
+  if (!buffer_ptr || !stride || !height) {
+    REXKRNL_ERROR("XamReadTileToTexture: X_E_INVALIDARG (null pointer for buffer_ptr, or stride/height is zero)");
     return X_ERROR_INVALID_PARAMETER;
   }
 
-  size_t size = size_t(stride) * size_t(height);
-  std::memset(buffer_ptr, 0xFF, size);
+  const size_t buffer_size = size_t(stride) * size_t(height);
+
+  std::span<const uint8_t> icon_data{};
+
+  auto* user_profile = GetUserProfile(user_index);
+  if (!user_profile) {
+    // Some titles pass 0xFF/garbage user indices with a tile key; use the
+    // primary profile's picture in that case.
+    user_profile = GetUserProfile(0);
+  }
+  if (user_profile) {
+    // Pick small/large tile based on requested height.
+    const XTileType icon_type =
+        height <= kProfileIconSizeSmall.second ? XTileType::kGamerTileSmall
+                                               : XTileType::kGamerTile;
+    icon_data = user_profile->GetProfileIcon(icon_type);
+    if (icon_data.empty()) {
+      icon_data = user_profile->GetProfileIcon(XTileType::kGamerTile);
+    }
+  }
+
+  std::memset(buffer_ptr, 0, buffer_size);
+
+  bool decoded = false;
+  if (!icon_data.empty()) {
+    int width = 0, img_height = 0, channels = 0;
+    unsigned char* image_data = stbi_load_from_memory(
+        icon_data.data(), static_cast<int>(icon_data.size()), &width, &img_height,
+        &channels, STBI_rgb_alpha);
+    if (image_data) {
+      // RGBA -> ARGB
+      const size_t pixel_count = size_t(width) * size_t(img_height);
+      for (size_t i = 0; i < pixel_count; i++) {
+        unsigned char* pixel = &image_data[i * sizeof(uint32_t)];
+        std::swap(pixel[0], pixel[3]);
+        std::swap(pixel[1], pixel[3]);
+        std::swap(pixel[2], pixel[3]);
+      }
+
+      const size_t row_size_bytes = size_t(width) * sizeof(uint32_t);
+      const size_t copy_row_bytes = std::min(row_size_bytes, size_t(stride));
+      const int copy_rows = std::min<int>(img_height, int(height));
+      auto* dest = static_cast<uint8_t*>(buffer_ptr);
+      for (int y = 0; y < copy_rows; ++y) {
+        std::memcpy(dest + size_t(y) * stride, &image_data[y * row_size_bytes],
+                    copy_row_bytes);
+      }
+
+      stbi_image_free(image_data);
+      decoded = true;
+    }
+  }
+
+  if (!decoded) {
+    // Solid black (full alpha) tile.
+    auto* dest = static_cast<uint8_t*>(buffer_ptr);
+    for (size_t i = 0; i < buffer_size; ++i) {
+      dest[i] = (i % 4 == 0) ? 0xFF : 0x00;
+    }
+  }
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr, X_ERROR_SUCCESS);
@@ -837,6 +1076,7 @@ u32 XamReadTileToTexture_entry(u32 unknown, u32 title_id, u64 tile_id, u32 user_
 }
 
 u32 XamWriteGamerTile_entry(u32 arg1, u32 arg2, u32 arg3, u32 arg4, u32 arg5, u32 overlapped_ptr) {
+  REXKRNL_INFO("XamWriteGamerTile: arg1={:08X} arg2={:08X} arg3={:08X} arg4={:08X} arg5={:08X}", (uint32_t)arg1, (uint32_t)arg2, (uint32_t)arg3, (uint32_t)arg4, (uint32_t)arg5);
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr, X_ERROR_SUCCESS);
     return X_ERROR_IO_PENDING;
@@ -845,11 +1085,13 @@ u32 XamWriteGamerTile_entry(u32 arg1, u32 arg2, u32 arg3, u32 arg4, u32 arg5, u3
 }
 
 u32 XamSessionCreateHandle_entry(mapped_u32 handle_ptr) {
+  REXKRNL_INFO("XamSessionCreateHandle: handle_ptr={:08X}", (uint32_t)handle_ptr);
   *handle_ptr = 0xCAFEDEAD;
   return X_ERROR_SUCCESS;
 }
 
 u32 XamSessionRefObjByHandle_entry(u32 handle, mapped_u32 obj_ptr) {
+  REXKRNL_INFO("XamSessionRefObjByHandle: handle={:08X} obj_ptr={:08X}", (uint32_t)handle, (uint32_t)obj_ptr);
   assert_true(handle == 0xCAFEDEAD);
   // TODO(PermaNull): Implement this properly,
   // For the time being returning 0xDEADF00D will prevent crashing.
@@ -897,17 +1139,17 @@ REX_EXPORT_STUB(__imp__XamUserCreateStatsEnumerator);
 REX_EXPORT_STUB(__imp__XamUserCreateTitlesPlayedEnumerator);
 REX_EXPORT_STUB(__imp__XamUserFlushLogonQueue);
 REX_EXPORT_STUB(__imp__XamUserGetAge);
-REX_EXPORT_STUB(__imp__XamUserGetAgeGroup);
+REX_EXPORT(__imp__XamUserGetAgeGroup, rex::kernel::xam::XamUserGetAgeGroup_entry);
 REX_EXPORT(__imp__XamUserGetCachedUserFlags, rex::kernel::xam::XamUserGetCachedUserFlags_entry);
 REX_EXPORT_STUB(__imp__XamUserGetDeviceId);
-REX_EXPORT_STUB(__imp__XamUserGetIndexFromXUID);
+REX_EXPORT(__imp__XamUserGetIndexFromXUID, rex::kernel::xam::XamUserGetIndexFromXUID_entry);
 REX_EXPORT(__imp__XamUserGetMembershipTierFromXUID, rex::kernel::xam::XamUserGetMembershipTierFromXUID_entry);
 REX_EXPORT_STUB(__imp__XamUserGetOnlineCountryFromXUID);
 REX_EXPORT_STUB(__imp__XamUserGetOnlineLanguageFromXUID);
 REX_EXPORT_STUB(__imp__XamUserGetOnlineXUIDFromOfflineXUID);
 REX_EXPORT_STUB(__imp__XamUserGetReportingInfo);
 REX_EXPORT_STUB(__imp__XamUserGetRequestedUserIndexMask);
-REX_EXPORT_STUB(__imp__XamUserGetSubscriptionType);
+REX_EXPORT(__imp__XamUserGetSubscriptionType, rex::kernel::xam::XamUserGetSubscriptionType_entry);
 REX_EXPORT(__imp__XamUserGetUserFlags, rex::kernel::xam::XamUserGetUserFlags_entry);
 REX_EXPORT(__imp__XamUserGetUserFlagsFromXUID, rex::kernel::xam::XamUserGetUserFlagsFromXUID_entry);
 REX_EXPORT_STUB(__imp__XamUserGetUserIndexMask);
@@ -920,7 +1162,7 @@ REX_EXPORT_STUB(__imp__XamUserIsLogonPreviewModeEnabled);
 REX_EXPORT_STUB(__imp__XamUserIsParentalControlled);
 REX_EXPORT_STUB(__imp__XamUserIsPartial);
 REX_EXPORT_STUB(__imp__XamUserIsPartialProfile);
-REX_EXPORT_STUB(__imp__XamUserIsUnsafeProgrammingAllowed);
+REX_EXPORT(__imp__XamUserIsUnsafeProgrammingAllowed, rex::kernel::xam::XamUserIsUnsafeProgrammingAllowed_entry);
 REX_EXPORT_STUB(__imp__XamUserLockLogonPreviewMode);
 REX_EXPORT_STUB(__imp__XamUserLogon);
 REX_EXPORT_STUB(__imp__XamUserLogonEx);

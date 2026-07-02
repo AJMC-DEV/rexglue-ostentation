@@ -144,6 +144,8 @@ class ContentManager {
   ContentManager(KernelState* kernel_state, const std::filesystem::path& root_path);
   ~ContentManager();
 
+  const std::filesystem::path& root_path() const { return root_path_; }
+
   std::vector<XCONTENT_AGGREGATE_DATA> ListContent(uint32_t device_id, uint64_t xuid,
                                                    XContentType content_type,
                                                    uint32_t title_id = -1);

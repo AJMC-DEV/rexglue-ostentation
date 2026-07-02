@@ -485,9 +485,30 @@ u32 NetDll_XNetGetDebugXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
   return XnAddrStatus::XNET_GET_XNADDR_NONE;
 }
 
-u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, mapped_u32 id_ptr) {
-  REXKRNL_INFO("XNetXnAddrToMachineId: -> 1");
-  return 1;
+u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, mapped_u64 id_ptr) {
+  // Ported from netplay NetDll_XNetXnAddrToMachineId: machine id is
+  // 0xFA00000000000000 | mac (from the XNADDR's ethernet address).
+  if (id_ptr) {
+    *id_ptr = 0;
+  }
+
+  if (!addr_ptr || !id_ptr) {
+    return 10022;  // WSAEINVAL
+  }
+
+  if (!addr_ptr->inaOnline.s_addr || !addr_ptr->wPortOnline) {
+    return 10022;  // WSAEINVAL
+  }
+
+  uint64_t mac = 0;
+  for (int i = 0; i < 6; ++i) {
+    mac = (mac << 8) | addr_ptr->abEnet[i];
+  }
+  const uint64_t machine_id = 0xFA00000000000000ULL | mac;
+  *id_ptr = machine_id;
+
+  REXKRNL_INFO("XNetXnAddrToMachineId: -> {:016X}", machine_id);
+  return 0;
 }
 
 void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string string_out,

@@ -17,6 +17,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <rex/system/kernel_state.h>
 
 // Declared in xlive_flags.cpp
 REXCVAR_DECLARE(bool,        xlive_web_enabled);
@@ -376,19 +377,41 @@ bool XLiveWebClient::EnsureReady() {
     return true;
   }
 
-  // 2. Resolve XUID
-  std::string xuid_str = REXCVAR_GET(user_xuid);
-  uint64_t xuid = 0;
-  if (xuid_str.empty()) {
-    xuid = 0xB13EBABEBABEBABE;  // default
-  } else {
-    try { xuid = std::stoull(xuid_str, nullptr, 16); } catch (...) {}
+  // 2. Resolve identity from the signed-in profile (falling back to cvars).
+  // The netplay backend keys players on the ONLINE (0x0009...) XUID; the MAC
+  // stays derived from the offline XUID so it matches the XNADDR we hand to
+  // the game in XNetGetTitleXnAddr.
+  uint64_t offline_xuid = 0;
+  uint64_t online_xuid = 0;
+  std::string gamertag = REXCVAR_GET(user_gamertag);
+
+  if (auto* ks = kernel_state()) {
+    if (auto* profile = ks->user_profile()) {
+      offline_xuid = profile->xuid();
+      online_xuid = profile->GetOnlineXUID();
+      gamertag = profile->name();
+    }
   }
-  registered_xuid_ = fmt::format("{:016X}", xuid);
-  registered_mac_  = MacFromXuid(xuid);
+
+  if (!offline_xuid) {
+    std::string xuid_str = REXCVAR_GET(user_xuid);
+    if (xuid_str.empty()) {
+      offline_xuid = 0xB13EBABEBABEBABE;  // default
+    } else {
+      try { offline_xuid = std::stoull(xuid_str, nullptr, 16); } catch (...) {}
+    }
+  }
+  if (!online_xuid) {
+    // Synthesize an online XUID like older builds did.
+    online_xuid = 0x0009000000000000ULL | (offline_xuid & 0x0000FFFFFFFFFFFFULL);
+  }
+  if (gamertag.empty()) gamertag = "Player";
+
+  registered_xuid_ = fmt::format("{:016X}", online_xuid);
+  registered_mac_  = MacFromXuid(offline_xuid);
 
   // 3. Register player
-  if (!RegisterPlayer(xuid, REXCVAR_GET(user_gamertag), registered_mac_)) {
+  if (!RegisterPlayer(online_xuid, gamertag, registered_mac_)) {
     XLIVE_ERR("Failed to register player with web service");
     // Non-fatal – continue
   }
@@ -405,14 +428,31 @@ bool XLiveWebClient::EnsureReady() {
 
 bool XLiveWebClient::RegisterPlayer(uint64_t xuid, const std::string& gamertag,
                                     const std::string& machine_id) {
+  // machineId on the netplay backend is 0xFA00000000000000 | mac, formatted
+  // as 16 lowercase hex chars (see netplay GetMachineId/PlayerObjectJSON).
+  uint64_t mac_u64 = 0;
+  try { mac_u64 = std::stoull(machine_id, nullptr, 16); } catch (...) {}
+  const std::string netplay_machine_id =
+      fmt::format("{:016x}", 0xFA00000000000000ULL | mac_u64);
+
   std::string payload = fmt::format(
-      R"({{"xuid":"{}","gamertag":"{}","machineId":"{}","hostAddress":"{}","macAddress":"{}"}})",
-      fmt::format("{:016X}", xuid), gamertag, machine_id,
-      public_address_, MacFromXuid(xuid));
+      R"({{"xuid":"{}","gamertag":"{}","machineId":"{}","hostAddress":"{}","macAddress":"{}","settings":{{}}}})",
+      fmt::format("{:016X}", xuid), gamertag, netplay_machine_id,
+      public_address_, machine_id);
 
   std::string resp;
   bool ok = HttpPost("/players", payload, resp);
-  if (ok) XLIVE_LOG("XLive web /players registered {} ({})", gamertag, fmt::format("{:016X}", xuid));
+  // The backend returns 201 with the player object on success; a 500 or an
+  // error body means we are NOT registered even if the HTTP call "worked".
+  if (ok && resp.find("Internal server error") != std::string::npos) {
+    XLIVE_ERR("XLive web /players registration failed: {}", resp);
+    ok = false;
+  }
+  if (ok) {
+    registered_ok_ = true;
+    XLIVE_LOG("XLive web /players registered {} ({})", gamertag,
+              fmt::format("{:016X}", xuid));
+  }
   return ok;
 }
 
@@ -422,10 +462,17 @@ bool XLiveWebClient::CreateSession(uint32_t title_id, const WebSession& info,
   if (session_id_hex.size() != 16) session_id_hex = std::string(16, '0');
   // HOST(1) | PRESENCE(2) | PEER_NETWORK(32) = 35 = 0x23
   // PRESENCE makes isAdvertised=true on the server so search returns it.
+
+  const auto* user_profile = REX_KERNEL_STATE()->profile_manager()->GetProfile(static_cast<uint8_t>(0));
+  if (!user_profile) {
+    REXKRNL_ERROR("XamUserGetSigninInfo: X_E_NO_SUCH_USER (user_index {} not signed in)", (uint32_t)0);
+    return X_E_NO_SUCH_USER;
+  }
+  
   const int kSessionFlags = 35;
   std::string payload = fmt::format(
       R"({{"xuid":"{}","sessionId":"{}","flags":{},"publicSlotsCount":{},"privateSlotsCount":{},"hostAddress":"{}","macAddress":"{}","port":{}}})",
-      info.host_xuid ? fmt::format("{:016X}", info.host_xuid) : registered_xuid_,
+      user_profile->GetOnlineXUID() ? fmt::format("{:016X}", user_profile->GetOnlineXUID()) : registered_xuid_,
       session_id_hex,
       kSessionFlags,
       info.slots_public ? info.slots_public : 4,

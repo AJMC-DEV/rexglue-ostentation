@@ -210,6 +210,16 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
             REXKRNL_INFO("XGISessionCreateImpl: XSESSION_INFO written ({} bytes)",
                          sizeof(system::XSESSION_INFO));
           }
+
+          // Games pass the nonce back to XSessionStart/arbitration; without
+          // it hosts and joiners disagree on the session identity (netplay
+          // writes it in XSession::CreateSession).
+          if (nonce_ptr) {
+            memory::store_and_swap<uint64_t>(memory_->TranslateVirtual(nonce_ptr),
+                                             session.nonce());
+            REXKRNL_INFO("XGISessionCreateImpl: nonce {:016X} written",
+                         session.nonce());
+          }
         } else {
           // Client joining an existing session.
           // The game already populated session_info_ptr with the host's XSESSION_INFO
@@ -258,6 +268,13 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       assert_zero(unk_0);
       REXKRNL_INFO("XGISessionJoinLocal({:08X}, {}, {}, {:08X}, {:08X})", session_ptr, user_count,
                    unk_0, user_index_array, private_slots_array);
+      return X_E_SUCCESS;
+    }
+    case 0x000B0013: {
+      // XSessionLeave (local variant of 0x000B0012's leave path); netplay
+      // routes this to XSession::LeaveSession. We track a single session so
+      // just report success.
+      REXKRNL_INFO("XSessionLeave({:08X}, {:08X})", buffer_ptr, buffer_length);
       return X_E_SUCCESS;
     }
     case 0x000B0014: {

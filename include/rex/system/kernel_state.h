@@ -34,6 +34,7 @@
 #include <rex/system/util/xdbf_utils.h>
 #include <rex/system/xam/app_manager.h>
 #include <rex/system/xam/content_manager.h>
+#include <rex/system/xam/profile_manager.h>
 #include <rex/system/xam/user_profile.h>
 #include <rex/platform/dynlib.h>
 #include <rex/system/function_dispatcher.h>
@@ -199,7 +200,12 @@ class KernelState {
 
   xam::AppManager* app_manager() const { return app_manager_.get(); }
   xam::ContentManager* content_manager() const { return content_manager_.get(); }
-  xam::UserProfile* user_profile() const { return user_profile_.get(); }
+  xam::ProfileManager* profile_manager() const { return profile_manager_.get(); }
+  // Primary signed-in profile (slot 0). Kept for existing call sites that
+  // assume a single user; multi-user callers should go via profile_manager().
+  xam::UserProfile* user_profile() const {
+    return profile_manager_->GetProfile(uint8_t(0));
+  }
 
   // Access must be guarded by the global critical region.
   util::ObjectTable* object_table() { return &object_table_; }
@@ -353,7 +359,7 @@ class KernelState {
 
   std::unique_ptr<xam::AppManager> app_manager_;
   std::unique_ptr<xam::ContentManager> content_manager_;
-  std::unique_ptr<xam::UserProfile> user_profile_;
+  std::unique_ptr<xam::ProfileManager> profile_manager_;
 
   rex::thread::global_critical_region global_critical_region_;
 
@@ -362,6 +368,7 @@ class KernelState {
   std::unordered_map<uint32_t, XThread*> threads_by_id_;
   std::vector<object_ref<XNotifyListener>> notify_listeners_;
   bool has_notified_startup_ = false;
+  bool has_notified_live_startup_ = false;
 
   // Protected by global_critical_region_.
   std::unordered_map<uint32_t, FiberInfo> fiber_map_;

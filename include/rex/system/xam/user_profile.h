@@ -7,11 +7,16 @@
  ******************************************************************************
  *
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ * @modified    2026 - Account-based profile model ported from xenia-canary
+ *              netplay (src/xenia/kernel/xam/user_profile.h).
  */
 
 #pragma once
 
+#include <filesystem>
+#include <map>
 #include <memory>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -20,6 +25,7 @@
 
 #include <rex/memory.h>
 #include <rex/stream.h>
+#include <rex/system/xam/account_info.h>
 #include <rex/system/xtypes.h>
 
 namespace rex::system {
@@ -72,6 +78,42 @@ struct X_USER_PROFILE_SETTING {
   };
 };
 static_assert_size(X_USER_PROFILE_SETTING, 40);
+
+// Profile icon (gamer pic) tile types, from netplay.
+enum class XTileType {
+  kAchievement,
+  kGameIcon,
+  kGamerTile,
+  kGamerTileSmall,
+  kLocalGamerTile,
+  kLocalGamerTileSmall,
+  kBkgnd,
+  kAwardedGamerTile,
+  kAwardedGamerTileSmall,
+  kGamerTileByImageId,
+  kPersonalGamerTile,
+  kPersonalGamerTileSmall,
+  kGamerTileByKey,
+  kAvatarGamerTile,
+  kAvatarGamerTileSmall,
+  kAvatarFullBody
+};
+
+// TODO: find filenames of other tile types that are stored in profile
+inline const std::map<XTileType, std::string> kTileFileNames = {
+    {XTileType::kGamerTile, "tile_64.png"},
+    {XTileType::kGamerTileSmall, "tile_32.png"},
+    {XTileType::kLocalGamerTile, "tile_64.png"},
+    {XTileType::kLocalGamerTileSmall, "tile_32.png"},
+    {XTileType::kPersonalGamerTile, "pp_64.png"},
+    {XTileType::kPersonalGamerTileSmall, "pp_32.png"},
+    {XTileType::kAvatarGamerTile, "avtr_64.png"},
+    {XTileType::kAvatarGamerTileSmall, "avtr_32.png"},
+};
+
+static constexpr std::pair<uint16_t, uint16_t> kProfileIconSize = {64, 64};
+static constexpr std::pair<uint16_t, uint16_t> kProfileIconSizeSmall = {32,
+                                                                        32};
 
 class UserProfile {
  public:
@@ -214,12 +256,55 @@ class UserProfile {
     }
   };
 
-  UserProfile();
+  UserProfile(uint64_t xuid, const X_XAMACCOUNTINFO* account_info,
+              std::filesystem::path profile_path);
 
   uint64_t xuid() const { return xuid_; }
-  std::string name() const { return name_; }
-  uint32_t signin_state() const { return 1; }
-  uint32_t type() const { return 1 | 2; /* local | online profile? */ }
+
+  // Online (LIVE) XUID: 0x0009.... Zero when profile is not live-enabled.
+  uint64_t GetOnlineXUID() const {
+    return IsLiveEnabled() ? static_cast<uint64_t>(account_info_.xuid_online)
+                           : 0;
+  }
+  // XUID reported to titles for the signed-in user: online XUID when signed
+  // in to LIVE, offline XUID otherwise.
+  uint64_t GetLogonXUID() const {
+    return IsLiveEnabled() &&
+                   signin_state() == X_USER_SIGNIN_STATE::SignedInToLive
+               ? static_cast<uint64_t>(account_info_.xuid_online)
+               : xuid();
+  }
+
+  std::string name() const { return account_info_.GetGamertagString(); }
+
+  X_USER_SIGNIN_STATE signin_state() const;
+
+  uint32_t GetReservedFlags() const { return account_info_.GetReservedFlags(); }
+  uint32_t GetCachedFlags() const { return account_info_.GetCachedFlags(); }
+  uint32_t GetCountry() const {
+    return static_cast<uint32_t>(account_info_.GetCountry());
+  }
+  uint32_t GetSubscriptionTier() const {
+    return account_info_.GetSubscriptionTier();
+  }
+  uint32_t GetLanguage() const { return account_info_.GetLanguage(); }
+
+  bool IsParentalControlled() const {
+    return account_info_.IsParentalControlled();
+  }
+  bool IsLiveEnabled() const { return account_info_.IsLiveEnabled(); }
+
+  const X_XAMACCOUNTINFO* account_info() const { return &account_info_; }
+
+  void GetPasscode(uint16_t* passcode) const {
+    std::memcpy(passcode, account_info_.passcode,
+                sizeof(account_info_.passcode));
+  }
+
+  // Profile icon (gamer pic) PNG bytes; empty when profile has no custom pic.
+  std::span<const uint8_t> GetProfileIcon(XTileType icon_type);
+  void WriteProfileIcon(XTileType tile_type,
+                        std::span<const uint8_t> icon_data);
 
   void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }
 
@@ -228,11 +313,17 @@ class UserProfile {
 
  private:
   uint64_t xuid_;
-  std::string name_;
+  X_XAMACCOUNTINFO account_info_;
+  std::filesystem::path profile_path_;
+
+  std::map<XTileType, std::vector<uint8_t>> profile_images_;
+
   std::vector<std::unique_ptr<Setting>> setting_list_;
   std::unordered_map<uint32_t, Setting*> settings_;
   KernelState* kernel_state_ = nullptr;
 
+  void AddDefaultSettings();
+  void LoadProfileIcon(XTileType tile_type);
   void LoadSetting(UserProfile::Setting*);
   void SaveSetting(UserProfile::Setting*);
 };
