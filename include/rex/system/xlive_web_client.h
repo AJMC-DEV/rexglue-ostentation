@@ -46,6 +46,10 @@ struct WebSession {
   std::string xnkey_hex;       ///< 32 hex chars (16 bytes)
   uint32_t    slots_public  = 0;
   uint32_t    slots_private = 0;
+  uint32_t    open_public    = 0;  ///< openPublicSlotsCount
+  uint32_t    open_private   = 0;  ///< openPrivateSlotsCount
+  uint32_t    filled_public  = 0;  ///< filledPublicSlotsCount
+  uint32_t    filled_private = 0;  ///< filledPrivateSlotsCount
   uint64_t    host_xuid   = 0;
   uint32_t    port_offset = 0;
   uint64_t    nonce       = 0;
@@ -98,6 +102,13 @@ class XLiveWebClient {
 
   bool FetchSession(uint32_t title_id, const std::string& session_id,
                     WebSession& out);
+
+  /// Fetch a session's advertised properties/contexts. Each returned blob is a
+  /// base64-decoded serialized property: [property_id LE u32 (4)]
+  /// [X_USER_DATA (16): type@0, union@8 big-endian][extended string/blob bytes].
+  /// A context is just a property whose X_USER_DATA type == 0 (CONTEXT).
+  bool GetSessionProperties(uint32_t title_id, const std::string& session_id,
+                            std::vector<std::vector<uint8_t>>& out);
 
   bool JoinSession(uint32_t title_id, const std::string& session_id,
                    uint64_t xuid);

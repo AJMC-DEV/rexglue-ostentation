@@ -118,7 +118,61 @@ std::vector<std::string> GetArray(const std::string& j, const std::string& key) 
   return result;
 }
 
+// Extract an array of quoted strings: "key":["a","b",...]. Handles the simple
+// escapes (\" and \\) that base64 never actually produces but which keep this
+// honest.
+std::vector<std::string> GetStringArray(const std::string& j, const std::string& key) {
+  std::vector<std::string> result;
+  std::string search = "\"" + key + "\"";
+  auto pos = j.find(search);
+  if (pos == std::string::npos) return result;
+  pos = j.find('[', pos + search.size());
+  if (pos == std::string::npos) return result;
+
+  for (size_t i = pos + 1; i < j.size(); ++i) {
+    if (j[i] == ']') break;
+    if (j[i] == '"') {
+      std::string s;
+      for (++i; i < j.size() && j[i] != '"'; ++i) {
+        if (j[i] == '\\' && i + 1 < j.size()) ++i;
+        s += j[i];
+      }
+      result.push_back(std::move(s));
+    }
+  }
+  return result;
+}
+
 }  // namespace json
+
+// ---------------------------------------------------------------------------
+// Base64 decode (standard alphabet, ignores padding/whitespace)
+// ---------------------------------------------------------------------------
+
+static bool Base64Decode(const std::string& in, std::vector<uint8_t>& out) {
+  auto val = [](char c) -> int {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+  };
+  out.clear();
+  int buffer = 0, bits = 0;
+  for (char c : in) {
+    if (c == '=' ) break;
+    int v = val(c);
+    if (v < 0) continue;  // skip whitespace/newlines
+    buffer = (buffer << 6) | v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push_back(static_cast<uint8_t>((buffer >> bits) & 0xFF));
+    }
+  }
+  return true;
+}
 
 // ---------------------------------------------------------------------------
 // Hex helpers
@@ -471,9 +525,11 @@ bool XLiveWebClient::CreateSession(uint32_t title_id, const WebSession& info,
   
   const int kSessionFlags = 35;
   std::string payload = fmt::format(
-      R"({{"xuid":"{}","sessionId":"{}","flags":{},"publicSlotsCount":{},"privateSlotsCount":{},"hostAddress":"{}","macAddress":"{}","port":{}}})",
+      R"({{"xuid":"{}","sessionId":"{}","xnkid":"{}","xnkey":"{}","flags":{},"publicSlotsCount":{},"privateSlotsCount":{},"hostAddress":"{}","macAddress":"{}","port":{}}})",
       user_profile->GetOnlineXUID() ? fmt::format("{:016X}", user_profile->GetOnlineXUID()) : registered_xuid_,
       session_id_hex,
+      info.xnkid_hex,
+      info.xnkey_hex,
       kSessionFlags,
       info.slots_public ? info.slots_public : 4,
       info.slots_private,
@@ -483,6 +539,17 @@ bool XLiveWebClient::CreateSession(uint32_t title_id, const WebSession& info,
 
   std::string resp;
   bool ok = HttpPost(SessionsPath(title_id), payload, resp);
+
+  // HttpPost only tells us the request completed; the backend still rejects
+  // with a JSON error body (e.g. 403 "Player not found") if the session's host
+  // xuid isn't a registered player. Treat that as a real failure so callers
+  // don't cache an empty/invalid session id.
+  if (ok && (resp.find("\"error\"") != std::string::npos ||
+             resp.find("statusCode") != std::string::npos)) {
+    XLIVE_ERR("CreateSession rejected by backend: {}", resp);
+    ok = false;
+  }
+
   if (ok) {
     out_session_id = json::GetString(resp, "id");
     if (out_session_id.empty()) out_session_id = json::GetString(resp, "sessionId");
@@ -522,6 +589,26 @@ bool XLiveWebClient::FetchSession(uint32_t title_id, const std::string& id,
   bool ok = HttpGet(SessionPath(title_id, id), resp);
   if (!ok) return false;
   return ParseWebSession(resp, out);
+}
+
+bool XLiveWebClient::GetSessionProperties(uint32_t title_id,
+                                          const std::string& session_id,
+                                          std::vector<std::vector<uint8_t>>& out) {
+  std::string resp;
+  if (!HttpGet(SessionPath(title_id, session_id) + "/properties", resp)) {
+    return false;
+  }
+  // Body: {"properties":["<base64>", ...]} — each blob is a serialized
+  // xam::Property ([id LE u32][X_USER_DATA 16][ext bytes]).
+  auto b64s = json::GetStringArray(resp, "properties");
+  for (auto& b64 : b64s) {
+    std::vector<uint8_t> bytes;
+    if (Base64Decode(b64, bytes) && bytes.size() >= 4 + 16) {
+      out.push_back(std::move(bytes));
+    }
+  }
+  XLIVE_LOG("GetSessionProperties {} -> {} properties", session_id, out.size());
+  return true;
 }
 
 bool XLiveWebClient::JoinSession(uint32_t title_id, const std::string& id,
@@ -617,6 +704,8 @@ bool XLiveWebClient::EnsureHostSession(uint32_t title_id, uint16_t port) {
 }
 
 bool XLiveWebClient::ParseWebSession(const std::string& obj, WebSession& out) {
+  REXKRNL_INFO("ParseWebSession: obj={}", obj);
+
   out.session_id   = json::GetString(obj, "id");
   if (out.session_id.empty()) out.session_id = json::GetString(obj, "sessionId");
   out.host_address = json::GetString(obj, "hostAddress");
@@ -624,12 +713,28 @@ bool XLiveWebClient::ParseWebSession(const std::string& obj, WebSession& out) {
   out.port         = static_cast<uint16_t>(json::GetUInt32(obj, "port"));
   out.mac_address  = json::GetString(obj, "macAddress");
   out.xnkid_hex    = json::GetString(obj, "xnkid");
+  if (out.xnkid_hex.empty()) out.xnkid_hex = json::GetString(obj, "xnkid_hex");
+  if (out.xnkid_hex.empty()) {
+    std::string session_id = out.session_id;
+    if (session_id.size() == 16) {
+      out.xnkid_hex = session_id;
+      std::transform(out.xnkid_hex.begin(), out.xnkid_hex.end(), out.xnkid_hex.begin(), ::tolower);
+    }
+  }
   out.xnkey_hex    = json::GetString(obj, "xnkey");
+  if (out.xnkey_hex.empty()) out.xnkey_hex = json::GetString(obj, "xnkey_hex");
+  if (out.xnkey_hex.empty()) {
+    out.xnkey_hex = std::string(32, '0');
+  }
   out.slots_public = json::GetUInt32(obj, "publicSlotsCount");
   if (!out.slots_public) out.slots_public = json::GetUInt32(obj, "slotsPublic");
   if (!out.slots_public) out.slots_public = json::GetUInt32(obj, "slots_public");
   out.slots_private= json::GetUInt32(obj, "privateSlotsCount");
   if (!out.slots_private) out.slots_private = json::GetUInt32(obj, "slotsPrivate");
+  out.open_public    = json::GetUInt32(obj, "openPublicSlotsCount");
+  out.open_private   = json::GetUInt32(obj, "openPrivateSlotsCount");
+  out.filled_public  = json::GetUInt32(obj, "filledPublicSlotsCount");
+  out.filled_private = json::GetUInt32(obj, "filledPrivateSlotsCount");
   out.nonce        = json::GetUInt64(obj, "nonce");
   out.port_offset  = json::GetUInt32(obj, "portOffset");
 
@@ -637,6 +742,7 @@ bool XLiveWebClient::ParseWebSession(const std::string& obj, WebSession& out) {
   if (!xuid_str.empty())
     try { out.host_xuid = std::stoull(xuid_str, nullptr, 16); } catch (...) {}
 
+  REXKRNL_INFO("ParseWebSession: session_id={} host_address={} port={} mac_address={} xnkid_hex={} xnkey_hex={} slots_public={} slots_private={} nonce={:016X} port_offset={}", out.session_id, out.host_address, out.port, out.mac_address, out.xnkid_hex, out.xnkey_hex, out.slots_public, out.slots_private, out.nonce, out.port_offset);
   return !out.host_address.empty();
 }
 

@@ -1083,32 +1083,53 @@ u32 NetDll_XNetUnregisterKey_entry(u32 caller, mapped_void xnkid_ptr) {
   return 0;
 }
 
-u32 NetDll_XNetQosLookup_entry(u32 caller, u32 num, mapped_void xnaddr_array,
-                               mapped_void xnkid_array, mapped_void xnkey_array,
-                               mapped_void xndata_array, mapped_void xndata_size_array,
-                               u32 flags, u32 event_handle, mapped_u32 pqos) {
-  REXKRNL_INFO("XNetQosLookup: num={} flags={:08X}", (uint32_t)num, (uint32_t)flags);
-  if (pqos) {
-    size_t alloc_size = sizeof(XNQOS) + sizeof(XNQOSINFO) * (num > 1 ? num - 1 : 0);
-    auto qos_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(static_cast<uint32_t>(alloc_size));
-    auto qos = REX_KERNEL_MEMORY()->TranslateVirtual<XNQOS*>(qos_guest);
-    qos->count         = num;
-    qos->count_pending = 0;
-    for (uint32_t i = 0; i < num; ++i) {
-      auto& info            = qos->info[i];
-      info.flags            = 0x07;
-      info.reserved         = 0;
-      info.probes_xmit      = 4;
-      info.probes_recv      = 4;
-      info.data_len         = 0;
-      info.data_ptr         = 0;
-      info.rtt_min_in_msecs = static_cast<uint16_t>(REXCVAR_GET(xlive_web_qos_rtt_min_ms));
-      info.rtt_med_in_msecs = static_cast<uint16_t>(REXCVAR_GET(xlive_web_qos_rtt_median_ms));
-      info.up_bits_per_sec  = static_cast<uint32_t>(REXCVAR_GET(xlive_web_qos_up_bits_per_second));
-      info.down_bits_per_sec= static_cast<uint32_t>(REXCVAR_GET(xlive_web_qos_down_bits_per_second));
-    }
-    *pqos = qos_guest;
+// XNetQosLookup has 13 arguments (caller + 12). Getting the count wrong shifts
+// every stack argument, so the real out-pointer (qos_ptr, the LAST arg) never
+// receives our XNQOS and the guest reads qos->info[0].flags off a NULL base
+// (guest_addr 0x00000008). Signature mirrors netplay NetDll_XNetQosLookup_entry.
+u32 NetDll_XNetQosLookup_entry(u32 caller, u32 num_remote_consoles,
+                               mapped_void remote_addresses_array_ptrs,
+                               mapped_void sessionId_array_ptrs,
+                               mapped_void remote_keys_array_ptrs,
+                               u32 num_gateways, mapped_void gateways_array,
+                               mapped_void service_ids_array, u32 probes_count,
+                               u32 bits_per_second, u32 flags, u32 event_handle,
+                               mapped_u32 qos_ptr) {
+  REXKRNL_INFO(
+      "XNetQosLookup: consoles={} gateways={} probes={} bps={} flags={:08X} qos_ptr={:08X}",
+      (uint32_t)num_remote_consoles, (uint32_t)num_gateways, (uint32_t)probes_count,
+      (uint32_t)bits_per_second, (uint32_t)flags, qos_ptr.guest_address());
+
+  if (!qos_ptr) return 0;
+
+  uint32_t count = static_cast<uint32_t>(num_remote_consoles) +
+                   static_cast<uint32_t>(num_gateways);
+  if (count == 0) count = 1;
+
+  size_t alloc_size = sizeof(XNQOS) + sizeof(XNQOSINFO) * (count > 1 ? count - 1 : 0);
+  auto qos_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(static_cast<uint32_t>(alloc_size));
+  auto qos = REX_KERNEL_MEMORY()->TranslateVirtual<XNQOS*>(qos_guest);
+  std::memset(qos, 0, alloc_size);
+
+  for (uint32_t i = 0; i < count; ++i) {
+    auto& info            = qos->info[i];
+    // COMPLETE | TARGET_CONTACTED — do NOT set DATA_RECEIVED (0x08) since we
+    // have no QoS data blob; that keeps the guest from dereferencing data_ptr.
+    info.flags            = 0x01 | 0x02;
+    info.reserved         = 0;
+    info.probes_xmit      = probes_count ? static_cast<uint16_t>(probes_count) : 4;
+    info.probes_recv      = probes_count ? static_cast<uint16_t>(probes_count) : 4;
+    info.data_len         = 0;
+    info.data_ptr         = 0;
+    info.rtt_min_in_msecs = static_cast<uint16_t>(REXCVAR_GET(xlive_web_qos_rtt_min_ms));
+    info.rtt_med_in_msecs = static_cast<uint16_t>(REXCVAR_GET(xlive_web_qos_rtt_median_ms));
+    info.up_bits_per_sec  = static_cast<uint32_t>(REXCVAR_GET(xlive_web_qos_up_bits_per_second));
+    info.down_bits_per_sec= static_cast<uint32_t>(REXCVAR_GET(xlive_web_qos_down_bits_per_second));
   }
+  qos->count         = count;
+  qos->count_pending = 0;
+  *qos_ptr = qos_guest;
+
   if (event_handle) {
     auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
     if (ev) ev->Set(0, false);

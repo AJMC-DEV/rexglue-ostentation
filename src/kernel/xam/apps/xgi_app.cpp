@@ -49,6 +49,17 @@ static bool HexToBytes(const std::string& hex, uint8_t* out, size_t out_len) {
   return true;
 }
 
+static std::string ToHex(const uint8_t* data, size_t len) {
+  std::string out;
+  out.reserve(len * 2);
+  static const char hex_digits[] = "0123456789abcdef";
+  for (size_t i = 0; i < len; ++i) {
+    out += hex_digits[(data[i] >> 4) & 0xF];
+    out += hex_digits[data[i] & 0xF];
+  }
+  return out;
+}
+
 // Write an IPv4 address string to 4 bytes in network byte order (big-endian).
 static void WriteIPNBO(uint8_t* dst, const std::string& ip_str) {
   unsigned a = 0, b = 0, c = 0, d = 0;
@@ -60,6 +71,106 @@ static void WriteIPNBO(uint8_t* dst, const std::string& ip_str) {
   } else {
     std::memset(dst, 0, 4);
   }
+}
+
+// Fetch the session's advertised properties/contexts from the backend and write
+// them into the XSESSION_SEARCHRESULT (contexts_count @0x50, contexts_ptr @0x58,
+// properties_count @0x4C, properties_ptr @0x54). This is REQUIRED, not cosmetic:
+// titles look up specific advertised properties by id (e.g. Viva Piñata reads
+// property 0x40000809, a unicode string) and dereference the returned pointer;
+// if the property is absent the lookup returns 0 and the guest faults reading
+// NULL+0xC. Mirrors netplay GetSessions -> FillSessionContext/FillSessionProperties.
+//
+// Each backend blob is a serialized xam::Property:
+//   [property_id LE u32 (4)][X_USER_DATA (16): type@0, pad, union@8 big-endian]
+//   [extended bytes]  (extended present only for WSTRING/BINARY)
+// A context is a property whose X_USER_DATA type == 0 (CONTEXT).
+//
+// Guest XUSER_PROPERTY (0x18): property_id(be)@0, pad@4, X_USER_DATA@8
+//   (type@8, union@0x10: {size@0x10, ptr@0x14} for string/blob).
+// Guest XUSER_CONTEXT (0x8): context_id(be)@0, value(be)@4.
+static void WriteSessionAttrs(memory::Memory* mem, uint8_t* r, uint32_t title_id,
+                              const std::string& session_id) {
+  enum : uint8_t { kTypeContext = 0, kTypeWString = 4, kTypeBinary = 6 };
+
+  std::vector<std::vector<uint8_t>> blobs;
+  system::XLiveWebClient::Get().GetSessionProperties(title_id, session_id, blobs);
+
+  // Split contexts vs properties by X_USER_DATA type (blob[4]).
+  std::vector<const std::vector<uint8_t>*> contexts, properties;
+  for (const auto& b : blobs) {
+    if (b.size() < 4 + 16) continue;
+    if (b[4] == kTypeContext) contexts.push_back(&b);
+    else properties.push_back(&b);
+  }
+
+  auto rd_le32 = [](const uint8_t* p) -> uint32_t {
+    return p[0] | (p[1] << 8) | (p[2] << 16) | (uint32_t(p[3]) << 24);
+  };
+
+  uint32_t ctx_g = 0, props_g = 0;
+
+  if (!contexts.empty()) {
+    uint32_t g = mem->SystemHeapAlloc(static_cast<uint32_t>(contexts.size()) * 0x8);
+    if (g) {
+      uint8_t* base = mem->TranslateVirtual(g);
+      for (size_t i = 0; i < contexts.size(); ++i) {
+        const auto& b = *contexts[i];
+        uint8_t* c = base + i * 0x8;
+        memory::store_and_swap<uint32_t>(c + 0, rd_le32(b.data()));  // context_id
+        std::memcpy(c + 4, b.data() + 12, 4);  // value (union.u32, already be)
+      }
+      memory::store_and_swap<uint32_t>(r + 0x50, static_cast<uint32_t>(contexts.size()));
+      memory::store_and_swap<uint32_t>(r + 0x58, g);
+      ctx_g = g;
+    }
+  }
+
+  if (!properties.empty()) {
+    uint32_t g = mem->SystemHeapAlloc(static_cast<uint32_t>(properties.size()) * 0x18);
+    if (g) {
+      uint8_t* base = mem->TranslateVirtual(g);
+      for (size_t i = 0; i < properties.size(); ++i) {
+        const auto& b = *properties[i];
+        uint8_t* p = base + i * 0x18;
+        std::memset(p, 0, 0x18);
+        memory::store_and_swap<uint32_t>(p + 0x00, rd_le32(b.data()));  // property_id
+        uint8_t type = b[4];
+        p[0x08] = type;  // X_USER_DATA.type
+        if (type == kTypeWString || type == kTypeBinary) {
+          uint32_t ext_size = static_cast<uint32_t>(b.size() - 20);
+          uint32_t data_g = mem->SystemHeapAlloc(ext_size ? ext_size : 1);
+          if (data_g && ext_size) {
+            std::memcpy(mem->TranslateVirtual(data_g), b.data() + 20, ext_size);
+          }
+          memory::store_and_swap<uint32_t>(p + 0x10, ext_size);  // union.size
+          memory::store_and_swap<uint32_t>(p + 0x14, data_g);    // union.ptr
+        } else {
+          std::memcpy(p + 0x10, b.data() + 12, 8);  // union value (already be)
+        }
+      }
+      memory::store_and_swap<uint32_t>(r + 0x4C, static_cast<uint32_t>(properties.size()));
+      memory::store_and_swap<uint32_t>(r + 0x54, g);
+      props_g = g;
+    }
+  }
+
+  REXKRNL_INFO("  session attrs: contexts_ptr=0x{:08X} (n={}) properties_ptr=0x{:08X} (n={})",
+               ctx_g, contexts.size(), props_g, properties.size());
+}
+
+// Hex-dump `len` bytes of guest memory `r` for diagnostics.
+static void DumpResultBytes(const uint8_t* r, uint32_t len) {
+  std::string hex;
+  hex.reserve(len * 3);
+  static const char d[] = "0123456789abcdef";
+  for (uint32_t i = 0; i < len; ++i) {
+    hex += d[(r[i] >> 4) & 0xF];
+    hex += d[r[i] & 0xF];
+    if ((i & 0xF) == 0xF) hex += '\n';
+    else hex += ' ';
+  }
+  REXKRNL_INFO("  result bytes:\n{}", hex);
 }
 
 XgiApp::XgiApp(KernelState* kernel_state) : App(kernel_state, 0xFB) {}
@@ -175,7 +286,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
             return X_E_SUCCESS;
           }
 
-          uint64_t host_xuid = kernel_state_->user_profile()->xuid();
+          // Host under the SAME xuid the web client registered the player with
+          // (the online 0x0009... xuid when LIVE-enabled). Using the offline
+          // xuid makes the backend reject the session with 403 "Player not
+          // found" (it only knows the registered online xuid).
+          uint64_t host_xuid = kernel_state_->user_profile()->GetLogonXUID();
           uint16_t port = static_cast<uint16_t>(
               REXCVAR_GET(systemlink_base_port) + REXCVAR_GET(systemlink_port_offset));
           REXKRNL_INFO("XGISessionCreateImpl: host_xuid={:016X} port={} public_ip={}",
@@ -192,6 +307,8 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           ws_info.slots_private = num_slots_private;
           ws_info.port          = port;
           ws_info.host_address  = wc.public_address();
+          ws_info.xnkid_hex     = ToHex(session.session_id().ab, 8);
+          ws_info.xnkey_hex     = ToHex(session.exchange_key().ab, 16);
           REXKRNL_INFO("XGISessionCreateImpl: calling wc.CreateSession title_id={:08X}",
                        kernel_state_->title_id());
           std::string web_id;
@@ -331,9 +448,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       }
 
       // Cap to what the game allocated for and what fits in the results buffer.
-      // _XSESSION_SEARCHRESULT = 92 bytes; header = 8 bytes.
+      // Match netplay's SEARCH_RESULTS layout: 0x0C header (8-byte
+      // XSESSION_SEARCHRESULT_HEADER + a 4-byte results_ptr field), then the
+      // array of XSESSION_SEARCHRESULT (0x5C each) at offset 0x0C.
       constexpr uint32_t kResultSize = 92;
-      constexpr uint32_t kHeaderSize = 8;
+      constexpr uint32_t kHeaderSize = 0x0C;
       uint32_t max_by_alloc = num_results;
       if (results_buffer_size >= kHeaderSize) {
         uint32_t max_by_buf = (results_buffer_size - kHeaderSize) / kResultSize;
@@ -349,11 +468,10 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
         return X_E_SUCCESS;
       }
 
-      // _XSESSION_SEARCHRESULT_HEADER: dwSearchResults (u32) + pResults (guest ptr, u32)
-      // pResults points to the array immediately after the 8-byte header.
       uint32_t results_guest_ptr = search_results_ptr + kHeaderSize;
       memory::store_and_swap<uint32_t>(out + 0, count);
       memory::store_and_swap<uint32_t>(out + 4, count > 0 ? results_guest_ptr : 0u);
+      memory::store_and_swap<uint32_t>(out + 8, count > 0 ? results_guest_ptr : 0u);
 
       uint8_t* r = out + kHeaderSize;
       for (uint32_t i = 0; i < count; ++i, r += kResultSize) {
@@ -364,45 +482,76 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
         //   XNKID  sessionID  [0x00, 8 bytes]
         //   XNADDR hostAddress[0x08, 36 bytes]
         //   XNKEY  keyExchange[0x2C, 16 bytes]
-        // Total _XSESSION_INFO = 60 bytes
 
         // XNKID (8 bytes at 0x00): 16 hex chars from xnkid_hex
-        if (!HexToBytes(ws.xnkid_hex, r + 0x00, 8)) {
+        system::XNKID kid{};
+        if (!HexToBytes(ws.xnkid_hex, kid.ab, 8)) {
           REXKRNL_WARN("XSessionSearch: bad xnkid_hex '{}' for session {}", ws.xnkid_hex, i);
         }
+        std::memcpy(r + 0x00, kid.ab, 8);
 
-        // XNADDR (36 bytes at 0x08):
-        //   ina         u32  [0x08] — LAN address, unknown; leave 0
-        //   inaOnline   u32  [0x0C] — public IP in NBO (written raw, no swap)
-        //   wPortOnline u16  [0x10] — port in NBO
-        //   abEnet      [6]  [0x12] — Ethernet MAC / pseudo-MAC from host_xuid low bytes
-        //   abOnline    [20] [0x18] — zeros
+        // XNADDR (36 bytes at 0x08) — mirrors netplay GetXnAddrFromSessionObject:
+        //   ina         u32   [0x08] — public IP (both ina and inaOnline set)
+        //   inaOnline   u32   [0x0C] — public IP in NBO
+        //   wPortOnline u16   [0x10] — port in NBO
+        //   abEnet      [6]   [0x12] — host ethernet MAC
+        //   abOnline  SGADDR  [0x18] — zeroed except platform_type @0x28
+        WriteIPNBO(r + 0x08, ws.host_address);
         WriteIPNBO(r + 0x0C, ws.host_address);
         memory::store_and_swap<uint16_t>(r + 0x10, ws.port);
-        // Use the low 6 bytes of host_xuid as a pseudo-MAC for abEnet
-        uint64_t xuid = ws.host_xuid;
-        r[0x12] = static_cast<uint8_t>((xuid >> 40) & 0xFF);
-        r[0x13] = static_cast<uint8_t>((xuid >> 32) & 0xFF);
-        r[0x14] = static_cast<uint8_t>((xuid >> 24) & 0xFF);
-        r[0x15] = static_cast<uint8_t>((xuid >> 16) & 0xFF);
-        r[0x16] = static_cast<uint8_t>((xuid >>  8) & 0xFF);
-        r[0x17] = static_cast<uint8_t>((xuid >>  0) & 0xFF);
 
-        // XNKEY (16 bytes at 0x2C): 32 hex chars from xnkey_hex
-        if (!HexToBytes(ws.xnkey_hex, r + 0x2C, 16)) {
-          REXKRNL_WARN("XSessionSearch: bad xnkey_hex '{}' for session {}", ws.xnkey_hex, i);
+        uint8_t mac[6] = {};
+        bool have_mac = ws.mac_address.size() == 12 &&
+                        HexToBytes(ws.mac_address, mac, 6);
+        if (!have_mac && ws.host_xuid) {
+          for (int b = 0; b < 6; ++b) {
+            mac[b] = static_cast<uint8_t>(ws.host_xuid >> ((5 - b) * 8));
+          }
         }
+        std::memcpy(r + 0x12, mac, 6);
+        r[0x28] = 1;  // SGADDR.platform_type = PLATFORM_TYPE::Xbox360
 
-        // Slot counts at 0x3C–0x4B (all u32 big-endian):
-        //   dwOpenPublicSlots   [0x3C]
-        //   dwOpenPrivateSlots  [0x40]
-        //   dwFilledPublicSlots [0x44]
-        //   dwFilledPrivateSlots[0x48]
-        memory::store_and_swap<uint32_t>(r + 0x3C, ws.slots_public);
-        memory::store_and_swap<uint32_t>(r + 0x40, ws.slots_private);
-        // Filled slots unknown; leave as 0.
+        // XNKEY (16 bytes at 0x2C): netplay's fixed identity key {0,1,...,15}
+        // (GenerateIdentityExchangeKey) on both ends — a zero key faults the
+        // guest when it derives a secure association.
+        system::XNKEY key{};
+        for (uint8_t b = 0; b < 16; ++b) key.ab[b] = b;
+        std::memcpy(r + 0x2C, key.ab, 16);
 
-        // cProperties, cContexts, pProperties, pContexts at 0x4C–0x58: all 0 (no props/ctx)
+        // Slot counts (all four, matching netplay FillSessionSearchResult):
+        //   open_public @0x3C, open_private @0x40, filled_public @0x44,
+        //   filled_private @0x48
+        uint32_t open_pub = ws.open_public;
+        if (!open_pub && !ws.filled_public) open_pub = ws.slots_public;
+        memory::store_and_swap<uint32_t>(r + 0x3C, open_pub);
+        memory::store_and_swap<uint32_t>(r + 0x40, ws.open_private);
+        memory::store_and_swap<uint32_t>(r + 0x44, ws.filled_public);
+        memory::store_and_swap<uint32_t>(r + 0x48, ws.filled_private);
+
+        // Properties/contexts: fetch the session's real advertised properties
+        // (required — the game looks up specific property ids and derefs the
+        // result, faulting on a missing one).
+        WriteSessionAttrs(memory_, r, kernel_state_->title_id(), ws.session_id);
+
+        // Pre-register so the joiner's XNetXnAddrToInAddr / XNetRegisterKey
+        // resolve this host instead of missing.
+        if (!kid.IsZero()) {
+          system::XNADDR addr{};
+          {
+            unsigned a = 0, bb = 0, c = 0, d = 0;
+            if (std::sscanf(ws.host_address.c_str(), "%u.%u.%u.%u", &a, &bb, &c, &d) == 4) {
+              uint32_t ip = htonl((a << 24) | (bb << 16) | (c << 8) | d);
+              addr.ina = ip;
+              addr.inaOnline = ip;
+            }
+          }
+          addr.wPortOnline = htons(ws.port);
+          std::memcpy(addr.abEnet, mac, 6);
+          std::memset(addr.abOnline, 0, sizeof(addr.abOnline));
+          addr.abOnline[0x10] = 1;
+          system::XNetKeyRegistry::Get().Register(kid, key);
+          system::XNetAddrCache::Get().Store(addr, kid);
+        }
 
         REXKRNL_INFO("XSessionSearch: result[{}] xnkid={} host={} port={} pub={} priv={}",
                      i, ws.xnkid_hex, ws.host_address, ws.port,
@@ -456,8 +605,14 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
         return X_E_SUCCESS;
       }
 
-      constexpr uint32_t kResultSize = 92;
-      constexpr uint32_t kHeaderSize = 8;
+      // Match netplay's SEARCH_RESULTS layout exactly (xsession.cc
+      // GetSessionByIDs):
+      //   struct SEARCH_RESULTS {
+      //     XSESSION_SEARCHRESULT_HEADER header;  // count@0x00, results_ptr@0x04
+      //     XSESSION_SEARCHRESULT*       results; // guest ptr @0x08
+      //   };  // = 0x0C; the result array begins right after, at offset 0x0C.
+      constexpr uint32_t kResultSize = 92;    // sizeof(XSESSION_SEARCHRESULT)
+      constexpr uint32_t kHeaderSize = 0x0C;  // header(8) + results_ptr field(4)
       uint32_t max_by_alloc = num_results;
       if (results_buffer_size >= kHeaderSize) {
         uint32_t max_by_buf = (results_buffer_size - kHeaderSize) / kResultSize;
@@ -474,35 +629,115 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       }
 
       uint32_t results_guest_ptr = search_results_ptr + kHeaderSize;
+      // header.search_results_count @0x00, header.search_results_ptr @0x04, and
+      // the SEARCH_RESULTS::results_ptr field @0x08 — all point at the array.
       memory::store_and_swap<uint32_t>(out + 0, count);
       memory::store_and_swap<uint32_t>(out + 4, count > 0 ? results_guest_ptr : 0u);
+      memory::store_and_swap<uint32_t>(out + 8, count > 0 ? results_guest_ptr : 0u);
 
       uint8_t* r = out + kHeaderSize;
       for (uint32_t i = 0; i < count; ++i, r += kResultSize) {
         const auto& ws = sessions[i];
         std::memset(r, 0, kResultSize);
 
-        if (!HexToBytes(ws.xnkid_hex, r + 0x00, 8)) {
+        // --- XNKID (session id) @ 0x00 ---
+        system::XNKID kid{};
+        if (!HexToBytes(ws.xnkid_hex, kid.ab, 8)) {
           REXKRNL_WARN("XSessionSearchEx: bad xnkid_hex '{}' for session {}", ws.xnkid_hex, i);
         }
+        std::memcpy(r + 0x00, kid.ab, 8);
+
+        // --- XNADDR (hostAddress) @ 0x08 --- mirrors netplay
+        // XLiveAPI::GetXnAddrFromSessionObject:
+        //   ina         u32   [0x08] — public IP (netplay sets BOTH ina and
+        //                              inaOnline to HostAddress; leaving ina 0
+        //                              makes the joiner connect to 0.0.0.0)
+        //   inaOnline   u32   [0x0C] — public IP in NBO
+        //   wPortOnline u16   [0x10] — port in NBO
+        //   abEnet      [6]   [0x12] — host ethernet MAC
+        //   abOnline  SGADDR  [0x18] — zeroed except platform_type
+        //     platform_type u8 [0x28] = Xbox360 (1); a mismatched platform makes
+        //                                some titles refuse to join.
+        WriteIPNBO(r + 0x08, ws.host_address);
         WriteIPNBO(r + 0x0C, ws.host_address);
         memory::store_and_swap<uint16_t>(r + 0x10, ws.port);
-        uint64_t xuid = ws.host_xuid;
-        r[0x12] = static_cast<uint8_t>((xuid >> 40) & 0xFF);
-        r[0x13] = static_cast<uint8_t>((xuid >> 32) & 0xFF);
-        r[0x14] = static_cast<uint8_t>((xuid >> 24) & 0xFF);
-        r[0x15] = static_cast<uint8_t>((xuid >> 16) & 0xFF);
-        r[0x16] = static_cast<uint8_t>((xuid >>  8) & 0xFF);
-        r[0x17] = static_cast<uint8_t>((xuid >>  0) & 0xFF);
-        if (!HexToBytes(ws.xnkey_hex, r + 0x2C, 16)) {
-          REXKRNL_WARN("XSessionSearchEx: bad xnkey_hex '{}' for session {}", ws.xnkey_hex, i);
-        }
-        memory::store_and_swap<uint32_t>(r + 0x3C, ws.slots_public);
-        memory::store_and_swap<uint32_t>(r + 0x40, ws.slots_private);
 
-        REXKRNL_INFO("XSessionSearchEx: result[{}] xnkid={} host={} port={} pub={} priv={}",
+        // The backend returns the host's real MAC (macAddress). Write that into
+        // abEnet — NOT the host xuid, which the search response does not carry.
+        uint8_t mac[6] = {};
+        bool have_mac = ws.mac_address.size() == 12 &&
+                        HexToBytes(ws.mac_address, mac, 6);
+        if (!have_mac && ws.host_xuid) {
+          for (int b = 0; b < 6; ++b) {
+            mac[b] = static_cast<uint8_t>(ws.host_xuid >> ((5 - b) * 8));
+          }
+          have_mac = true;
+        }
+        std::memcpy(r + 0x12, mac, 6);
+
+        // abOnline stays zero (already memset) except the platform type byte at
+        // SGADDR offset 0x10 (result offset 0x28).
+        constexpr uint8_t kPlatformXbox360 = 1;  // PLATFORM_TYPE::Xbox360
+        r[0x28] = kPlatformXbox360;
+
+        // --- XNKEY (exchange key) @ 0x2C ---
+        // Netplay uses a FIXED identity key {0,1,...,15}
+        // (GenerateIdentityExchangeKey) on BOTH host and joiner; the backend
+        // does not relay a key (xnkey_hex here is all-zeros). A zero exchange
+        // key makes the guest fault when it derives a secure association from
+        // it, so emit the same deterministic non-zero key netplay does.
+        system::XNKEY key{};
+        for (uint8_t b = 0; b < 16; ++b) key.ab[b] = b;
+        std::memcpy(r + 0x2C, key.ab, 16);
+
+        // --- Slot counts (netplay FillSessionSearchResult writes all four) ---
+        //   open_public @0x3C, open_private @0x40,
+        //   filled_public @0x44, filled_private @0x48
+        uint32_t open_pub = ws.open_public;
+        if (!open_pub && !ws.filled_public) open_pub = ws.slots_public;
+        memory::store_and_swap<uint32_t>(r + 0x3C, open_pub);
+        memory::store_and_swap<uint32_t>(r + 0x40, ws.open_private);
+        memory::store_and_swap<uint32_t>(r + 0x44, ws.filled_public);
+        memory::store_and_swap<uint32_t>(r + 0x48, ws.filled_private);
+
+        // --- Properties/contexts @0x4C..0x58 ---
+        // properties_count @0x4C, contexts_count @0x50,
+        // properties_ptr   @0x54, contexts_ptr   @0x58
+        // Netplay always SystemHeapAllocs these buffers; some titles dereference
+        // result->properties_ptr / contexts_ptr as soon as a session is found,
+        // regardless of the count — a NULL there faults in pure guest code
+        // (which is exactly the crash: it only happens once count goes 0->1).
+        // Fetch the session's real advertised properties/contexts from the
+        // backend; the game looks up specific property ids by value and
+        // dereferences the result, so they must be present.
+        WriteSessionAttrs(memory_, r, kernel_state_->title_id(), ws.session_id);
+
+        // Pre-register the discovered session so a subsequent
+        // XNetXnAddrToInAddr / XNetRegisterKey on the joiner resolves this host
+        // instead of missing (and the game connecting to a bogus token).
+        if (!kid.IsZero()) {
+          system::XNADDR addr{};
+          {
+            unsigned a = 0, bb = 0, c = 0, d = 0;
+            if (std::sscanf(ws.host_address.c_str(), "%u.%u.%u.%u", &a, &bb, &c, &d) == 4) {
+              uint32_t ip = htonl((a << 24) | (bb << 16) | (c << 8) | d);
+              addr.ina = ip;        // netplay sets both ina and inaOnline
+              addr.inaOnline = ip;
+            }
+          }
+          addr.wPortOnline = htons(ws.port);
+          std::memcpy(addr.abEnet, mac, 6);
+          // abOnline zeroed except platform_type (SGADDR offset 0x10) = Xbox360.
+          std::memset(addr.abOnline, 0, sizeof(addr.abOnline));
+          addr.abOnline[0x10] = 1;  // PLATFORM_TYPE::Xbox360
+          system::XNetKeyRegistry::Get().Register(kid, key);
+          system::XNetAddrCache::Get().Store(addr, kid);
+        }
+
+        REXKRNL_INFO("XSessionSearchEx: result[{}] xnkid={} host={} port={} mac={} pub={} priv={}",
                      i, ws.xnkid_hex, ws.host_address, ws.port,
-                     ws.slots_public, ws.slots_private);
+                     ws.mac_address, ws.slots_public, ws.slots_private);
+        DumpResultBytes(r, kResultSize);
       }
 
       REXKRNL_INFO("XSessionSearchEx: wrote {} results to {:08X}", count, search_results_ptr);

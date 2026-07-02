@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <utility>
 
@@ -18,6 +19,7 @@
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
+#include <rex/exception_handler.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/stream.h>
@@ -259,6 +261,80 @@ bool Memory::Initialize() {
     return false;
   }
   REXSYS_DEBUG("Installed MMIO handler for physical address translation");
+
+  // Diagnostic: log any access violation the MMIO handler did NOT service
+  // (i.e. a crash-bound wild guest pointer). Installed AFTER the MMIO handler so
+  // it only fires for faults MMIO returned false for. It logs the guest address
+  // the guest code tried to touch plus the host RIP, then returns false to let
+  // the process crash as normal. Uses fputs+fflush so the line survives the
+  // imminent crash even if the async logger doesn't flush.
+  arch::ExceptionHandler::Install(
+      [](arch::Exception* ex, void* data) -> bool {
+        auto* self = static_cast<Memory*>(data);
+        if (ex->code() != arch::Exception::Code::kAccessViolation) {
+          return false;
+        }
+        const char* op =
+            ex->access_violation_operation() ==
+                    arch::Exception::AccessViolationOperation::kWrite
+                ? "WRITE"
+                : (ex->access_violation_operation() ==
+                           arch::Exception::AccessViolationOperation::kRead
+                       ? "READ"
+                       : "?");
+        uint64_t fault = ex->fault_address();
+        uint64_t rip = ex->pc();
+        uint64_t base = reinterpret_cast<uint64_t>(self->virtual_membase_);
+        uint64_t end = reinterpret_cast<uint64_t>(self->physical_membase_) + 0x1FFFFFFFull;
+
+        // Resolve which loaded module the faulting instruction is in, and its
+        // offset within that module (module_base + offset can be symbolized
+        // against the recompiled module's .map/.pdb to find the guest function).
+        char mod_name[MAX_PATH] = "?";
+        uint64_t mod_base = 0;
+#if REX_PLATFORM_WIN32
+        HMODULE mod = nullptr;
+        if (GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(rip), &mod) &&
+            mod) {
+          mod_base = reinterpret_cast<uint64_t>(mod);
+          char full[MAX_PATH];
+          if (GetModuleFileNameA(mod, full, MAX_PATH)) {
+            const char* slash = std::strrchr(full, '\\');
+            std::snprintf(mod_name, sizeof(mod_name), "%s", slash ? slash + 1 : full);
+          }
+        }
+#endif
+        uint64_t rip_off = mod_base ? (rip - mod_base) : 0;
+
+        char line[384];
+        if (fault >= base && fault <= end) {
+          uint32_t guest = static_cast<uint32_t>(fault - base);
+          std::snprintf(line, sizeof(line),
+                        "[CRASH] unhandled guest AV: %s guest_addr=0x%08X "
+                        "host_rip=0x%016llX (%s+0x%llX)\n",
+                        op, guest, static_cast<unsigned long long>(rip), mod_name,
+                        static_cast<unsigned long long>(rip_off));
+          REXSYS_ERROR("[CRASH] unhandled guest AV: {} guest_addr=0x{:08X} host_rip=0x{:016X} ({}+0x{:X}) fault_host=0x{:016X}",
+                       op, guest, rip, mod_name, rip_off, fault);
+        } else {
+          std::snprintf(line, sizeof(line),
+                        "[CRASH] unhandled AV (non-guest): %s host_addr=0x%016llX "
+                        "host_rip=0x%016llX (%s+0x%llX)\n",
+                        op, static_cast<unsigned long long>(fault),
+                        static_cast<unsigned long long>(rip), mod_name,
+                        static_cast<unsigned long long>(rip_off));
+          REXSYS_ERROR("[CRASH] unhandled AV (non-guest): {} host_addr=0x{:016X} host_rip=0x{:016X} ({}+0x{:X})",
+                       op, fault, rip, mod_name, rip_off);
+        }
+        std::fputs(line, stderr);
+        std::fflush(stderr);
+        return false;  // Not handled — let it crash, but now we know where.
+      },
+      this);
+  REXSYS_DEBUG("Installed diagnostic access-violation logger");
 
   // ?
   uint32_t unk_phys_alloc;
