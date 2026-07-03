@@ -272,6 +272,7 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     if (input_sys) {
       input_sys->SetActiveCallback([this]() {
         if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_
+            && !netplay_overlay_
 #ifdef REXGLUE_ENABLE_SHADERS
             && !shader_debugger_overlay_
 #endif
@@ -542,7 +543,10 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
     }
     UpdateBuiltinOverlayInputMode();
   });
-  rex::ui::RegisterBind("bind_netplay", "F6", "Toggle netplay/Xbox LIVE overlay", [this] {
+  rex::ui::RegisterBind("bind_netplay", "F8", "Toggle netplay/Xbox LIVE overlay", [this] {
+    REXLOG_INFO("bind_netplay fired: overlay currently {}, imgui_drawer={}",
+                netplay_overlay_ ? "open" : "closed",
+                imgui_drawer_ ? "valid" : "null");
     if (netplay_overlay_) {
       netplay_overlay_.reset();
     } else {

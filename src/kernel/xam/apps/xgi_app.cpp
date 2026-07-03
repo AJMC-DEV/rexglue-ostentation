@@ -18,6 +18,10 @@
 
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #if REX_PLATFORM_WIN32
 #include <WinSock2.h>
@@ -173,6 +177,113 @@ static void DumpResultBytes(const uint8_t* r, uint32_t len) {
   REXKRNL_INFO("  result bytes:\n{}", hex);
 }
 
+// --- Host-advertised session attributes -----------------------------------
+// The game sets matchmaking contexts/properties via XGIUserSetContextEx /
+// XGIUserSetPropertyEx before hosting. We capture them here and, on session
+// create, upload them to the backend so joiners fetch them (otherwise a
+// rexglue-hosted session returns {"properties":[]} and the joiner faults on the
+// game's property lookup, exactly like a xenia host that never advertised).
+// Each stored blob is the serialized xam::Property format WriteSessionAttrs /
+// GetSessionProperties consume: [id LE u32][X_USER_DATA 16: type@0, union@8 BE]
+// [ext bytes].
+namespace {
+struct SessionAttrStore {
+  std::mutex mtx;
+  std::vector<std::pair<uint32_t, std::vector<uint8_t>>> items;
+  // Returns true if this changed the stored set (new id or different value).
+  bool Set(uint32_t id, std::vector<uint8_t> blob) {
+    std::lock_guard<std::mutex> lk(mtx);
+    for (auto& it : items) {
+      if (it.first == id) {
+        if (it.second == blob) return false;
+        it.second = std::move(blob);
+        return true;
+      }
+    }
+    items.emplace_back(id, std::move(blob));
+    return true;
+  }
+  std::vector<std::vector<uint8_t>> All() {
+    std::lock_guard<std::mutex> lk(mtx);
+    std::vector<std::vector<uint8_t>> out;
+    out.reserve(items.size());
+    for (auto& it : items) out.push_back(it.second);
+    return out;
+  }
+};
+
+SessionAttrStore& AttrStore() {
+  static SessionAttrStore s;
+  return s;
+}
+
+// The web session this console currently hosts (set on create). Property/context
+// sets after create re-upload so the backend always has the latest advertised
+// attributes — mirrors netplay's change-driven UserTracker maintenance upload.
+std::mutex g_host_mtx;
+std::string g_host_web_id;
+uint32_t g_host_title_id = 0;
+
+void SetHostedSession(uint32_t title_id, const std::string& web_id) {
+  std::lock_guard<std::mutex> lk(g_host_mtx);
+  g_host_title_id = title_id;
+  g_host_web_id = web_id;
+}
+
+// Upload the current attribute set if we are hosting a web session. Runs on a
+// detached thread so a synchronous HTTP POST never stalls the guest thread that
+// is busy setting properties.
+void UploadAttrsIfHosting() {
+  std::string web_id;
+  uint32_t title_id;
+  {
+    std::lock_guard<std::mutex> lk(g_host_mtx);
+    web_id = g_host_web_id;
+    title_id = g_host_title_id;
+  }
+  if (web_id.empty()) return;
+  auto blobs = AttrStore().All();
+  if (blobs.empty()) return;
+  std::thread([title_id, web_id, blobs = std::move(blobs)]() {
+    system::XLiveWebClient::Get().SetSessionProperties(title_id, web_id, blobs);
+  }).detach();
+}
+
+void PutLE32(uint8_t* p, uint32_t v) {
+  p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF; p[2] = (v >> 16) & 0xFF; p[3] = (v >> 24) & 0xFF;
+}
+void PutBE32(uint8_t* p, uint32_t v) {
+  p[0] = (v >> 24) & 0xFF; p[1] = (v >> 16) & 0xFF; p[2] = (v >> 8) & 0xFF; p[3] = v & 0xFF;
+}
+
+// Context: X_USER_DATA.type == CONTEXT(0), value in union.u32.
+std::vector<uint8_t> BuildContextBlob(uint32_t id, uint32_t value) {
+  std::vector<uint8_t> b(20, 0);
+  PutLE32(b.data() + 0, id);
+  b[4] = 0;  // X_USER_DATA_TYPE::CONTEXT
+  PutBE32(b.data() + 12, value);  // union @ blob[12]
+  return b;
+}
+
+// Property: type = id >> 28. Non-string types store the raw big-endian guest
+// value in the union; WSTRING/BINARY append the bytes as extended data.
+std::vector<uint8_t> BuildPropertyBlob(uint32_t id, const uint8_t* val, uint32_t val_size) {
+  uint8_t type = static_cast<uint8_t>((id >> 28) & 0xF);
+  bool ext = (type == 4 /*WSTRING*/ || type == 6 /*BINARY*/);
+  std::vector<uint8_t> b(20 + (ext ? val_size : 0), 0);
+  PutLE32(b.data() + 0, id);
+  b[4] = type;
+  if (ext) {
+    PutBE32(b.data() + 12, val_size);  // union.size
+    if (val && val_size) std::memcpy(b.data() + 20, val, val_size);
+  } else {
+    uint32_t n = val_size > 8 ? 8 : val_size;
+    if (val && n) std::memcpy(b.data() + 12, val, n);  // union value (BE guest bytes)
+  }
+  return b;
+}
+}  // namespace
+
 XgiApp::XgiApp(KernelState* kernel_state) : App(kernel_state, 0xFB) {}
 
 // http://mb.mirage.org/bugzilla/xliveless/main.c
@@ -195,6 +306,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t context_value = memory::load_and_swap<uint32_t>(buffer + 20);
       REXKRNL_DEBUG("XGIUserSetContextEx({:08X}, {:08X}, {:08X})", user_index, context_id,
                     context_value);
+      // Capture for advertising when this console hosts a session; re-upload if
+      // it changed and we are already hosting (game may set attrs post-create).
+      if (AttrStore().Set(context_id, BuildContextBlob(context_id, context_value))) {
+        UploadAttrsIfHosting();
+      }
       return X_E_SUCCESS;
     }
     case 0x000B0007: {
@@ -204,6 +320,12 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t value_ptr = memory::load_and_swap<uint32_t>(buffer + 24);
       REXKRNL_DEBUG("XGIUserSetPropertyEx({:08X}, {:08X}, {}, {:08X})", user_index, property_id,
                     value_size, value_ptr);
+      // Capture for advertising when this console hosts a session; re-upload if
+      // it changed and we are already hosting (game may set attrs post-create).
+      const uint8_t* pval = value_ptr ? memory_->TranslateVirtual(value_ptr) : nullptr;
+      if (AttrStore().Set(property_id, BuildPropertyBlob(property_id, pval, value_size))) {
+        UploadAttrsIfHosting();
+      }
       return X_E_SUCCESS;
     }
     case 0x000B0008: {
@@ -316,6 +438,12 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           REXKRNL_INFO("XGISessionCreateImpl: CreateSession ok={} web_id='{}'", create_ok, web_id);
           if (create_ok && !web_id.empty()) {
             session.set_web_session_id(web_id);
+            // Advertise the matchmaking contexts/properties the game set so
+            // joiners can fetch them (else they fault on the missing-property
+            // lookup). Mirrors xenia SessionPropertiesSet. Register as the hosted
+            // session first so any attrs set AFTER create also get re-uploaded.
+            SetHostedSession(kernel_state_->title_id(), web_id);
+            UploadAttrsIfHosting();
           }
 
           auto* info_raw = memory_->TranslateVirtual(session_info_ptr);

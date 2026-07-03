@@ -16,6 +16,7 @@
 #include <imgui.h>
 
 #include <rex/cvar.h>
+#include <rex/logging.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/profile_manager.h>
@@ -33,7 +34,10 @@ using rex::system::xam::X_USER_SIGNIN_STATE;
 using rex::system::xam::XTileType;
 
 NetplayOverlayDialog::NetplayOverlayDialog(ImGuiDrawer* imgui_drawer)
-    : ImGuiDialog(imgui_drawer) {}
+    : ImGuiDialog(imgui_drawer) {
+  REXLOG_INFO("NetplayOverlayDialog constructed (drawer={})",
+              static_cast<const void*>(imgui_drawer));
+}
 
 NetplayOverlayDialog::~NetplayOverlayDialog() {}
 
@@ -56,6 +60,11 @@ void NetplayOverlayDialog::RefreshFromProfile() {
 }
 
 void NetplayOverlayDialog::OnDraw(ImGuiIO& io) {
+  static bool logged_once = false;
+  if (!logged_once) {
+    REXLOG_INFO("NetplayOverlayDialog::OnDraw first call");
+    logged_once = true;
+  }
   if (!loaded_from_profile_) {
     RefreshFromProfile();
   }

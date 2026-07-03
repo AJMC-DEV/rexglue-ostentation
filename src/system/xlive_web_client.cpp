@@ -174,6 +174,31 @@ static bool Base64Decode(const std::string& in, std::vector<uint8_t>& out) {
   return true;
 }
 
+static std::string Base64Encode(const std::vector<uint8_t>& in) {
+  static const char* tbl =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve((in.size() + 2) / 3 * 4);
+  size_t i = 0;
+  for (; i + 3 <= in.size(); i += 3) {
+    uint32_t n = (in[i] << 16) | (in[i + 1] << 8) | in[i + 2];
+    out += tbl[(n >> 18) & 0x3F];
+    out += tbl[(n >> 12) & 0x3F];
+    out += tbl[(n >> 6) & 0x3F];
+    out += tbl[n & 0x3F];
+  }
+  if (i < in.size()) {
+    uint32_t n = in[i] << 16;
+    bool two = (i + 1 < in.size());
+    if (two) n |= in[i + 1] << 8;
+    out += tbl[(n >> 18) & 0x3F];
+    out += tbl[(n >> 12) & 0x3F];
+    out += two ? tbl[(n >> 6) & 0x3F] : '=';
+    out += '=';
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Hex helpers
 // ---------------------------------------------------------------------------
@@ -609,6 +634,22 @@ bool XLiveWebClient::GetSessionProperties(uint32_t title_id,
   }
   XLIVE_LOG("GetSessionProperties {} -> {} properties", session_id, out.size());
   return true;
+}
+
+bool XLiveWebClient::SetSessionProperties(
+    uint32_t title_id, const std::string& session_id,
+    const std::vector<std::vector<uint8_t>>& blobs) {
+  std::string arr;
+  for (size_t i = 0; i < blobs.size(); ++i) {
+    if (i) arr += ",";
+    arr += "\"" + Base64Encode(blobs[i]) + "\"";
+  }
+  std::string payload = "{\"properties\":[" + arr + "]}";
+  std::string resp;
+  bool ok = HttpPost(SessionPath(title_id, session_id) + "/properties", payload, resp);
+  XLIVE_LOG("SetSessionProperties {} -> {} properties (ok={})", session_id,
+            blobs.size(), ok);
+  return ok;
 }
 
 bool XLiveWebClient::JoinSession(uint32_t title_id, const std::string& id,

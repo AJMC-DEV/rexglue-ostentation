@@ -230,17 +230,39 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
   uint32_t dest_addr = 0;
 
   if (to) {
-    dest_addr = to->sin_addr;  // host byte order (as stored in the field)
+    dest_addr = to->sin_addr;  // host byte order (be<> read of guest NBO bytes)
+    uint16_t dest_port_nbo = htons(static_cast<uint16_t>(to->sin_port));
     if (REXCVAR_GET(xlive_web_enabled) && (dest_addr & 0xFF000000u) == 0xAB000000u) {
       XNetAddrEntry entry;
       if (XNetAddrCache::Get().Lookup(dest_addr, entry)) {
-        dest_addr = entry.xn_addr.inaOnline;
+        // Cache stores addresses as NBO patterns; normalize to host order so
+        // both the token and raw-address paths agree below.
+        dest_addr = ntohl(entry.xn_addr.inaOnline);
+        // The peer's socket listens on the port it advertised with the web
+        // session (e.g. xenia netplay's 36000 range), not on the guest-side
+        // game port the title puts in the sockaddr.
+        if (entry.xn_addr.wPortOnline) {
+          dest_port_nbo = entry.xn_addr.wPortOnline;  // already NBO
+        }
       }
     }
 
-    nto.sin_addr.s_addr = dest_addr;
+    nto.sin_addr.s_addr = htonl(dest_addr);
     nto.sin_family = to->sin_family;
-    nto.sin_port   = to->sin_port;
+    nto.sin_port   = dest_port_nbo;
+
+    // Two instances behind one public IP can't reach each other through it
+    // (home NATs don't hairpin), so route unicast aimed at our own public IP
+    // via loopback — the same remap the broadcast bridge applies.
+    if (REXCVAR_GET(xlive_web_enabled) &&
+        REXCVAR_GET(xlive_web_bridge_loopback_same_public_ip)) {
+      auto& wc = XLiveWebClient::Get();
+      if (wc.is_ready() && nto.sin_addr.s_addr == wc.public_address_net()) {
+        REXKRNL_DEBUG("XSocket::SendTo remapping same-public-IP unicast {}:{} to loopback",
+                      wc.public_address(), static_cast<uint16_t>(to->sin_port));
+        nto.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      }
+    }
   }
 
   if (to && REXCVAR_GET(xlive_web_enabled) && REXCVAR_GET(xlive_web_bridge_systemlink_broadcast)) {

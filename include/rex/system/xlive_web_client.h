@@ -110,6 +110,12 @@ class XLiveWebClient {
   bool GetSessionProperties(uint32_t title_id, const std::string& session_id,
                             std::vector<std::vector<uint8_t>>& out);
 
+  /// Upload the host's advertised properties/contexts for a session so joiners
+  /// can fetch them (mirrors xenia SessionPropertiesSet). Each blob is the same
+  /// serialized-property format GetSessionProperties returns.
+  bool SetSessionProperties(uint32_t title_id, const std::string& session_id,
+                            const std::vector<std::vector<uint8_t>>& blobs);
+
   bool JoinSession(uint32_t title_id, const std::string& session_id,
                    uint64_t xuid);
 

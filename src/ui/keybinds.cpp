@@ -10,6 +10,7 @@
  */
 #include <rex/ui/keybinds.h>
 #include <rex/cvar.h>
+#include <rex/logging.h>
 #include <mutex>
 #include <string>
 #include <deque>
@@ -214,6 +215,7 @@ void UnregisterBind(std::string_view name) {
 
 bool ProcessKeyEvent(KeyEvent& e) {
   std::lock_guard lock(g_binds_mutex);
+  bool matched = false;
   for (auto& entry : g_binds) {
     if (!entry.callback)
       continue;
@@ -221,10 +223,24 @@ bool ProcessKeyEvent(KeyEvent& e) {
     if (vk != VirtualKey::kNone && e.virtual_key() == vk) {
       entry.callback();
       e.set_handled(true);
-      return true;
+      matched = true;
+      break;
     }
   }
-  return false;
+  // Diagnostic: log function-key presses (F1..F12 == 0x70..0x7B) and, on a miss,
+  // dump the whole bind table so we can see each bind's *effective* key (which
+  // a saved config may have overridden away from the code default).
+  uint32_t vkv = static_cast<uint32_t>(e.virtual_key());
+  if (vkv >= 0x70 && vkv <= 0x7B) {
+    REXLOG_INFO("ProcessKeyEvent: vk=0x{:02X} matched={}", vkv, matched);
+    if (!matched) {
+      for (auto& entry : g_binds) {
+        REXLOG_INFO("  bind '{}' key='{}' callback={}", entry.name,
+                    entry.current_key, entry.callback ? "set" : "null");
+      }
+    }
+  }
+  return matched;
 }
 
 }  // namespace rex::ui
