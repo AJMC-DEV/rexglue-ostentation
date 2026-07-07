@@ -24,6 +24,7 @@
 #include <rex/ui/overlay/achievements_overlay.h>
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
+#include <rex/ui/overlay/mods_menu_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
 #ifdef REXGLUE_ENABLE_SHADERS
 #include <rex/ui/overlay/shader_debugger_overlay.h>
@@ -71,6 +72,13 @@ std::unique_ptr<ui::ImGuiDialog> ReXApp::CreateAchievementsOverlay() {
   }
   return std::make_unique<ui::AchievementsOverlayDialog>(
       imgui_drawer_.get(), immediate_drawer_.get(), runtime_.get(), &achievements());
+}
+
+std::unique_ptr<ui::ImGuiDialog> ReXApp::CreateModsMenuOverlay() {
+  if (!imgui_drawer_ || !immediate_drawer_) {
+    return nullptr;
+  }
+  return std::make_unique<ui::ModsMenuDialog>(imgui_drawer_.get(), immediate_drawer_.get());
 }
 
 std::unique_ptr<ui::AchievementNotificationDialog> ReXApp::CreateAchievementNotificationDialog() {
@@ -272,7 +280,7 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     if (input_sys) {
       input_sys->SetActiveCallback([this]() {
         if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_
-            && !netplay_overlay_
+            && !netplay_overlay_ && !mods_menu_overlay_
 #ifdef REXGLUE_ENABLE_SHADERS
             && !shader_debugger_overlay_
 #endif
@@ -554,6 +562,14 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
     }
     UpdateBuiltinOverlayInputMode();
   });
+  rex::ui::RegisterBind("bind_mods_menu", "F5", "Toggle mods menu overlay", [this] {
+    if (mods_menu_overlay_) {
+      mods_menu_overlay_.reset();
+    } else {
+      mods_menu_overlay_ = CreateModsMenuOverlay();
+    }
+    UpdateBuiltinOverlayInputMode();
+  });
 
   OnCreateDialogs(imgui_drawer_.get());
 }
@@ -690,7 +706,7 @@ void ReXApp::UpdateBuiltinOverlayInputMode() {
       : nullptr;
   if (!input_sys) return;
   bool ui_mode = debug_overlay_ || console_overlay_ || settings_overlay_ || achievements_overlay_
-      || netplay_overlay_
+      || netplay_overlay_ || mods_menu_overlay_
 #ifdef REXGLUE_ENABLE_SHADERS
       || shader_debugger_overlay_
 #endif
@@ -717,6 +733,7 @@ void ReXApp::OnDestroy() {
   rex::ui::UnregisterBind("bind_settings");
   rex::ui::UnregisterBind("bind_achievements");
   rex::ui::UnregisterBind("bind_netplay");
+  rex::ui::UnregisterBind("bind_mods_menu");
 
   // ImGui cleanup (reverse of setup)
   if (achievement_notification_listener_ != 0) {
@@ -727,6 +744,7 @@ void ReXApp::OnDestroy() {
   }
   achievement_notification_.reset();
   achievements_overlay_.reset();
+  mods_menu_overlay_.reset();
   settings_overlay_.reset();
   console_overlay_.reset();
   debug_overlay_.reset();

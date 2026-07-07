@@ -85,22 +85,22 @@ REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
                     "Pre-mask scaled resolve L2 blocks to the write range before iterating");
 
 #ifdef REXGLUE_ENABLE_TEXTURES
-REXCVAR_DEFINE_BOOL(texture_dump_enabled, false, "GPU/Texture Replacement",
+REXCVAR_DEFINE_BOOL(texture_dump_enabled, false, "MODS/Textures",
                     "Dump all decoded textures to disk as DDS files for replacement authoring")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_STRING(texture_dump_format, "dds", "GPU/Texture Replacement",
+REXCVAR_DEFINE_STRING(texture_dump_format, "dds", "MODS/Textures",
                       "Output format for texture dumps: \"dds\" (lossless, preserves BC blocks) "
                       "or \"png\" (RGBA8; BC-compressed textures are decompressed to RGBA8 first)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload)
     .allowed({"dds", "png"});
 
-REXCVAR_DEFINE_BOOL(texture_dump_skip_video_sizes, true, "GPU/Texture Replacement",
+REXCVAR_DEFINE_BOOL(texture_dump_skip_video_sizes, true, "MODS/Textures",
                     "Skip dumping textures whose dimensions match common cutscene/video sizes "
                     "(640x360, 1280x720) to avoid flooding the dump directory with video frames")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(texture_replace_enabled, false, "GPU/Texture Replacement",
+REXCVAR_DEFINE_BOOL(texture_load_enabled, false, "MODS/Textures",
                     "Inject replacement textures from disk when available")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 #endif
@@ -997,7 +997,7 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   texture_util::TextureGuestLayout original_guest_layout{};
   bool has_replacement = false;
   uint64_t replacement_content_hash = 0;
-  if (replacement_ && REXCVAR_GET(texture_replace_enabled) &&
+  if (replacement_ && REXCVAR_GET(texture_load_enabled) &&
       key.base_page != 0 && !key.scaled_resolve) {
     const uint32_t guest_addr = key.base_page << 12;
     // Capture the original guest layout BEFORE mutating the key.

@@ -59,6 +59,12 @@ REXCVAR_DEFINE_BOOL(readback_resolve_half_pixel_offset, false, "GPU",
                     "scaled block during resolve readback downscale")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(readback_resolve_max_bytes, 0, "GPU",
+                     "Skip CPU readback of resolves larger than this many bytes (0 = no limit). "
+                     "Small data resolves the CPU actually reads (e.g. luminance measurement) "
+                     "stay readable without paying for full-screen color resolves.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(readback_memexport, true, "GPU",
                     "Enable CPU readback of shader memexport writes for guest memory "
                     "coherency (can reduce correctness issues, but may add GPU/CPU sync cost)")
@@ -253,6 +259,11 @@ ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
   }
   return legacy_readback_resolve_enabled ? ReadbackResolveMode::kFast
                                          : ReadbackResolveMode::kDisabled;
+}
+
+bool CommandProcessor::ShouldReadbackResolveLength(uint32_t written_length) const {
+  int32_t max_bytes = REXCVAR_GET(readback_resolve_max_bytes);
+  return max_bytes <= 0 || written_length <= uint32_t(max_bytes);
 }
 
 bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) const {

@@ -204,7 +204,18 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
   if (ret > 0) {
     char src_ip_str[INET_ADDRSTRLEN] = {};
     inet_ntop(AF_INET, &nfrom.sin_addr, src_ip_str, sizeof(src_ip_str));
-    REXKRNL_DEBUG("XSocket::RecvFrom got {} bytes from {}:{}", ret, src_ip_str, ntohs(nfrom.sin_port));
+    // Local port this arrived on — compare against the local port SendTo uses.
+    // A mismatch means our reply leaves via a different NAT mapping than the
+    // one the peer's NAT already has a hole punched for, so it gets silently
+    // dropped even though sendto() itself reports success.
+    sockaddr_in local{};
+    socklen_t local_len = sizeof(local);
+    uint16_t local_port = 0;
+    if (getsockname(native_handle_, (sockaddr*)&local, &local_len) == 0) {
+      local_port = ntohs(local.sin_port);
+    }
+    REXKRNL_DEBUG("XSocket::RecvFrom got {} bytes from {}:{} (our local port={})", ret,
+                 src_ip_str, ntohs(nfrom.sin_port), local_port);
   }
   if (from) {
     from->sin_family = nfrom.sin_family;
@@ -337,8 +348,28 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
     }
   }
 
-  return sendto(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
-                to ? (sockaddr*)&nto : nullptr, to_len);
+  int direct_result = sendto(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
+                            to ? (sockaddr*)&nto : nullptr, to_len);
+  if (to) {
+    char dest_ip_str[INET_ADDRSTRLEN] = {};
+    inet_ntop(AF_INET, &nto.sin_addr, dest_ip_str, sizeof(dest_ip_str));
+    sockaddr_in local{};
+    socklen_t local_len = sizeof(local);
+    uint16_t local_port = 0;
+    if (getsockname(native_handle_, (sockaddr*)&local, &local_len) == 0) {
+      local_port = ntohs(local.sin_port);
+    }
+    if (direct_result < 0) {
+      REXKRNL_WARN("XSocket::SendTo direct unicast to {}:{} FAILED buf_len={} WSAError={} "
+                   "(our local port={})",
+                   dest_ip_str, ntohs(nto.sin_port), buf_len, WSAGetLastError(), local_port);
+    } else {
+      REXKRNL_DEBUG("XSocket::SendTo direct unicast to {}:{} ok, sent {} bytes "
+                    "(our local port={})",
+                    dest_ip_str, ntohs(nto.sin_port), direct_result, local_port);
+    }
+  }
+  return direct_result;
 }
 
 bool XSocket::QueuePacket(uint32_t src_ip, uint16_t src_port, const uint8_t* buf, size_t len) {

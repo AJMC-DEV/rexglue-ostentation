@@ -4463,6 +4463,10 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     return true;
   }
 
+  if (!ShouldReadbackResolveLength(written_length)) {
+    return true;
+  }
+
   auto ensure_readback_slot = [&](ReadbackBuffer& readback, uint32_t index, uint32_t size) -> bool {
     if (readback.buffers[index] != VK_NULL_HANDLE && size <= readback.sizes[index] &&
         readback.mapped_data[index] != nullptr) {

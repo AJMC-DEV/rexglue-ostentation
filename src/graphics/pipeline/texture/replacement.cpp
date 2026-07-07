@@ -22,6 +22,7 @@ extern "C" {
 #include <rex/graphics/pipeline/texture/conversion.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/logging.h>
+#include <rex/mods.h>
 
 #ifndef XXH_INLINE_ALL
 #define XXH_INLINE_ALL
@@ -1307,13 +1308,26 @@ TextureReplacement::~TextureReplacement() = default;
 
 TextureReplacement::TextureReplacement(std::filesystem::path root)
     : root_(std::move(root)) {
+
+  // Use mods_data_root as the mods parent folder if configured, otherwise
+  // default to <root>/mods. Only mod folders listed in enabled_mods are
+  // scanned; each contributes a mods_data_root/<mod>/textures/ folder.
+  std::filesystem::path mods_data_root = REXCVAR_GET(mods_data_root);
+  if (mods_data_root.empty()) { mods_data_root = root_ / "mods"; }
+
   dump_dir_ = root_ / "dumps" / "textures";
-  replace_dir_ = root_ / "mods" / "textures";
+  for (auto& mod_dir : GetEnabledModDirs(mods_data_root)) {
+    replace_dirs_.push_back(mod_dir / "textures");
+  }
 
   std::error_code ec;
   std::filesystem::create_directories(dump_dir_, ec);
   ec.clear();
-  std::filesystem::create_directories(replace_dir_, ec);
+  std::filesystem::create_directories(mods_data_root, ec);
+  for (auto& dir : replace_dirs_) {
+    ec.clear();
+    std::filesystem::create_directories(dir, ec);
+  }
 
   Rescan();
 }
@@ -1324,53 +1338,60 @@ void TextureReplacement::Rescan() {
   failed_cache_.clear();
   video_decoders_.clear();
 
-  std::error_code ec;
-  if (!std::filesystem::exists(replace_dir(), ec)) return;
-
   size_t video_count = 0;
-  for (auto& entry : std::filesystem::directory_iterator(replace_dir(), ec)) {
-    if (ec) break;
-    if (!entry.is_regular_file()) continue;
-    auto& p = entry.path();
-    const auto ext = p.extension();
-    if (ext != ".dds" && ext != ".png" && ext != ".mp4") continue;
+  std::error_code ec;
 
-    const std::string stem = p.stem().string();
-    if (stem.size() < 16) continue;
+  // Scan enabled mod folders in priority order. replacements_.emplace() and
+  // the video_decoders_ count() check below both keep the first (highest
+  // priority) entry when the same hash appears in more than one mod.
+  for (const auto& dir : replace_dirs_) {
+    if (!std::filesystem::exists(dir, ec)) continue;
 
-    uint64_t hash = 0;
-    bool ok = true;
-    for (int i = 0; i < 16; ++i) {
-      char c = stem[i];
-      uint64_t nibble = 0;
-      if      (c >= '0' && c <= '9') nibble = static_cast<uint64_t>(c - '0');
-      else if (c >= 'a' && c <= 'f') nibble = static_cast<uint64_t>(c - 'a' + 10);
-      else if (c >= 'A' && c <= 'F') nibble = static_cast<uint64_t>(c - 'A' + 10);
-      else { ok = false; break; }
-      hash = (hash << 4) | nibble;
-    }
-    if (!ok) continue;
+    for (auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+      if (ec) break;
+      if (!entry.is_regular_file()) continue;
+      auto& p = entry.path();
+      const auto ext = p.extension();
+      if (ext != ".dds" && ext != ".png" && ext != ".mp4") continue;
 
-    if (ext == ".mp4") {
-      auto dec = std::make_unique<VideoDecoder>();
-      if (dec->Open(p)) {
-        video_decoders_.emplace(hash, std::move(dec));
-        ++video_count;
-        REXLOG_INFO("TextureReplacement: loaded video {}  ({}x{})",
-                    p.filename().string(),
-                    video_decoders_.at(hash)->current_data_.width,
-                    video_decoders_.at(hash)->current_data_.height);
-      } else {
-        REXLOG_WARN("TextureReplacement: failed to open video {}",
-                    p.filename().string());
+      const std::string stem = p.stem().string();
+      if (stem.size() < 16) continue;
+
+      uint64_t hash = 0;
+      bool ok = true;
+      for (int i = 0; i < 16; ++i) {
+        char c = stem[i];
+        uint64_t nibble = 0;
+        if      (c >= '0' && c <= '9') nibble = static_cast<uint64_t>(c - '0');
+        else if (c >= 'a' && c <= 'f') nibble = static_cast<uint64_t>(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') nibble = static_cast<uint64_t>(c - 'A' + 10);
+        else { ok = false; break; }
+        hash = (hash << 4) | nibble;
       }
-    } else {
-      replacements_[hash] = p;
+      if (!ok) continue;
+
+      if (ext == ".mp4") {
+        if (video_decoders_.count(hash)) continue;
+        auto dec = std::make_unique<VideoDecoder>();
+        if (dec->Open(p)) {
+          video_decoders_.emplace(hash, std::move(dec));
+          ++video_count;
+          REXLOG_INFO("TextureReplacement: loaded video {}  ({}x{})",
+                      p.filename().string(),
+                      video_decoders_.at(hash)->current_data_.width,
+                      video_decoders_.at(hash)->current_data_.height);
+        } else {
+          REXLOG_WARN("TextureReplacement: failed to open video {}",
+                      p.filename().string());
+        }
+      } else {
+        replacements_.emplace(hash, p);
+      }
     }
   }
 
-  REXLOG_INFO("TextureReplacement: {} static + {} video replacement(s) indexed from {}",
-              replacements_.size(), video_count, replace_dir().string());
+  REXLOG_INFO("TextureReplacement: {} static + {} video replacement(s) indexed from {} mod folder(s)",
+              replacements_.size(), video_count, replace_dirs_.size());
 }
 
 // ---------------------------------------------------------------------------

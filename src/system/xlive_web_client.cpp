@@ -550,7 +550,7 @@ bool XLiveWebClient::CreateSession(uint32_t title_id, const WebSession& info,
   
   const int kSessionFlags = 35;
   std::string payload = fmt::format(
-      R"({{"xuid":"{}","sessionId":"{}","xnkid":"{}","xnkey":"{}","flags":{},"publicSlotsCount":{},"privateSlotsCount":{},"hostAddress":"{}","macAddress":"{}","port":{}}})",
+      R"({{"xuid":"{}","sessionId":"{}","xnkid":"{}","xnkey":"{}","flags":{},"publicSlotsCount":{},"privateSlotsCount":{},"hostAddress":"{}","macAddress":"{}","port":{},"mediaId":"{}","version":"{}"}})",
       user_profile->GetOnlineXUID() ? fmt::format("{:016X}", user_profile->GetOnlineXUID()) : registered_xuid_,
       session_id_hex,
       info.xnkid_hex,
@@ -560,7 +560,9 @@ bool XLiveWebClient::CreateSession(uint32_t title_id, const WebSession& info,
       info.slots_private,
       info.host_address.empty() ? public_address_ : info.host_address,
       info.mac_address.empty() ? registered_mac_ : info.mac_address,
-      info.port);
+      info.port,
+      info.media_id,
+      info.version);
 
   std::string resp;
   bool ok = HttpPost(SessionsPath(title_id), payload, resp);

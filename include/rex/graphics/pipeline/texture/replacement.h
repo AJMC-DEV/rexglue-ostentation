@@ -122,13 +122,15 @@ class TextureReplacement {
   // ---------------------------------------------------------------------------
   static uint64_t HashGuestData(const uint8_t* data, size_t size);
 
-  std::filesystem::path dump_dir()    const { return dump_dir_; }
-  std::filesystem::path replace_dir() const { return replace_dir_; }
+  std::filesystem::path dump_dir() const { return dump_dir_; }
+  // Enabled mod texture folders (mods_data_root/<mod>/textures/), in
+  // priority order — earlier entries win on hash conflicts.
+  std::vector<std::filesystem::path> replace_dirs() const { return replace_dirs_; }
 
  private:
   std::filesystem::path root_;
   std::filesystem::path dump_dir_;
-  std::filesystem::path replace_dir_;
+  std::vector<std::filesystem::path> replace_dirs_;
   std::unordered_map<uint64_t, std::filesystem::path> replacements_;
 
   // Textures that have been loaded from disk are cached here so that

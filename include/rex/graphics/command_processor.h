@@ -327,6 +327,9 @@ class CommandProcessor {
 
   // Shared readback resolve mode with backend legacy-flag alias support.
   ReadbackResolveMode GetReadbackResolveMode(bool legacy_readback_resolve_enabled) const;
+  // False when readback_resolve_max_bytes caps out this resolve's size and its
+  // CPU readback should be skipped.
+  bool ShouldReadbackResolveLength(uint32_t written_length) const;
   // Shared memexport readback enable state with backend legacy-flag override support.
   bool IsReadbackMemexportEnabled(bool legacy_backend_flag) const;
 

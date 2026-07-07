@@ -53,6 +53,8 @@ struct WebSession {
   uint64_t    host_xuid   = 0;
   uint32_t    port_offset = 0;
   uint64_t    nonce       = 0;
+  std::string media_id;        ///< "{:08X}" of the XEX media id (host side)
+  std::string version;         ///< Title version "a.b.c.d" (host side)
 };
 
 // ---------------------------------------------------------------------------

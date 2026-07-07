@@ -218,6 +218,10 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// built-in achievement UI. Returning nullptr disables the overlay.
   virtual std::unique_ptr<ui::ImGuiDialog> CreateAchievementsOverlay();
 
+  /// Creates the overlay toggled by bind_mods_menu (F5). Override to replace
+  /// the built-in mods list UI. Returning nullptr disables the overlay.
+  virtual std::unique_ptr<ui::ImGuiDialog> CreateModsMenuOverlay();
+
   /// Creates the achievement notification UI. Override to replace the
   /// built-in toast renderer. Returning nullptr disables notifications.
   virtual std::unique_ptr<ui::AchievementNotificationDialog> CreateAchievementNotificationDialog();
@@ -311,6 +315,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<ui::ShaderDebuggerDialog> shader_debugger_overlay_;
 #endif
   std::unique_ptr<ui::ImGuiDialog> achievements_overlay_;
+  std::unique_ptr<ui::ImGuiDialog> mods_menu_overlay_;
   std::shared_ptr<ui::AchievementNotificationDialog> achievement_notification_;
   uint64_t achievement_notification_listener_ = 0;
   ui::DebugOverlayDialog::FrameStatsProvider frame_stats_provider_;

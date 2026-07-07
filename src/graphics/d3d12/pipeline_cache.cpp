@@ -51,6 +51,7 @@
 #include <rex/hash.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/mods.h>
 #include <rex/string.h>
 #include <rex/string/buffer.h>
 #include <rex/thread.h>
@@ -1247,11 +1248,27 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
 
 #ifdef REXGLUE_ENABLE_SHADERS
   if (REXCVAR_GET(shader_load_enabled)) {
-    const auto mod_path =
-        rex::filesystem::GetExecutableFolder() / "mods" / "shaders" /
-        fmt::format("{:016X}_{:016X}.dxbc", shader.ucode_data_hash(),
-                    translation.modification());
-    if (std::filesystem::exists(mod_path)) {
+
+    //use mods_data_root as mod_path if it exists, otherwise use the default mods/shaders path
+    std::filesystem::path mods_data_root = REXCVAR_GET(mods_data_root);
+    if (mods_data_root.empty()) {
+      mods_data_root = rex::filesystem::GetExecutableFolder() / "mods";
+    }
+
+    // Search enabled mod folders in priority order (mods_data_root/<mod>/shaders/),
+    // first match wins.
+    const std::string shader_filename = fmt::format(
+        "{:016X}_{:016X}.dxbc", shader.ucode_data_hash(), translation.modification());
+    std::filesystem::path mod_path;
+    for (const auto& mod_dir : GetEnabledModDirs(mods_data_root)) {
+      auto candidate = mod_dir / "shaders" / shader_filename;
+      if (std::filesystem::exists(candidate)) {
+        mod_path = std::move(candidate);
+        break;
+      }
+    }
+
+    if (!mod_path.empty()) {
       FILE* f = rex::filesystem::OpenFile(mod_path, "rb");
       if (f) {
         rex::filesystem::Seek(f, 0, SEEK_END);
@@ -1262,8 +1279,9 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
           if (fread(replacement.data(), 1, replacement.size(), f) ==
               replacement.size()) {
             translation.set_translated_binary(std::move(replacement));
-            REXGPU_INFO("Loaded replacement DXBC {:016X} mod {:016X} from mods/shaders/",
-                        shader.ucode_data_hash(), translation.modification());
+            REXGPU_INFO("Loaded replacement DXBC {:016X} mod {:016X} from {}",
+                        shader.ucode_data_hash(), translation.modification(),
+                        mod_path.parent_path().string());
           }
         }
         fclose(f);

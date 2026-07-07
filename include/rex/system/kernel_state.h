@@ -195,6 +195,10 @@ class KernelState {
   rex::filesystem::VirtualFileSystem* file_system() const { return file_system_; }
 
   uint32_t title_id() const;
+  // XEX execution-info media id (0 if unavailable).
+  uint32_t media_id() const;
+  // Title version formatted "major.minor.build.qfe" ("" if unavailable).
+  std::string title_version() const;
   util::XdbfGameData title_xdbf() const;
   util::XdbfGameData module_xdbf(object_ref<UserModule> exec_module) const;
 

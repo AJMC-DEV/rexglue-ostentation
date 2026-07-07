@@ -36,6 +36,7 @@
 #include <rex/system/xevent.h>
 #include <rex/system/xmodule.h>
 #include <rex/system/xmutant.h>
+#include <rex/system/xlive_web_client.h>
 #include <rex/system/xnotifylistener.h>
 #include <rex/system/xobject.h>
 #include <rex/system/xsemaphore.h>
@@ -164,6 +165,17 @@ void KernelState::SetProcessTLSVars(X_KPROCESS* process, uint32_t num_slots, uin
 }
 
 KernelState::~KernelState() {
+  // Best-effort: delete any sessions this console still owns on the web
+  // service so they don't linger in the public list after a clean exit.
+  // (Netplay equivalently deletes own sessions when going offline; a killed
+  // process is still cleaned up by the next launch's startup delete.)
+  {
+    auto& wc = XLiveWebClient::Get();
+    if (wc.is_ready() && !wc.registered_mac().empty()) {
+      wc.DeleteStaleSessions(true, wc.registered_mac());
+    }
+  }
+
   app_manager_.reset();
 
   // Stop the dispatch thread before touching the object table
@@ -238,6 +250,33 @@ uint32_t KernelState::title_id() const {
   }
 
   return 0;
+}
+
+uint32_t KernelState::media_id() const {
+  assert_not_null(executable_module_);
+
+  xex2_opt_execution_info* exec_info = 0;
+  executable_module_->GetOptHeader(XEX_HEADER_EXECUTION_INFO, &exec_info);
+
+  if (exec_info) {
+    return exec_info->media_id;
+  }
+
+  return 0;
+}
+
+std::string KernelState::title_version() const {
+  assert_not_null(executable_module_);
+
+  xex2_opt_execution_info* exec_info = 0;
+  executable_module_->GetOptHeader(XEX_HEADER_EXECUTION_INFO, &exec_info);
+
+  if (exec_info) {
+    const xex2_version v = exec_info->version();
+    return fmt::format("{}.{}.{}.{}", v.major, v.minor, v.build, v.qfe);
+  }
+
+  return "";
 }
 
 util::XdbfGameData KernelState::title_xdbf() const {
