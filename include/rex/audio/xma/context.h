@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <mutex>
+#include <vector>
 
 #include <rex/kernel.h>
 #include <rex/memory.h>
@@ -37,6 +38,9 @@ struct AVFrame;
 struct AVPacket;
 
 namespace rex::audio {
+
+class AudioReplacement;
+struct AudioReplacementData;
 
 // This is stored in guest space in big-endian order.
 // We load and swap the whole thing to splat here so that we can
@@ -193,6 +197,14 @@ class XmaContext {
   int Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr);
   bool Work();
 
+  // Dump/replace pipeline pointer, shared across all contexts (may be null).
+  void set_replacement(AudioReplacement* replacement) { replacement_ = replacement; }
+
+  // Write any in-progress dump to disk and reset stream state. Public so the
+  // decoder can flush every context at shutdown (before the shared
+  // AudioReplacement it points at is destroyed). Takes lock_.
+  void FlushDump();
+
   void Enable();
   bool Block(bool poll);
   void Clear();
@@ -241,6 +253,23 @@ class XmaContext {
   void UpdateLoopStatus(XMA_CONTEXT_DATA* data);
   void ClearLocked(XMA_CONTEXT_DATA* data);
 
+  // --- Dump/replace support -------------------------------------------------
+  // Begin (or continue) tracking the stream currently feeding this context.
+  // Computes the content hash from the current input buffer on the first frame
+  // of a fresh stream. Must be called with lock_ held.
+  void BeginStreamIfNeeded(XMA_CONTEXT_DATA* data);
+  // Append one just-decoded frame (raw_frame_, big-endian int16) to the dump
+  // accumulator, converting to host-endian. Must be called with lock_ held.
+  void AccumulateDump(const XMA_CONTEXT_DATA* data);
+  // Synthesize one frame (kSamplesPerFrame samples/channel) into raw_frame_
+  // from the injected replacement instead of decoding XMA, resampling to the
+  // context's rate/channels. Must be called with lock_ held.
+  void ProduceInjectedFrame(const XMA_CONTEXT_DATA* data);
+  // Write the accumulated stream to disk (if any) and reset. Assumes lock_ held.
+  void FlushDumpLocked();
+  // Reset stream state without flushing. Assumes lock_ held.
+  void ResetStreamState();
+
   memory::RingBuffer PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data);
   int PrepareDecoder(int sample_rate, bool is_two_channel);
   void PreparePacket(uint32_t frame_size, uint32_t frame_padding);
@@ -280,6 +309,29 @@ class XmaContext {
   // Loop subframe precision state
   uint8_t loop_frame_output_limit_ = 0;
   bool loop_start_skip_pending_ = false;
+
+  // --- Dump/replace state ---------------------------------------------------
+  AudioReplacement* replacement_ = nullptr;
+
+  // Accumulated host-endian interleaved int16 PCM for the current stream.
+  std::vector<int16_t> dump_pcm_;
+  uint64_t stream_hash_ = 0;
+  uint32_t stream_rate_ = 0;
+  uint32_t stream_channels_ = 0;
+  bool stream_active_ = false;
+  // True while we should be accumulating a dump for this stream.
+  bool dumping_ = false;
+  // Set once the accumulator hits the cap; we flush early and stop buffering
+  // so long looping streams can't grow without bound.
+  bool dump_capped_ = false;
+
+  // Injection: when set, ProduceInjectedFrame() substitutes decoded audio.
+  const AudioReplacementData* inject_data_ = nullptr;
+  bool injecting_ = false;
+  double inject_src_pos_ = 0.0;  // fractional read cursor, in source frames
+
+  // ~30 s at 48 kHz stereo — plenty for any one-shot, bounds runaway loops.
+  static const size_t kMaxDumpSamples = 30u * 48000u * 2u;
 };
 
 }  // namespace rex::audio

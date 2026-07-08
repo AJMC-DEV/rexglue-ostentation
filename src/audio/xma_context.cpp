@@ -10,11 +10,14 @@
 */
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
+#include <rex/audio/replacement.h>
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/audio/xma/helpers.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/memory/ring_buffer.h>
@@ -171,6 +174,9 @@ void XmaContext::Clear() {
   std::lock_guard<std::mutex> lock(lock_);
   REXAPU_NOISY_DEBUG("XmaContext: reset context {}", id());
 
+  // The stream feeding this context is ending/restarting — commit its dump.
+  FlushDumpLocked();
+
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
   XMA_CONTEXT_DATA data(context_ptr);
   ClearLocked(&data);
@@ -199,6 +205,9 @@ void XmaContext::Disable() {
 void XmaContext::Release() {
   std::lock_guard<std::mutex> lock(lock_);
   assert_true(is_allocated());
+
+  // Context is being freed for reuse — commit any in-progress dump.
+  FlushDumpLocked();
 
   set_is_allocated(false);
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
@@ -524,6 +533,8 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 
   uint8_t* current_input_buffer = GetCurrentInputBuffer(data);
 
+  BeginStreamIfNeeded(data);
+
   input_buffer_.fill(0);
 
   // Detect loop end frame before UpdateLoopStatus resets the offset.
@@ -640,11 +651,25 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 
   raw_frame_.fill(0);
 
-  PrepareDecoder(data->sample_rate, bool(data->is_stereo));
-  PreparePacket(packet_info.current_frame_size_, padding_start);
-  if (DecodePacket(av_context_, av_packet_, av_frame_)) {
-    ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
-                 raw_frame_.data());
+  // When a modder replacement is bound to this stream, synthesize the frame
+  // from it instead of decoding the guest's XMA. We still advance through the
+  // real input below so the guest's stream bookkeeping (offsets, loops, end
+  // detection) stays byte-for-byte identical to an unmodded run.
+  bool have_frame;
+  if (injecting_) {
+    ProduceInjectedFrame(data);
+    have_frame = true;
+  } else {
+    PrepareDecoder(data->sample_rate, bool(data->is_stereo));
+    PreparePacket(packet_info.current_frame_size_, padding_start);
+    have_frame = DecodePacket(av_context_, av_packet_, av_frame_);
+    if (have_frame) {
+      ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
+                   raw_frame_.data());
+      AccumulateDump(data);
+    }
+  }
+  if (have_frame) {
     current_frame_remaining_subframes_ = 4 << data->is_stereo;
 
     // Loop end: limit output to subframes 0..loop_subframe_end.
@@ -763,6 +788,161 @@ void XmaContext::ConvertFrame(const uint8_t** samples, bool is_two_channel,
     }
   }
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// Dump / replace support
+// ---------------------------------------------------------------------------
+void XmaContext::BeginStreamIfNeeded(XMA_CONTEXT_DATA* data) {
+  if (!replacement_ || stream_active_) {
+    return;
+  }
+  const bool want_dump = REXCVAR_GET(audio_dump_enabled);
+  const bool want_replace = REXCVAR_GET(audio_replace_enabled);
+  if (!want_dump && !want_replace) {
+    return;
+  }
+
+  const uint32_t input_size = GetCurrentInputBufferSize(data);
+  if (!input_size) {
+    return;  // consume-only / nothing to identify a stream by yet
+  }
+
+  // Identify the stream by the content of its (first) input buffer. Stable
+  // across replays for one-shot sounds whose data is set up in one buffer.
+  const uint8_t* input = GetCurrentInputBuffer(data);
+  stream_hash_ = AudioReplacement::HashGuestData(input, input_size);
+  stream_rate_ = static_cast<uint32_t>(GetSampleRate(data->sample_rate));
+  stream_channels_ = data->is_stereo ? 2u : 1u;
+  dump_pcm_.clear();
+  dump_capped_ = false;
+  stream_active_ = true;
+
+  // Injection takes priority: if a replacement exists for this stream, we
+  // synthesize from it and skip both the FFmpeg decode and the dump (there is
+  // no point dumping our own replacement back out).
+  inject_data_ = nullptr;
+  injecting_ = false;
+  inject_src_pos_ = 0.0;
+  if (want_replace && replacement_->HasReplacement(stream_hash_)) {
+    inject_data_ = replacement_->FindReplacement(stream_hash_);
+    if (inject_data_ && !inject_data_->samples.empty() && inject_data_->channels) {
+      injecting_ = true;
+      REXAPU_DEBUG("XmaContext {}: injecting replacement for stream {:016X}", id(), stream_hash_);
+    }
+  }
+
+  dumping_ = want_dump && !injecting_;
+}
+
+void XmaContext::AccumulateDump(const XMA_CONTEXT_DATA* data) {
+  if (!dumping_ || dump_capped_) {
+    return;
+  }
+
+  // raw_frame_ holds one freshly decoded frame: kSamplesPerFrame samples per
+  // channel, interleaved, big-endian int16 (as ConvertFrame emitted it).
+  const uint32_t channels = data->is_stereo ? 2u : 1u;
+  const uint32_t value_count = kSamplesPerFrame * channels;
+  const auto* be = reinterpret_cast<const int16_t*>(raw_frame_.data());
+
+  dump_pcm_.reserve(dump_pcm_.size() + value_count);
+  for (uint32_t i = 0; i < value_count; ++i) {
+    dump_pcm_.push_back(rex::byte_swap(be[i]));
+  }
+
+  // Bound runaway (looping/streaming) contexts: flush what we have and stop.
+  if (dump_pcm_.size() >= kMaxDumpSamples) {
+    if (replacement_ && stream_channels_) {
+      replacement_->DumpStream(stream_hash_, dump_pcm_.data(),
+                               dump_pcm_.size() / stream_channels_, stream_rate_,
+                               stream_channels_);
+    }
+    dump_pcm_.clear();
+    dump_pcm_.shrink_to_fit();
+    dump_capped_ = true;
+  }
+}
+
+void XmaContext::FlushDumpLocked() {
+  if (replacement_ && !dump_pcm_.empty() && stream_channels_) {
+    replacement_->DumpStream(stream_hash_, dump_pcm_.data(),
+                             dump_pcm_.size() / stream_channels_, stream_rate_,
+                             stream_channels_);
+  }
+  ResetStreamState();
+}
+
+void XmaContext::FlushDump() {
+  std::lock_guard<std::mutex> lock(lock_);
+  FlushDumpLocked();
+}
+
+void XmaContext::ResetStreamState() {
+  dump_pcm_.clear();
+  dump_pcm_.shrink_to_fit();
+  stream_hash_ = 0;
+  stream_rate_ = 0;
+  stream_channels_ = 0;
+  stream_active_ = false;
+  dumping_ = false;
+  dump_capped_ = false;
+
+  inject_data_ = nullptr;
+  injecting_ = false;
+  inject_src_pos_ = 0.0;
+}
+
+void XmaContext::ProduceInjectedFrame(const XMA_CONTEXT_DATA* data) {
+  const uint32_t dst_channels = data->is_stereo ? 2u : 1u;
+  const uint32_t dst_rate = static_cast<uint32_t>(GetSampleRate(data->sample_rate));
+  auto out = reinterpret_cast<int16_t*>(raw_frame_.data());
+
+  const std::vector<int16_t>& src = inject_data_->samples;
+  const uint32_t src_channels = inject_data_->channels;
+  const size_t src_frames = inject_data_->frame_count();
+  const double ratio = (inject_data_->sample_rate && dst_rate)
+                           ? static_cast<double>(inject_data_->sample_rate) / dst_rate
+                           : 1.0;
+  // Loop the replacement only when the guest stream itself loops; one-shots go
+  // silent once the replacement is exhausted so overall timing is preserved.
+  const bool loop = data->loop_count > 0 && src_frames > 0;
+
+  auto sample_at = [&](size_t frame, uint32_t ch) -> double {
+    return static_cast<double>(src[frame * src_channels + ch]);
+  };
+
+  for (uint32_t i = 0; i < kSamplesPerFrame; ++i) {
+    if (loop && inject_src_pos_ >= static_cast<double>(src_frames)) {
+      inject_src_pos_ = std::fmod(inject_src_pos_, static_cast<double>(src_frames));
+    }
+
+    const size_t idx = static_cast<size_t>(inject_src_pos_);
+    int16_t l = 0, r = 0;
+    if (idx < src_frames) {
+      const size_t idx1 = std::min(idx + 1, src_frames - 1);
+      const double frac = inject_src_pos_ - static_cast<double>(idx);
+      if (src_channels == 1) {
+        const double s = sample_at(idx, 0) * (1.0 - frac) + sample_at(idx1, 0) * frac;
+        l = r = static_cast<int16_t>(s);
+      } else {
+        l = static_cast<int16_t>(sample_at(idx, 0) * (1.0 - frac) + sample_at(idx1, 0) * frac);
+        r = static_cast<int16_t>(sample_at(idx, 1) * (1.0 - frac) + sample_at(idx1, 1) * frac);
+      }
+    }
+
+    if (dst_channels == 1) {
+      const int16_t m = (src_channels == 1)
+                            ? l
+                            : static_cast<int16_t>((static_cast<int>(l) + static_cast<int>(r)) / 2);
+      out[i] = rex::byte_swap(m);
+    } else {
+      out[i * 2] = rex::byte_swap(l);
+      out[i * 2 + 1] = rex::byte_swap(r);
+    }
+
+    inject_src_pos_ += ratio;
+  }
 }
 
 }  // namespace rex::audio

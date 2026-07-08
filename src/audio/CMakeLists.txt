@@ -2,9 +2,10 @@
 # Audio processing and XMA decoding for Xbox 360 emulation
 
 add_library(rexaudio OBJECT
-    
+
     audio_driver.cpp
     audio_system.cpp
+    replacement.cpp
     xma_context.cpp
     xma_decoder.cpp
     xma_register_file.cpp
@@ -23,5 +24,5 @@ target_include_directories(rexaudio PUBLIC
 
 target_link_libraries(rexaudio
     PUBLIC rexcore SDL3::SDL3
-    PRIVATE libavcodec libavutil
+    PRIVATE libavcodec libavutil xxHash::xxhash
 )

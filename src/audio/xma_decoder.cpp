@@ -9,9 +9,11 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/audio/replacement.h>
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
@@ -90,6 +92,10 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
   // Setup ffmpeg logging callback
   av_log_set_callback(av_log_callback);
 
+  // Dump/replace pipeline (shared by every context). Rooted at the executable
+  // folder, matching the texture replacement pipeline.
+  replacement_ = std::make_unique<AudioReplacement>(rex::filesystem::GetExecutableFolder());
+
   // Register APU/XMA MMIO handlers
   // XMA registers are at 0x7FEA0000-0x7FEAFFFF
   memory()->AddVirtualMappedRange(
@@ -118,6 +124,7 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
     if (context.Setup(i, memory(), guest_ptr)) {
       assert_always();
     }
+    context.set_replacement(replacement_.get());
   }
   register_file_[XmaRegister::NextContextIndex] = 1;
   context_bitmap_.Resize(kContextCount);
@@ -185,6 +192,12 @@ void XmaDecoder::Shutdown() {
     REXAPU_WARN("XMA: Worker thread did not exit within 2s, abandoning");
   }
   worker_thread_.reset();
+
+  // Commit any in-progress dumps while the shared AudioReplacement is still
+  // alive (it is destroyed before contexts_ in ~XmaDecoder).
+  for (auto& context : contexts_) {
+    context.FlushDump();
+  }
 
   if (context_data_first_ptr_) {
     memory()->SystemHeapFree(context_data_first_ptr_);

@@ -28,6 +28,7 @@ class FunctionDispatcher;
 namespace rex::audio {
 
 struct XMA_CONTEXT_DATA;
+class AudioReplacement;
 
 class XmaDecoder {
  public:
@@ -36,6 +37,7 @@ class XmaDecoder {
 
   memory::Memory* memory() const { return memory_; }
   runtime::FunctionDispatcher* function_dispatcher() const { return function_dispatcher_; }
+  AudioReplacement* replacement() const { return replacement_.get(); }
 
   X_STATUS Setup(system::KernelState* kernel_state);
   void Shutdown();
@@ -87,6 +89,9 @@ class XmaDecoder {
 
   uint32_t context_data_first_ptr_ = 0;
   uint32_t context_data_last_ptr_ = 0;
+
+  // Dump/replace pipeline shared by all contexts (null if construction failed).
+  std::unique_ptr<AudioReplacement> replacement_;
 };
 
 }  // namespace rex::audio
