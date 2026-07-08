@@ -498,6 +498,12 @@ class RenderTargetCache {
     return last_update_transfers_;
   }
 
+  // Union of the stencil bit planes the guest has read or written in any draw so
+  // far. Sticky, and only ever grows. A backend that has to reconstruct stencil
+  // one bit plane at a time can skip the planes this never names: the guest can
+  // never observe them. Zero means the title has not touched stencil at all.
+  uint32_t guest_stencil_bits_used() const { return guest_stencil_bits_used_; }
+
   HostDepthStoreRenderTargetConstant GetHostDepthStoreRenderTargetConstant(
       uint32_t pitch_tiles, bool msaa_2x_supported) const {
     HostDepthStoreRenderTargetConstant constant;
@@ -563,6 +569,10 @@ class RenderTargetCache {
   const RegisterFile& register_file_;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
+
+  // Accumulated in Update() before the draw's transfers are generated, so a
+  // draw that is the first to touch stencil still gets its bits preserved.
+  uint32_t guest_stencil_bits_used_ = 0;
 
   DrawExtentEstimator draw_extent_estimator_;
 

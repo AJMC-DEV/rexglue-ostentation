@@ -37,6 +37,16 @@ REXCVAR_DEFINE_BOOL(gpu_debug_markers, false, "GPU",
                     "like PIX and RenderDoc. Automatically enabled when "
                     "RenderDoc is detected.");
 
+REXCVAR_DEFINE_BOOL(gpu_profile, false, "GPU/Profile",
+                    "Time the Xenos EDRAM emulation passes (ownership transfers, host depth "
+                    "stores, render target dumps, resolves) with GPU timestamps and log a "
+                    "breakdown periodically. D3D12 only. Costs two timestamps per pass.");
+REXCVAR_DEFINE_INT32(gpu_profile_interval_frames, 120, "GPU/Profile",
+                     "Frames to average over before emitting a gpu_profile report")
+    .range(1, 100000);
+REXCVAR_DEFINE_STRING(gpu_profile_csv, "", "GPU/Profile",
+                      "Append gpu_profile reports to this CSV path (empty = disabled)");
+
 bool IsGpuDebugMarkersEnabled() {
   static bool cached = false;
   static bool result = false;

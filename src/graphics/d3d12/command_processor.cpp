@@ -1645,6 +1645,9 @@ bool D3D12CommandProcessor::SetupContext() {
   pix_capturing_ = false;
   occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
 
+  // Failure here is not fatal - the profiler just stays unavailable.
+  gpu_profiler_.Initialize(provider.GetDevice(), provider.GetDirectQueue());
+
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
 
@@ -1655,6 +1658,7 @@ void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
+  gpu_profiler_.Shutdown();
 
   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
   readback_buffer_size_ = 0;
@@ -3263,6 +3267,8 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
     resources_for_deletion_.pop_front();
   }
 
+  gpu_profiler_.CompletedSubmissionUpdated(submission_completed_);
+
   shared_memory_->CompletedSubmissionUpdated();
 
   render_target_cache_->CompletedSubmissionUpdated();
@@ -3410,6 +3416,11 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   if (is_opening_frame) {
     frame_open_ = true;
 
+    // Latch the cvar before any scope can open, so a mid-frame toggle can't
+    // leave a begin timestamp without its matching end.
+    gpu_profiler_.UpdateEnabled();
+    gpu_profiler_.BeginFrame(deferred_command_list_);
+
     // Reset bindings that depend on the data stored in the pools.
     std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));
     std::memset(current_float_constant_map_pixel_, 0, sizeof(current_float_constant_map_pixel_));
@@ -3493,6 +3504,13 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
                                          active_occlusion_query_.host_index);
       active_occlusion_query_ = {};
     }
+
+    // Timestamp resolves must be recorded before the list is executed. This
+    // submission is the one about to be signalled with submission_current_.
+    if (is_closing_frame) {
+      gpu_profiler_.EndFrame(deferred_command_list_, submission_current_);
+    }
+    gpu_profiler_.EndSubmission(deferred_command_list_, submission_current_);
 
     pipeline_cache_->EndSubmission();
 

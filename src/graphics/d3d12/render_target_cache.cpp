@@ -17,6 +17,7 @@
 #include <cstring>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -47,6 +48,25 @@ REXCVAR_DEFINE_STRING(render_target_path_d3d12, "", "GPU/D3D12",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native stencil value output");
+
+// Only consulted when the GPU cannot write SV_StencilRef from a pixel shader
+// (NVIDIA in D3D12). Without it, preserving stencil across an EDRAM ownership
+// transfer costs one full-rectangle draw per bit plane - eight passes over the
+// same pixels. Each cleared bit here drops one of those passes; the hardware
+// stencil clear that precedes them still runs, so masked-out bits read as 0
+// rather than as stale data.
+//
+// The default tracks the bit planes the guest has actually read or written, so a
+// title that never touches stencil pays nothing and one that uses a single bit
+// pays an eighth. An explicit value overrides that and is only safe if you know
+// the title never tests the planes you drop.
+REXCVAR_DEFINE_INT32(transfer_stencil_bit_mask, -1, "GPU",
+                     "Stencil bit planes to preserve across EDRAM ownership transfers.\n"
+                     "  -1     = auto: only the planes the guest has read or written\n"
+                     "  0..255 = explicit mask; each set bit costs a full-rectangle draw\n"
+                     "No effect on GPUs with native stencil value output (AMD, Intel).")
+    .range(-1, 255)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::d3d12 {
 
@@ -1293,21 +1313,26 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           }
           TransitionEdramBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-          // Submit the resolve.
-          command_list.D3DSetComputeRootSignature(resolve_copy_root_signature_);
-          command_list.D3DSetComputeRootDescriptorTable(2, descriptor_source.second);
-          command_list.D3DSetComputeRootDescriptorTable(1, descriptor_dest.second);
-          if (draw_resolution_scaled) {
-            command_list.D3DSetComputeRoot32BitConstants(
-                0, sizeof(copy_shader_constants.dest_relative) / sizeof(uint32_t),
-                &copy_shader_constants.dest_relative, 0);
-          } else {
-            command_list.D3DSetComputeRoot32BitConstants(
-                0, sizeof(copy_shader_constants) / sizeof(uint32_t), &copy_shader_constants, 0);
+          // Submit the resolve. Scoped tightly around the dispatch: the render
+          // target dump that fed edram_buffer_ is timed separately.
+          {
+            GpuPassScope resolve_copy_scope(command_processor_.GetGpuProfiler(), command_list,
+                                            GpuPass::kResolveCopy);
+            command_list.D3DSetComputeRootSignature(resolve_copy_root_signature_);
+            command_list.D3DSetComputeRootDescriptorTable(2, descriptor_source.second);
+            command_list.D3DSetComputeRootDescriptorTable(1, descriptor_dest.second);
+            if (draw_resolution_scaled) {
+              command_list.D3DSetComputeRoot32BitConstants(
+                  0, sizeof(copy_shader_constants.dest_relative) / sizeof(uint32_t),
+                  &copy_shader_constants.dest_relative, 0);
+            } else {
+              command_list.D3DSetComputeRoot32BitConstants(
+                  0, sizeof(copy_shader_constants) / sizeof(uint32_t), &copy_shader_constants, 0);
+            }
+            command_processor_.SetExternalPipeline(resolve_copy_pipelines_[size_t(copy_shader)]);
+            command_processor_.SubmitBarriers();
+            command_list.D3DDispatch(copy_group_count_x, copy_group_count_y, 1);
           }
-          command_processor_.SetExternalPipeline(resolve_copy_pipelines_[size_t(copy_shader)]);
-          command_processor_.SubmitBarriers();
-          command_list.D3DDispatch(copy_group_count_x, copy_group_count_y, 1);
 
           // Order the resolve with other work using the destination as a UAV.
           if (draw_resolution_scaled) {
@@ -1371,6 +1396,8 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           }
         }
         if (descriptor_edram_obtained) {
+          GpuPassScope rov_clear_scope(command_processor_.GetGpuProfiler(), command_list,
+                                       GpuPass::kResolveClear);
           TransitionEdramBuffer(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
           // Should be safe to only commit once (if was UAV / ROV previously -
           // if there was nothing to copy, only to clear, for some reason, for
@@ -3980,6 +4007,17 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
 
   // Do host depth storing for the depth destination (assuming there can be only
   // one depth destination) where depth destination == host depth source.
+  GpuProfiler& gpu_profiler = command_processor_.GetGpuProfiler();
+  // Latched once per call so a hot reload cannot change it between the stencil
+  // clear and the bit-plane draws that repopulate it. Negative means auto: only
+  // restore the planes the guest can observe.
+  const int32_t transfer_stencil_bit_mask_cvar = REXCVAR_GET(transfer_stencil_bit_mask);
+  const uint32_t transfer_stencil_bit_mask = transfer_stencil_bit_mask_cvar < 0
+                                                 ? guest_stencil_bits_used()
+                                                 : uint32_t(transfer_stencil_bit_mask_cvar) & 0xFFu;
+  // Opened lazily so that the common case - no host depth store at all - does
+  // not burn a timestamp pair or inflate the call count.
+  std::optional<GpuPassScope> host_depth_store_scope;
   bool host_depth_store_set_up = false;
   for (uint32_t i = 0; i < render_target_count; ++i) {
     RenderTarget* dest_rt = render_targets[i];
@@ -4005,6 +4043,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
                 1 + uint32_t(!bindless_resources_used_), host_depth_store_descriptors)) {
           continue;
         }
+        host_depth_store_scope.emplace(gpu_profiler, command_list, GpuPass::kHostDepthStore);
         command_list.D3DSetComputeRootSignature(host_depth_store_root_signature_);
         // Destination (EDRAM uint4 buffer).
         if (bindless_resources_used_) {
@@ -4072,6 +4111,33 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       }
     }
     break;
+  }
+  // Close the host depth store scope before the transfer work begins.
+  host_depth_store_scope.reset();
+
+  // Everything below is the ownership transfer itself. When this function was
+  // entered from the resolve path the same draws also perform the resolve clear,
+  // so attribute the whole remainder to whichever the caller asked for rather
+  // than pretending the two can be separated.
+  //
+  // Update() calls this once per draw regardless of whether anything needs
+  // transferring, and the loops below skip a render target with no transfers.
+  // Only time the calls that actually emit GPU work - otherwise the scope count
+  // is really a draw count, and the timestamp pairs swamp the query heap.
+  bool any_transfer_work = resolve_clear_needed;
+  if (!any_transfer_work) {
+    for (uint32_t i = 0; i < render_target_count; ++i) {
+      if (render_targets[i] && !render_target_transfers[i].empty()) {
+        any_transfer_work = true;
+        break;
+      }
+    }
+  }
+  std::optional<GpuPassScope> transfer_scope;
+  if (any_transfer_work) {
+    transfer_scope.emplace(
+        gpu_profiler, command_list,
+        resolve_clear_needed ? GpuPass::kResolveClear : GpuPass::kOwnershipTransfer);
   }
 
   // Try to insert as many barriers as possible in one place, hoping that in the
@@ -4491,6 +4557,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         if (!transfer_rectangle_write_ptr) {
           continue;
         }
+        uint64_t transfer_rectangle_pixels = 0;
         for (auto it_merged = it_merged_first; it_merged <= it_merged_last; ++it_merged) {
           Transfer::Rectangle transfer_invocation_rectangles[Transfer::kMaxRectanglesWithCutout];
           uint32_t transfer_invocation_rectangle_count = it_merged->transfer.GetRectangles(
@@ -4499,6 +4566,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           assert_not_zero(transfer_invocation_rectangle_count);
           for (uint32_t j = 0; j < transfer_invocation_rectangle_count; ++j) {
             const Transfer::Rectangle& transfer_rectangle = transfer_invocation_rectangles[j];
+            transfer_rectangle_pixels +=
+                uint64_t(transfer_rectangle.width_pixels) * transfer_rectangle.height_pixels;
             float transfer_rectangle_x0 = -1.0f + transfer_rectangle.x_pixels * pixels_to_ndc_x;
             float transfer_rectangle_y0 = 1.0f - transfer_rectangle.y_pixels * pixels_to_ndc_y;
             float transfer_rectangle_x1 =
@@ -4693,11 +4762,18 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           transfer_root_parameters_set |= kTransferUsedRootParameterColorSRVBit;
         }
 
-        // Draw the transfer rectangles.
+        // Draw the transfer rectangles. A stencil-bit transfer rasterizes the
+        // whole rectangle set once per bit plane it has to restore; the stencil
+        // was already hardware-cleared to 0 above, so a bit plane skipped here
+        // simply reads back as 0.
         command_processor_.SubmitBarriers();
+        uint32_t transfer_draw_count = 0;
         for (uint32_t j = 0; j <= uint32_t(is_stencil_bit) * 7; ++j) {
           if (is_stencil_bit) {
             uint32_t transfer_stencil_bit = uint32_t(1) << j;
+            if (!(transfer_stencil_bit_mask & transfer_stencil_bit)) {
+              continue;
+            }
             command_list.D3DSetGraphicsRoot32BitConstants(
                 rex::bit_count(transfer_root_parameters_used &
                                (kTransferUsedRootParameterStencilMaskConstantBit - 1)),
@@ -4705,6 +4781,16 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           }
           command_processor_.SetExternalPipeline(transfer_pipelines[j]);
           command_list.D3DDrawInstanced(transfer_vertex_count, 1, 0, 0);
+          ++transfer_draw_count;
+        }
+
+        uint64_t transfer_pixels = transfer_rectangle_pixels * transfer_draw_count;
+        gpu_profiler.AddStat(GpuStat::kTransferDraws, transfer_draw_count);
+        gpu_profiler.AddStat(GpuStat::kTransferRectangles, transfer_rectangle_count);
+        gpu_profiler.AddStat(GpuStat::kTransferPixelsRasterized, transfer_pixels);
+        if (is_stencil_bit) {
+          gpu_profiler.AddStat(GpuStat::kTransferStencilBitDraws, transfer_draw_count);
+          gpu_profiler.AddStat(GpuStat::kTransferStencilBitPixels, transfer_pixels);
         }
       }
     }
@@ -5694,48 +5780,23 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDirectResolvePipeline(
 bool D3D12RenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
                                                     draw_util::ResolveCopyShaderIndex copy_shader,
                                                     bool draw_resolution_scaled) {
-  ++direct_resolve_attempt_count_;
+  (void)resolve_info;
   (void)copy_shader;
   (void)draw_resolution_scaled;
-  if (!direct_resolve_root_signature_color_ || !direct_resolve_root_signature_depth_) {
-    return false;
-  }
+  ++direct_resolve_attempt_count_;
 
-  uint32_t dump_base;
-  uint32_t dump_row_length_used;
-  uint32_t dump_rows;
-  uint32_t dump_pitch;
-  resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
-  GetResolveCopyDispatchesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
-                                 dump_rectangles_, direct_resolve_dispatches_);
-  if (direct_resolve_dispatches_.empty()) {
-    return false;
-  }
-
-  for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
-    const auto* render_target = static_cast<const D3D12RenderTarget*>(rectangle.render_target);
-    if (render_target == nullptr) {
-      return false;
-    }
-    DumpPipelineKey dump_pipeline_key;
-    dump_pipeline_key.msaa_samples = render_target->key().msaa_samples;
-    dump_pipeline_key.resource_format = render_target->key().resource_format;
-    dump_pipeline_key.is_depth = render_target->key().is_depth;
-    if (!GetOrCreateDumpPipeline(dump_pipeline_key)) {
-      return false;
-    }
-    DirectResolvePipelineKey direct_pipeline_key;
-    direct_pipeline_key.dump_pipeline_key = dump_pipeline_key;
-    direct_pipeline_key.copy_shader = copy_shader;
-    direct_pipeline_key.draw_resolution_scaled = draw_resolution_scaled;
-    if (!GetOrCreateDirectResolvePipeline(direct_pipeline_key)) {
-      return false;
-    }
-  }
-
-  // Dedicated direct resolve dispatches are staged behind the same preflight;
-  // keep using the existing dump path until source-image direct shaders land.
-  return DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+  // Not implemented. A direct resolve needs compute shaders that sample the
+  // host render target image directly instead of reading it back out of
+  // edram_buffer_, and those shaders do not exist: every resolve shader in this
+  // tree is prebuilt DXBC under src/graphics/shaders/bytecode, with no HLSL
+  // source and no compile step to regenerate them from.
+  //
+  // Until they land, report the fallback honestly. This function used to run
+  // GetResolveCopyDispatchesToDump plus two pipeline map lookups per rectangle,
+  // then call DumpRenderTargets and return its result - so it did the dump
+  // work, counted itself a success, and on failure let Resolve() dump a second
+  // time. Resolve() performs the dump itself when we return false.
+  return false;
 }
 
 bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
@@ -5747,6 +5808,10 @@ bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump
   if (dump_rectangles_.empty()) {
     return true;
   }
+
+  GpuPassScope dump_scope(command_processor_.GetGpuProfiler(),
+                          command_processor_.GetDeferredCommandList(),
+                          GpuPass::kRenderTargetDump);
 
   // Clear previously set temporary indices.
   for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {

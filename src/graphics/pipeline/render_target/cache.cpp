@@ -37,8 +37,13 @@ REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend, tru
 REXCVAR_DEFINE_BOOL(snorm16_render_target_full_range, true, "GPU",
                     "Use full range for SNORM16 render targets");
 
-REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
-                    "Resolve from host render targets directly to shared memory when possible")
+// Off by default because it is not implemented yet: the source-image resolve
+// shaders it needs do not exist (see D3D12RenderTargetCache::
+// TryResolveCopyDirectly). Enabling it only makes every resolve attempt the
+// direct path, fail, and fall back to the EDRAM round trip.
+REXCVAR_DEFINE_BOOL(direct_host_resolve, false, "GPU",
+                    "Resolve from host render targets directly to shared memory, skipping the "
+                    "round trip through the EDRAM buffer. NOT IMPLEMENTED - always falls back")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics {
@@ -402,6 +407,25 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                                uint32_t normalized_color_mask, const Shader& vertex_shader) {
   const RegisterFile& regs = register_file();
   bool interlock_barrier_only = GetPath() == Path::kPixelShaderInterlock;
+
+  // Record which stencil bit planes the guest can actually observe. Done before
+  // the transfers below are generated so the draw that first enables stencil
+  // still gets its bits carried across an ownership change. Both the read and
+  // the write mask count: a bit written now may be tested after a later
+  // transfer, by which point widening the mask would be too late.
+  if (is_rasterization_done && normalized_depth_control.stencil_enable) {
+    auto rb_stencilrefmask = regs.Get<reg::RB_STENCILREFMASK>();
+    uint32_t stencil_bits = rb_stencilrefmask.stencilmask | rb_stencilrefmask.stencilwritemask;
+    if (normalized_depth_control.backface_enable) {
+      auto rb_stencilrefmask_bf = regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF);
+      stencil_bits |= rb_stencilrefmask_bf.stencilmask | rb_stencilrefmask_bf.stencilwritemask;
+    }
+    if (stencil_bits & ~guest_stencil_bits_used_) {
+      guest_stencil_bits_used_ |= stencil_bits & 0xFF;
+      REXGPU_INFO("RenderTargetCache: guest stencil bits in use widened to 0x{:02X}",
+                  guest_stencil_bits_used_);
+    }
+  }
 
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   xenos::MsaaSamples msaa_samples = rb_surface_info.msaa_samples;
@@ -944,6 +968,11 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
   uint32_t base_offset_tiles_at_32bpp;
   xenos::MsaaSamples msaa_samples;
   if (resolve_info.IsClearingDepth()) {
+    // A clear is the other way stencil acquires a value the guest cares about,
+    // and it can precede the first stencil-enabled draw. Widen the mask here or
+    // an ownership transfer in between would drop bits nothing has claimed yet.
+    // Clearing to zero claims nothing, which is exactly right.
+    guest_stencil_bits_used_ |= resolve_info.rb_depth_clear & 0xFF;
     pitch_tiles_at_32bpp = resolve_info.depth_edram_info.pitch_tiles;
     base_offset_tiles_at_32bpp =
         resolve_info.depth_edram_info.base_tiles - resolve_info.depth_original_base;

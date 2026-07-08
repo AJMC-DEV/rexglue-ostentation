@@ -38,6 +38,7 @@ REXCVAR_DECLARE(bool, depth_float24_convert_in_pixel_shader);
 REXCVAR_DECLARE(bool, depth_transfer_not_equal_test);
 REXCVAR_DECLARE(bool, native_stencil_value_output);
 REXCVAR_DECLARE(bool, native_stencil_value_output_d3d12_intel);
+REXCVAR_DECLARE(int32_t, transfer_stencil_bit_mask);
 REXCVAR_DECLARE(bool, gamma_render_target_as_unorm16);
 REXCVAR_DECLARE(bool, native_2x_msaa);
 REXCVAR_DECLARE(bool, snorm16_render_target_full_range);
@@ -66,6 +67,11 @@ REXCVAR_DECLARE(int32_t, primitive_processor_cache_min_indices);
 // GPU Debug
 REXCVAR_DECLARE(bool, gpu_debug_markers);
 bool IsGpuDebugMarkersEnabled();
+
+// GPU Profiling (D3D12 only)
+REXCVAR_DECLARE(bool, gpu_profile);
+REXCVAR_DECLARE(int32_t, gpu_profile_interval_frames);
+REXCVAR_DECLARE(std::string, gpu_profile_csv);
 
 // GPU Alpha Test
 REXCVAR_DECLARE(bool, use_fuzzy_alpha_epsilon);

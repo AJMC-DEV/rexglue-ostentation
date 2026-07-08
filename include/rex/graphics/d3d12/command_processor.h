@@ -25,6 +25,7 @@
 #include <rex/assert.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/d3d12/deferred_command_list.h>
+#include <rex/graphics/d3d12/gpu_profiler.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
 #include <rex/graphics/d3d12/primitive_processor.h>
@@ -86,6 +87,9 @@ class D3D12CommandProcessor : public CommandProcessor {
     assert_true(submission_open_);
     return deferred_command_list_;
   }
+
+  // Pass-level GPU timestamp profiler. Inert unless the gpu_profile cvar is on.
+  GpuProfiler& GetGpuProfiler() { return gpu_profiler_; }
 
   uint64_t GetCurrentSubmission() const { return submission_current_; }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }
@@ -669,6 +673,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint32_t readback_buffer_size_ = 0;
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
+
+  GpuProfiler gpu_profiler_;
 
   static constexpr uint32_t kMaxOcclusionQueries = 8192;
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> occlusion_query_heap_;
