@@ -1249,42 +1249,92 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
 #ifdef REXGLUE_ENABLE_SHADERS
   if (REXCVAR_GET(shader_load_enabled)) {
 
-    //use mods_data_root as mod_path if it exists, otherwise use the default mods/shaders path
+    // Use mods_data_root if set, otherwise the default <exe>/mods path.
     std::filesystem::path mods_data_root = REXCVAR_GET(mods_data_root);
     if (mods_data_root.empty()) {
       mods_data_root = rex::filesystem::GetExecutableFolder() / "mods";
     }
 
-    // Search enabled mod folders in priority order (mods_data_root/<mod>/shaders/),
-    // first match wins.
-    const std::string shader_filename = fmt::format(
-        "{:016X}_{:016X}.dxbc", shader.ucode_data_hash(), translation.modification());
-    std::filesystem::path mod_path;
-    for (const auto& mod_dir : GetEnabledModDirs(mods_data_root)) {
-      auto candidate = mod_dir / "shaders" / shader_filename;
-      if (std::filesystem::exists(candidate)) {
-        mod_path = std::move(candidate);
-        break;
-      }
-    }
+    const bool compile_hlsl = REXCVAR_GET(shader_compile_hlsl) && provider.IsCompileAvailable();
+    const std::string base =
+        fmt::format("{:016X}_{:016X}", shader.ucode_data_hash(), translation.modification());
+    const std::string hlsl_filename = base + ".hlsl";
+    const std::string dxbc_filename = base + ".dxbc";
 
-    if (!mod_path.empty()) {
-      FILE* f = rex::filesystem::OpenFile(mod_path, "rb");
+    // Read an entire file into a byte vector (empty on any failure).
+    auto read_file = [](const std::filesystem::path& p) -> std::vector<uint8_t> {
+      std::vector<uint8_t> data;
+      FILE* f = rex::filesystem::OpenFile(p, "rb");
       if (f) {
         rex::filesystem::Seek(f, 0, SEEK_END);
         const int64_t size = rex::filesystem::Tell(f);
         rex::filesystem::Seek(f, 0, SEEK_SET);
         if (size > 0) {
-          std::vector<uint8_t> replacement(static_cast<size_t>(size));
-          if (fread(replacement.data(), 1, replacement.size(), f) ==
-              replacement.size()) {
-            translation.set_translated_binary(std::move(replacement));
-            REXGPU_INFO("Loaded replacement DXBC {:016X} mod {:016X} from {}",
-                        shader.ucode_data_hash(), translation.modification(),
-                        mod_path.parent_path().string());
+          data.resize(static_cast<size_t>(size));
+          if (fread(data.data(), 1, data.size(), f) != data.size()) {
+            data.clear();
           }
         }
         fclose(f);
+      }
+      return data;
+    };
+
+    // Search enabled mod folders in priority order (mods_data_root/<mod>/shaders/);
+    // the first mod that supplies a usable shader wins. Within a mod folder an
+    // .hlsl (compiled here, on the player's own GPU/driver) takes precedence over
+    // a prebuilt .dxbc, matching the goal of shipping source rather than bytecode
+    // baked on one specific machine.
+    for (const auto& mod_dir : GetEnabledModDirs(mods_data_root)) {
+      const auto shaders_dir = mod_dir / "shaders";
+      const auto hlsl_path = shaders_dir / hlsl_filename;
+      const auto dxbc_path = shaders_dir / dxbc_filename;
+
+      if (compile_hlsl && std::filesystem::exists(hlsl_path)) {
+        std::vector<uint8_t> source = read_file(hlsl_path);
+        if (!source.empty()) {
+          // Guest VS need vs_5_1 (they may use a UAV); PS use ps_5_1.
+          const char* target =
+              (shader.type() == xenos::ShaderType::kVertex) ? "vs_5_1" : "ps_5_1";
+          const std::string mod_macro = fmt::format("{}", translation.modification());
+          const D3D_SHADER_MACRO defines[] = {{"XE_SHADER_MODIFICATION", mod_macro.c_str()},
+                                              {nullptr, nullptr}};
+          const std::string source_name = hlsl_path.string();
+          Microsoft::WRL::ComPtr<ID3DBlob> code, errors;
+          const HRESULT hr = provider.Compile(
+              source.data(), source.size(), source_name.c_str(), defines,
+              D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+              &code, &errors);
+          if (SUCCEEDED(hr) && code) {
+            const uint8_t* bytes = static_cast<const uint8_t*>(code->GetBufferPointer());
+            translation.set_translated_binary(
+                std::vector<uint8_t>(bytes, bytes + code->GetBufferSize()));
+            REXGPU_INFO("Compiled replacement HLSL {:016X} mod {:016X} ({}) from {}",
+                        shader.ucode_data_hash(), translation.modification(), target,
+                        shaders_dir.string());
+            if (errors && errors->GetBufferSize() > 1) {
+              REXGPU_WARN("HLSL warnings for {}: {}", source_name,
+                          static_cast<const char*>(errors->GetBufferPointer()));
+            }
+            break;
+          }
+          // Compilation failed: surface diagnostics and fall through to any
+          // prebuilt .dxbc in this same mod folder before moving on.
+          REXGPU_ERROR("Failed to compile HLSL shader mod {} (hr=0x{:08X}): {}", source_name,
+                       static_cast<uint32_t>(hr),
+                       errors ? static_cast<const char*>(errors->GetBufferPointer())
+                              : "no compiler diagnostics");
+        }
+      }
+
+      if (std::filesystem::exists(dxbc_path)) {
+        std::vector<uint8_t> replacement = read_file(dxbc_path);
+        if (!replacement.empty()) {
+          translation.set_translated_binary(std::move(replacement));
+          REXGPU_INFO("Loaded replacement DXBC {:016X} mod {:016X} from {}",
+                      shader.ucode_data_hash(), translation.modification(), shaders_dir.string());
+          break;
+        }
       }
     }
   }

@@ -107,6 +107,19 @@ class D3D12Provider : public GraphicsProvider {
     }
     return pfn_d3d_disassemble_(src_data, src_data_size, flags, comments, disassembly_out);
   }
+  // Runtime HLSL -> DXBC compilation via D3DCompiler_47.dll. May be nullptr if
+  // the compiler DLL is unavailable; returns E_NOINTERFACE in that case.
+  bool IsCompileAvailable() const { return pfn_d3d_compile_ != nullptr; }
+  HRESULT Compile(const void* src_data, size_t src_data_size, const char* source_name,
+                  const D3D_SHADER_MACRO* defines, ID3DInclude* include, const char* entrypoint,
+                  const char* target, UINT flags1, UINT flags2, ID3DBlob** code_out,
+                  ID3DBlob** error_out) const {
+    if (!pfn_d3d_compile_) {
+      return E_NOINTERFACE;
+    }
+    return pfn_d3d_compile_(src_data, src_data_size, source_name, defines, include, entrypoint,
+                            target, flags1, flags2, code_out, error_out);
+  }
   HRESULT DxbcConverterCreateInstance(const CLSID& rclsid, const IID& riid, void** ppv) const {
     if (!pfn_dxilconv_dxc_create_instance_) {
       return E_NOINTERFACE;
@@ -143,6 +156,7 @@ class D3D12Provider : public GraphicsProvider {
 
   HMODULE library_d3dcompiler_ = nullptr;
   pD3DDisassemble pfn_d3d_disassemble_ = nullptr;
+  pD3DCompile pfn_d3d_compile_ = nullptr;
 
   HMODULE library_dxilconv_ = nullptr;
   DxcCreateInstanceProc pfn_dxilconv_dxc_create_instance_ = nullptr;

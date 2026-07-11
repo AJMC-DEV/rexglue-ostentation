@@ -27,7 +27,12 @@ REXCVAR_DEFINE_BOOL(gamma_render_target_as_unorm16, true, "GPU",
 REXCVAR_DEFINE_STRING(dump_shaders, "", "GPU", "Path to dump shaders to");
 #ifdef REXGLUE_ENABLE_SHADERS
 REXCVAR_DEFINE_BOOL(shader_load_enabled, true, "MODS/Shaders",
-                    "Load replacement DXBC shaders from mods/shaders/{hash}_{mod}.dxbc");
+                    "Load replacement shaders from mods/<mod>/shaders/{hash}_{mod}.hlsl "
+                    "(compiled at runtime) or {hash}_{mod}.dxbc (prebuilt)");
+REXCVAR_DEFINE_BOOL(shader_compile_hlsl, true, "MODS/Shaders",
+                    "Compile mod .hlsl shaders to DXBC at load time on the player's own "
+                    "GPU/driver. When a mod ships both, the .hlsl takes precedence over a "
+                    "prebuilt .dxbc. Disable to always use prebuilt .dxbc.");
 #endif  // REXGLUE_ENABLE_SHADERS
 REXCVAR_DEFINE_BOOL(use_fuzzy_alpha_epsilon, false, "GPU",
                     "Use approximate compare for alpha test values to prevent "

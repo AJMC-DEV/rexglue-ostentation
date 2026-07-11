@@ -147,6 +147,7 @@ bool D3D12Provider::Initialize() {
 
   // Load optional D3DCompiler_47.dll.
   pfn_d3d_disassemble_ = nullptr;
+  pfn_d3d_compile_ = nullptr;
   library_d3dcompiler_ = LoadLibraryW(L"D3DCompiler_47.dll");
   if (library_d3dcompiler_) {
     pfn_d3d_disassemble_ = pD3DDisassemble(GetProcAddress(library_d3dcompiler_, "D3DDisassemble"));
@@ -155,10 +156,16 @@ bool D3D12Provider::Initialize() {
           "Failed to get D3DDisassemble from D3DCompiler_47.dll, DXBC "
           "disassembly for debugging will be unavailable");
     }
+    pfn_d3d_compile_ = pD3DCompile(GetProcAddress(library_d3dcompiler_, "D3DCompile"));
+    if (pfn_d3d_compile_ == nullptr) {
+      REXLOG_DEBUG(
+          "Failed to get D3DCompile from D3DCompiler_47.dll, runtime HLSL "
+          "shader-mod compilation will be unavailable");
+    }
   } else {
     REXLOG_DEBUG(
         "Failed to load D3DCompiler_47.dll, DXBC disassembly for debugging "
-        "will be unavailable");
+        "and runtime HLSL shader-mod compilation will be unavailable");
   }
 
   // Load optional dxilconv.dll.

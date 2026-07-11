@@ -80,6 +80,7 @@ REXCVAR_DECLARE(bool, use_fuzzy_alpha_epsilon);
 REXCVAR_DECLARE(std::string, dump_shaders);
 #ifdef REXGLUE_ENABLE_SHADERS
 REXCVAR_DECLARE(bool, shader_load_enabled);
+REXCVAR_DECLARE(bool, shader_compile_hlsl);
 #endif  // REXGLUE_ENABLE_SHADERS
 REXCVAR_DECLARE(std::string, trace_gpu_prefix);
 REXCVAR_DECLARE(bool, trace_gpu_stream);
