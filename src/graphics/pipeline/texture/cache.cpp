@@ -53,6 +53,45 @@ REXCVAR_DEFINE_BOOL(gpu_3d_to_2d_texture, true, "GPU",
                     "Sample problematic 3D textures through 2D-compatible wrappers")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(texture_content_invalidation, true, "GPU",
+                    "Fallback texture invalidation via content hashing. Each draw, re-hash the "
+                    "guest bytes of every small bound texture the cache thinks is up to date; if "
+                    "they changed without an invalidation firing, invalidate the range so it "
+                    "re-uploads. Fixes stale/wrong textures (e.g. streamed DXT UI icons) whose CPU "
+                    "writes through the 0xE0000000 mirror bypass the page-protection write-watch.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(texture_content_invalidation_max_bytes, 131072, "GPU",
+                     "texture_content_invalidation only checks textures whose guest base size is "
+                     "<= this many bytes. Keeps the per-draw hashing cheap by skipping large "
+                     "render targets (which are invalidated via the GPU path). Default 128 KiB.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+namespace {
+// FNV-1a 64-bit over a sparse, strided sample of the guest bytes, used by
+// texture_content_invalidation to cheaply detect when the guest overwrites a
+// texture's memory. Sampling ~1K bytes spread across the whole range (plus the
+// final byte) keeps the per-frame cost constant regardless of texture size,
+// while still reliably detecting whole-texture content swaps. The stride is
+// folded into the hash so two different sizes can't collide. Dependency-free
+// (the replacement-path HashGuestData lives behind REXGLUE_ENABLE_TEXTURES).
+uint64_t HashGuestContentSparse(const uint8_t* data, uint32_t size) {
+  constexpr uint32_t kTargetSamples = 1024;
+  uint32_t step = size > kTargetSamples ? size / kTargetSamples : 1;
+  uint64_t h = UINT64_C(1469598103934665603);
+  h ^= step;
+  h *= UINT64_C(1099511628211);
+  for (uint32_t i = 0; i < size; i += step) {
+    h ^= data[i];
+    h *= UINT64_C(1099511628211);
+  }
+  // Always fold in the last byte so tail-only changes aren't missed by striding.
+  h ^= data[size - 1];
+  h *= UINT64_C(1099511628211);
+  return h;
+}
+}  // namespace
+
 REXCVAR_DEFINE_INT32(anisotropic_override, 3, "GPU",
                      "Forces anisotropic filtering for eligible textures.\n"
                      "Higher values keep textures sharper at oblique angles, but increase texture "
@@ -573,6 +612,20 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
   texture.LogAction("Loaded");
 
+  // Snapshot the guest base bytes we just uploaded so texture_content_invalidation
+  // can later detect if the guest changed them without an invalidation firing.
+  // Only meaningful when the base level was (re)loaded this call.
+  if (REXCVAR_GET(texture_content_invalidation) && pending_load.load_base) {
+    const TextureKey hash_key = texture.key();
+    const uint32_t hash_size = texture.GetGuestBaseSize();
+    const uint32_t hash_max =
+        static_cast<uint32_t>(REXCVAR_GET(texture_content_invalidation_max_bytes));
+    if (hash_size > 0 && hash_size <= hash_max && hash_key.base_page != 0) {
+      const uint8_t* hash_bytes = shared_memory().TranslatePhysical(hash_key.base_page << 12);
+      texture.set_content_hash(HashGuestContentSparse(hash_bytes, hash_size));
+    }
+  }
+
   return true;
 }
 
@@ -716,6 +769,61 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
   }
   if (bindings_changed) {
     UpdateTextureBindingsImpl(bindings_changed);
+  }
+
+  // Content-hash fallback invalidation.
+  //
+  // On this recompilation, CPU writes to physical texture memory mapped through
+  // the 0xE0000000 mirror (small, 4 KB-page allocations - e.g. streamed
+  // DXT UI/reel icons) do not reliably trigger the host page-protection
+  // write-watch, so the texture cache never learns the guest overwrote the
+  // texture and keeps sampling stale content (the "wrong icon" bug). As a
+  // safety net, for every small texture bound this draw that the cache believes
+  // is up to date, re-hash its guest base bytes and compare against the hash
+  // captured at its last upload. If they differ, the guest changed the memory
+  // without an invalidation firing, so drive the exact same invalidation path a
+  // real CPU-write fault would have: SharedMemory::MemoryInvalidationCallback
+  // clears the shared-memory valid bits (so the range re-uploads from guest RAM)
+  // and fires the texture's watch (so it is flagged outdated and reloaded next
+  // draw). Capped to small textures to stay cheap; large render targets change
+  // via the GPU which is handled separately.
+  if (REXCVAR_GET(texture_content_invalidation)) {
+    const uint32_t max_bytes =
+        static_cast<uint32_t>(REXCVAR_GET(texture_content_invalidation_max_bytes));
+    uint32_t remaining = used_texture_mask;
+    uint32_t index = 0;
+    while (rex::bit_scan_forward(remaining, &index)) {
+      remaining &= ~(UINT32_C(1) << index);
+      const TextureBinding& binding = texture_bindings_[index];
+      if (!binding.key.is_valid) {
+        continue;
+      }
+      Texture* texture = binding.texture;
+      if (texture == nullptr || !texture->content_hash_valid() ||
+          texture->outdated_mask() != 0) {
+        continue;
+      }
+      // At most once per frame per texture: RequestTextures runs per draw call,
+      // and a texture is typically bound across many draws, so without this the
+      // hashing cost multiplies per-draw and tanks the frame rate.
+      if (texture->content_check_submission() == current_submission_index_) {
+        continue;
+      }
+      texture->set_content_check_submission(current_submission_index_);
+      const TextureKey key = texture->key();
+      const uint32_t size = texture->GetGuestBaseSize();
+      if (size == 0 || size > max_bytes || key.base_page == 0) {
+        continue;
+      }
+      const uint8_t* bytes = shared_memory().TranslatePhysical(key.base_page << 12);
+      uint64_t now = HashGuestContentSparse(bytes, size);
+      if (now != texture->content_hash()) {
+        // Perform the invalidation the missed write-watch should have. This
+        // clears valid bits and fires the watch (marking the texture outdated);
+        // the reload's CommitPreparedTextureLoad refreshes the stored hash.
+        shared_memory().MemoryInvalidationCallback(key.base_page << 12, size, true);
+      }
+    }
   }
 }
 

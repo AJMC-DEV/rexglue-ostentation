@@ -264,6 +264,23 @@ class TextureCache {
 
     void LogAction(const char* action) const;
 
+    // texture_content_invalidation: sparse content hash of the guest base-level
+    // bytes captured at the last upload. A later bind re-hashes and, on a
+    // mismatch, invalidates the range so it re-uploads - the fallback for CPU
+    // writes that bypass the page-protection write-watch.
+    uint64_t content_hash() const { return content_hash_; }
+    bool content_hash_valid() const { return content_hash_valid_; }
+    void set_content_hash(uint64_t h) {
+      content_hash_ = h;
+      content_hash_valid_ = true;
+    }
+
+    // texture_content_invalidation: submission index of the last content-hash
+    // check, so the (potentially per-draw) check runs at most once per frame per
+    // texture instead of once per draw call.
+    uint64_t content_check_submission() const { return content_check_submission_; }
+    void set_content_check_submission(uint64_t s) { content_check_submission_ = s; }
+
 #ifdef REXGLUE_ENABLE_TEXTURES
     // Content hash of the guest texture that matched a replacement.
     // Non-zero means this texture has a replacement in TextureReplacement's
@@ -313,6 +330,12 @@ class TextureCache {
     // Watch handles for the memory ranges.
     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
+
+    // texture_content_invalidation bookkeeping. Not synchronized beyond the
+    // normal load/bind flow which already runs under the GPU thread.
+    uint64_t content_hash_ = 0;
+    bool content_hash_valid_ = false;
+    uint64_t content_check_submission_ = UINT64_MAX;
   };
 
   // Rules of data access in load shaders:
