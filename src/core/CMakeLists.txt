@@ -93,6 +93,12 @@ if(UNIX)
     target_link_libraries(rexcore PRIVATE pthread rt dl)
 endif()
 
+# socket_win.cpp uses winsock; rexcore is an OBJECT library, so the dependency
+# must propagate to whichever target links the objects.
+if(WIN32)
+    target_link_libraries(rexcore PUBLIC ws2_32)
+endif()
+
 target_link_libraries(rexcore
     PUBLIC
         fmt::fmt

@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cctype>
 #include <charconv>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -129,6 +130,50 @@ void MarkPendingRestart(std::string_view name) {
   if (std::find(pending.begin(), pending.end(), name_str) == pending.end()) {
     pending.push_back(name_str);
   }
+}
+
+// Render a value as a TOML basic (double-quoted) string. Values may have been
+// loaded from a literal ('single-quoted') string in the config, so they can
+// contain backslashes and quotes that must be escaped to stay parseable.
+std::string RenderTomlString(std::string_view value) {
+  std::string out;
+  out.reserve(value.size() + 2);
+  out.push_back('"');
+  for (char c : value) {
+    switch (c) {
+      case '\\':
+        out.append("\\\\");
+        break;
+      case '"':
+        out.append("\\\"");
+        break;
+      case '\b':
+        out.append("\\b");
+        break;
+      case '\f':
+        out.append("\\f");
+        break;
+      case '\n':
+        out.append("\\n");
+        break;
+      case '\r':
+        out.append("\\r");
+        break;
+      case '\t':
+        out.append("\\t");
+        break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof(buf), "\\u%04X", c);
+          out.append(buf);
+        } else {
+          out.push_back(c);
+        }
+    }
+  }
+  out.push_back('"');
+  return out;
 }
 
 bool ValidateConstraints(const FlagEntry& entry, std::string_view value) {
@@ -492,7 +537,7 @@ std::string SerializeToTOML() {
   for (const auto& entry : GetRegistryStorage()) {
     if (entry.getter() != entry.default_value) {
       if (entry.type == FlagType::String) {
-        result += entry.name + " = \"" + entry.getter() + "\"\n";
+        result += entry.name + " = " + RenderTomlString(entry.getter()) + "\n";
       } else {
         result += entry.name + " = " + entry.getter() + "\n";
       }
@@ -507,7 +552,7 @@ std::string SerializeToTOML(std::string_view category) {
   for (const auto& entry : GetRegistryStorage()) {
     if (entry.category == category && entry.getter() != entry.default_value) {
       if (entry.type == FlagType::String) {
-        result += entry.name + " = \"" + entry.getter() + "\"\n";
+        result += entry.name + " = " + RenderTomlString(entry.getter()) + "\n";
       } else {
         result += entry.name + " = " + entry.getter() + "\n";
       }

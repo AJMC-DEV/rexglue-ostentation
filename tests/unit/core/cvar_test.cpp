@@ -12,6 +12,8 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <toml++/toml.hpp>
+
 #include <rex/cvar.h>
 
 // Test cvars
@@ -563,6 +565,51 @@ TEST_CASE("cvar SaveConfig", "[cvar]") {
     rex::cvar::SaveConfig(save_path);
     // Either file doesn't exist or is minimal (just header comment)
   }
+}
+
+TEST_CASE("cvar SaveConfig round-trips values needing escapes", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  auto temp_dir = std::filesystem::temp_directory_path();
+  auto load_path = temp_dir / "test_literal_string_config.toml";
+  auto save_path = temp_dir / "test_literal_string_save.toml";
+  std::filesystem::remove(load_path);
+  std::filesystem::remove(save_path);
+
+  SECTION("Literal (single-quoted) string survives load then save") {
+    {
+      std::ofstream file(load_path);
+      file << "test_string_flag = 'C:\\mods\\new folder'\n";
+    }
+    rex::cvar::LoadConfig(load_path);
+    CHECK(REXCVAR_GET(test_string_flag) == "C:\\mods\\new folder");
+
+    rex::cvar::SaveConfig(save_path);
+    REQUIRE(std::filesystem::exists(save_path));
+
+    // The saved file must be valid TOML with the value intact.
+    toml::table reparsed;
+    REQUIRE_NOTHROW(reparsed = toml::parse_file(save_path.string()));
+    auto value = reparsed["test_string_flag"].value<std::string>();
+    REQUIRE(value.has_value());
+    CHECK(*value == "C:\\mods\\new folder");
+  }
+
+  SECTION("Quotes and newlines in values are escaped") {
+    REXCVAR_SET(test_string_flag, "say \"hi\"\nand 'bye'");
+    rex::cvar::SaveConfig(save_path);
+    REQUIRE(std::filesystem::exists(save_path));
+
+    toml::table reparsed;
+    REQUIRE_NOTHROW(reparsed = toml::parse_file(save_path.string()));
+    auto value = reparsed["test_string_flag"].value<std::string>();
+    REQUIRE(value.has_value());
+    CHECK(*value == "say \"hi\"\nand 'bye'");
+  }
+
+  std::filesystem::remove(load_path);
+  std::filesystem::remove(save_path);
+  rex::cvar::testing::ResetAllForTesting();
 }
 
 TEST_CASE("cvar ApplyEnvironment", "[cvar]") {
