@@ -676,6 +676,8 @@ endif()
 # (REXGLUE_ENABLE_TEXTURES). Compiled into the same libavcodec target.
 # No NASM assembler required: HAVE_X86ASM=0 in config.h guards all .asm paths.
 if(REXGLUE_ENABLE_TEXTURES)
+    # Registers ff_h264_decoder in the overlay codec_list.c.
+    target_compile_definitions(libavcodec PRIVATE REXGLUE_ENABLE_TEXTURES=1)
     target_sources(libavcodec PRIVATE
         ${FFMPEG_DIR}/libavcodec/atsc_a53.c
         ${FFMPEG_DIR}/libavcodec/cabac.c

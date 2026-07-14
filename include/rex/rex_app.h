@@ -286,9 +286,9 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   // WindowInputListener overrides
   void OnKeyDown(ui::KeyEvent& e) override;
 
-#ifdef REXGLUE_ENABLE_SHADERS
+  // Used by all builtin overlay toggles (console, settings, mods menu, ...),
+  // not only the shader debugger - must not be gated on REXGLUE_ENABLE_SHADERS.
   void UpdateBuiltinOverlayInputMode();
-#endif
 
   PPCImageInfo ppc_info_;
   PathConfig resolved_defaults_;

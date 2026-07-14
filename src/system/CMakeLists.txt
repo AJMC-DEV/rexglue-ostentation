@@ -100,13 +100,16 @@ endif()
 
 if(WIN32)
     target_link_libraries(rexruntime PRIVATE rexdiscord ws2_32 winhttp)
+    # DXGI is used by the UI presenter on Windows independently of the
+    # graphics backend.
+    target_link_libraries(rexruntime PUBLIC dxgi dxguid)
     target_compile_definitions(rexruntime PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
 elseif(LINUX)
     target_link_libraries(rexruntime PRIVATE rexdiscord)
 endif()
 
 if(REXGLUE_USE_D3D12)
-    target_link_libraries(rexruntime PUBLIC dxgi dxguid dxc-headers)
+    target_link_libraries(rexruntime PUBLIC dxc-headers)
     target_compile_definitions(rexruntime PUBLIC REX_HAS_D3D12=1)
 endif()
 if(REXGLUE_USE_VULKAN)

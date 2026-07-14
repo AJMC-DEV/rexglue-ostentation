@@ -165,11 +165,18 @@ if(NOT WIN32)
     )
 endif()
 
-# D3D12 backend dependencies
-if(REXGLUE_USE_D3D12)
+# The presenter uses DXGI on Windows for monitor tracking and vertical blank
+# ticks regardless of the graphics backend.
+if(WIN32)
     target_link_libraries(rexui PUBLIC
         dxgi
         dxguid
+    )
+endif()
+
+# D3D12 backend dependencies
+if(REXGLUE_USE_D3D12)
+    target_link_libraries(rexui PUBLIC
         dxc-headers
     )
 endif()

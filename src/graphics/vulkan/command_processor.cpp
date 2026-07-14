@@ -70,6 +70,11 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "device (falls back to render passes otherwise)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(vulkan_tessellation_enabled, true, "GPU/Vulkan",
+                    "Draw tessellated (patch domain) geometry. Disable to diagnose GPU hangs "
+                    "suspected in the tessellation path - tessellated surfaces will be missing")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::vulkan {
 
 namespace {
@@ -909,6 +914,18 @@ bool VulkanCommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to initialize shared memory");
     return false;
   }
+  // The vertex buffer residency cache (vertex_buffers_in_sync_ /
+  // vertex_buffer_states_) skips SharedMemory::RequestRange for fetch
+  // constants that haven't changed, so it must be dropped whenever pages are
+  // invalidated (CPU writes to watched memory, GPU resolves) - otherwise
+  // buffers whose fetch constants stay identical across frames are never
+  // reuploaded and render stale data (4D5307F1 garden ground).
+  vertex_buffer_cache_global_watch_ = shared_memory_->RegisterGlobalWatch(
+      [](const std::unique_lock<std::recursive_mutex>&, void* context, uint32_t, uint32_t, bool) {
+        static_cast<VulkanCommandProcessor*>(context)->vertex_buffer_cache_invalidated_.store(
+            true, std::memory_order_release);
+      },
+      this);
 
   primitive_processor_ = std::make_unique<VulkanPrimitiveProcessor>(
       *register_file_, *memory_, trace_writer_, *shared_memory_, *this);
@@ -1912,6 +1929,10 @@ bool VulkanCommandProcessor::SetupContext() {
 
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  if (vertex_buffer_cache_global_watch_ && shared_memory_) {
+    shared_memory_->UnregisterGlobalWatch(vertex_buffer_cache_global_watch_);
+    vertex_buffer_cache_global_watch_ = nullptr;
+  }
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -3767,6 +3788,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // pipeline cache.
     Shader::HostVertexShaderType host_vertex_shader_type =
         primitive_processing_result.host_vertex_shader_type;
+    if (Shader::IsHostVertexShaderTypeDomain(host_vertex_shader_type) &&
+        !REXCVAR_GET(vulkan_tessellation_enabled)) {
+      // Diagnostic escape hatch for GPU hangs suspected in the tessellation
+      // path - drop the draw entirely.
+      return true;
+    }
     if (host_vertex_shader_type != Shader::HostVertexShaderType::kVertex &&
         host_vertex_shader_type != Shader::HostVertexShaderType::kPointListAsTriangleStrip &&
         host_vertex_shader_type != Shader::HostVertexShaderType::kRectangleListAsTriangleStrip &&
@@ -4017,6 +4044,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
 
   // Ensure vertex buffers are resident.
+  // If any watched shared memory pages were invalidated since the last draw,
+  // previously requested ranges may need reuploading - drop the residency
+  // cache so RequestRange runs again for all used fetch constants.
+  if (vertex_buffer_cache_invalidated_.exchange(false, std::memory_order_acquire)) {
+    InvalidateAllVertexBufferResidency();
+  }
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
   for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
     uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
@@ -5039,7 +5072,8 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {
-      REXGPU_ERROR("Failed to await submission completion Vulkan fences");
+      REXGPU_ERROR("Failed to await submission completion Vulkan fences (VkResult {})",
+                   int32_t(wait_result));
       if (wait_result == VK_ERROR_DEVICE_LOST) {
         device_lost_ = true;
       }
@@ -5483,7 +5517,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
     }
     if (submit_result != VK_SUCCESS) {
-      REXGPU_ERROR("Failed to submit a Vulkan command buffer");
+      REXGPU_ERROR("Failed to submit a Vulkan command buffer (VkResult {})",
+                   int32_t(submit_result));
       if (submit_result == VK_ERROR_DEVICE_LOST && !device_lost_) {
         device_lost_ = true;
         if (graphics_system_) {

@@ -91,7 +91,11 @@ constexpr bool IsPatchIndexedHostVertexShaderType(
 
 std::string GetTessellationSystemConstantsBlockGlsl() {
   std::string source;
-  source += "layout(set = 0, binding = 0, std140) uniform XeSystemConstants {\n";
+  // The system constants uniform buffer lives in the guest draw constants
+  // descriptor set, not in the shared memory / EDRAM set 0.
+  source += fmt::format("layout(set = {}, binding = {}, std140) uniform XeSystemConstants {{\n",
+                        uint32_t(SpirvShaderTranslator::kDescriptorSetConstants),
+                        uint32_t(SpirvShaderTranslator::kConstantBufferSystem));
   source += fmt::format("  layout(offset = {}) uint xe_vertex_index_endian;\n",
                         offsetof(SpirvShaderTranslator::SystemConstants, vertex_index_endian));
   source += fmt::format("  layout(offset = {}) int xe_vertex_base_index;\n",
@@ -128,7 +132,7 @@ uint xe_swap_16_in_32(uint value) {
 void main() {
   uint value = uint(gl_VertexIndex);
   uint endian = xe_system_cbuffer.xe_vertex_index_endian;
-  if (endian == 1u || endian == 2u || endian == 3u) {
+  if (endian == 1u || endian == 2u) {
     value = xe_swap_8_in_16(value);
   }
   if (endian == 2u || endian == 3u) {
@@ -162,13 +166,16 @@ uint xe_swap_16_in_32(uint value) {
 void main() {
   uint value = uint(gl_VertexIndex);
   uint endian = xe_system_cbuffer.xe_vertex_index_endian;
-  if (endian == 1u || endian == 2u || endian == 3u) {
+  if (endian == 1u || endian == 2u) {
     value = xe_swap_8_in_16(value);
   }
   if (endian == 2u || endian == 3u) {
     value = xe_swap_16_in_32(value);
   }
-  float tessellation_factor = float(value) + 1.0;
+  // The guest stores the edge factors as raw float32 bits in the index
+  // buffer - reinterpret, don't convert (matches asfloat in the Direct3D 12
+  // tessellation_adaptive_vs).
+  float tessellation_factor = uintBitsToFloat(value) + 1.0;
   tessellation_factor = max(
       tessellation_factor, xe_system_cbuffer.xe_tessellation_factor_range_min);
   tessellation_factor = min(
@@ -3031,16 +3038,20 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   // unsupported behavior that may be dangerous/crashing because pipelines can
   // be created from the disk storage.
 
+  const PipelineDescription& description = creation_arguments.pipeline->first;
+  const char* pipeline_kind =
+      description.primitive_topology == PipelinePrimitiveTopology::kPatchList
+          ? " (tessellated)"
+          : "";
   if (creation_arguments.pixel_shader) {
-    REXGPU_INFO("Creating graphics pipeline state with VS {:016X}, PS {:016X}",
+    REXGPU_INFO("Creating graphics pipeline state with VS {:016X}, PS {:016X}{}",
                 creation_arguments.vertex_shader->shader().ucode_data_hash(),
-                creation_arguments.pixel_shader->shader().ucode_data_hash());
+                creation_arguments.pixel_shader->shader().ucode_data_hash(), pipeline_kind);
   } else {
-    REXGPU_INFO("Creating graphics pipeline state with VS {:016X}",
-                creation_arguments.vertex_shader->shader().ucode_data_hash());
+    REXGPU_INFO("Creating graphics pipeline state with VS {:016X}{}",
+                creation_arguments.vertex_shader->shader().ucode_data_hash(), pipeline_kind);
   }
 
-  const PipelineDescription& description = creation_arguments.pipeline->first;
   if (!ArePipelineRequirementsMet(description)) {
     assert_always(
         "When creating a new pipeline, the description must not require "

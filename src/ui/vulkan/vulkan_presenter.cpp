@@ -2174,7 +2174,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       }
     }
     if (submit_result != VK_SUCCESS) {
-      REXLOG_ERROR("VulkanPresenter: Failed to submit command buffers");
+      REXLOG_ERROR("VulkanPresenter: Failed to submit command buffers (VkResult {})",
+                   int32_t(submit_result));
       fence_acqusition.SubmissionFailedOrDropped();
       ui_fence_acquisition.SubmissionFailedOrDropped();
       if (ui_setup_command_buffer_index != SIZE_MAX) {

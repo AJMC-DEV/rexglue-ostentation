@@ -693,6 +693,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   };
   std::array<VertexBufferState, 96> vertex_buffer_states_{};
   uint64_t vertex_buffers_in_sync_[2] = {};
+  // Set by the shared memory global watch (from any thread) when watched pages
+  // are invalidated; consumed on the GPU thread before checking the residency
+  // cache above.
+  std::atomic<bool> vertex_buffer_cache_invalidated_{false};
+  SharedMemory::GlobalWatchHandle vertex_buffer_cache_global_watch_ = nullptr;
 
   std::atomic<bool> pix_capture_requested_ = false;
   bool pix_capturing_;

@@ -14,5 +14,10 @@ static const AVCodec* const codec_list[] = {
 #if CONFIG_XMAFRAMES_DECODER
     &ff_xmaframes_decoder,
 #endif
-    &ff_h264_decoder,  // For video texture replacement (.mp4)
+#if REXGLUE_ENABLE_TEXTURES
+    // For video texture replacement (.mp4). The decoder sources are only
+    // compiled when REXGLUE_ENABLE_TEXTURES is on (FFmpeg's own
+    // CONFIG_H264_DECODER is 0 in the checked-in config headers).
+    &ff_h264_decoder,
+#endif
     NULL};

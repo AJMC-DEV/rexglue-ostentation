@@ -48,6 +48,11 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(d3d12_invalidate_shared_memory_per_frame, false, "GPU/D3D12",
+                    "Diagnostic: reupload all guest memory used by the GPU every frame to rule "
+                    "out stale shared memory from unwatched CPU writes. Extremely slow")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -953,6 +958,18 @@ bool D3D12CommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to initialize shared memory");
     return false;
   }
+  // The vertex buffer residency cache (vertex_buffers_in_sync_ /
+  // vertex_buffer_states_) skips SharedMemory::RequestRange for fetch
+  // constants that haven't changed, so it must be dropped whenever pages are
+  // invalidated (CPU writes to watched memory, GPU resolves) - otherwise
+  // buffers whose fetch constants stay identical across frames are never
+  // reuploaded and render stale data (4D5307F1 garden ground).
+  vertex_buffer_cache_global_watch_ = shared_memory_->RegisterGlobalWatch(
+      [](const std::unique_lock<std::recursive_mutex>&, void* context, uint32_t, uint32_t, bool) {
+        static_cast<D3D12CommandProcessor*>(context)->vertex_buffer_cache_invalidated_.store(
+            true, std::memory_order_release);
+      },
+      this);
 
   // Initialize the render target cache before configuring binding - need to
   // know if using rasterizer-ordered views for the bindless root signature.
@@ -1656,6 +1673,10 @@ bool D3D12CommandProcessor::SetupContext() {
 
 void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  if (vertex_buffer_cache_global_watch_) {
+    shared_memory_->UnregisterGlobalWatch(vertex_buffer_cache_global_watch_);
+    vertex_buffer_cache_global_watch_ = nullptr;
+  }
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
   gpu_profiler_.Shutdown();
@@ -2399,6 +2420,89 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     return true;
   }
 
+  if (primitive_processing_result.IsTessellated()) {
+    // Diagnostic for partially rendering tessellated surfaces - log the draw
+    // parameters and every register the tessellation path clamps by, deduped
+    // by value so steady scenes emit one line per unique draw configuration.
+    struct TessDrawLogState {
+      uint32_t guest_count, host_count, min_idx, max_idx, idx_offset, dma_size_raw;
+      uint32_t mode_type, index_info;
+      float hos_min, hos_max;
+      bool operator==(const TessDrawLogState&) const = default;
+    };
+    TessDrawLogState tess_log_state{
+        primitive_processing_result.guest_draw_vertex_count,
+        primitive_processing_result.host_draw_vertex_count,
+        regs[XE_GPU_REG_VGT_MIN_VTX_INDX],
+        regs[XE_GPU_REG_VGT_MAX_VTX_INDX],
+        regs[XE_GPU_REG_VGT_INDX_OFFSET],
+        regs[XE_GPU_REG_VGT_DMA_SIZE],
+        uint32_t(primitive_processing_result.tessellation_mode) |
+            (uint32_t(primitive_processing_result.host_vertex_shader_type) << 8),
+        uint32_t(primitive_processing_result.index_buffer_type) |
+            (uint32_t(primitive_processing_result.host_index_format) << 8) |
+            (uint32_t(primitive_processing_result.host_shader_index_endian) << 16),
+        regs.Get<float>(XE_GPU_REG_VGT_HOS_MIN_TESS_LEVEL),
+        regs.Get<float>(XE_GPU_REG_VGT_HOS_MAX_TESS_LEVEL)};
+    static TessDrawLogState tess_log_last;
+    static bool tess_log_last_valid = false;
+    if (!tess_log_last_valid || !(tess_log_last == tess_log_state)) {
+      tess_log_last = tess_log_state;
+      tess_log_last_valid = true;
+      REXGPU_INFO(
+          "Tessellated draw: mode={} hvs_type={} guest_count={} host_count={} "
+          "min_vtx_indx={} max_vtx_indx={} indx_offset={} dma_size=0x{:08X} "
+          "hos_tess_level=[{}, {}] ib_type={} ib_fmt={} ib_endian={}",
+          uint32_t(primitive_processing_result.tessellation_mode),
+          uint32_t(primitive_processing_result.host_vertex_shader_type),
+          primitive_processing_result.guest_draw_vertex_count,
+          primitive_processing_result.host_draw_vertex_count, tess_log_state.min_idx,
+          tess_log_state.max_idx, tess_log_state.idx_offset, tess_log_state.dma_size_raw,
+          tess_log_state.hos_min, tess_log_state.hos_max,
+          uint32_t(primitive_processing_result.index_buffer_type),
+          uint32_t(primitive_processing_result.host_index_format),
+          uint32_t(primitive_processing_result.host_shader_index_endian));
+    }
+    // For adaptive quad-patch draws (garden ground), additionally log the
+    // per-draw data every non-deduped diagnostic misses: the edge factor
+    // buffer address, the vertex fetch constants (per-patch data buffer), and
+    // the leading vertex float constants (CPU-fed transform), to identify
+    // whether multiple quadrant draws differ where they should.
+    if (primitive_processing_result.tessellation_mode == xenos::TessellationMode::kAdaptive &&
+        primitive_processing_result.host_vertex_shader_type ==
+            Shader::HostVertexShaderType::kQuadDomainPatchIndexed) {
+      static uint32_t adaptive_quad_logs_remaining = 48;
+      if (adaptive_quad_logs_remaining) {
+        --adaptive_quad_logs_remaining;
+        // Dump the raw fetch constants of exactly the slots the shader's
+        // vertex fetches use.
+        std::string used_vfetches;
+        const Shader::ConstantRegisterMap& diag_constant_map =
+            vertex_shader->constant_register_map();
+        for (uint32_t vfetch_word = 0;
+             vfetch_word < rex::countof(diag_constant_map.vertex_fetch_bitmap); ++vfetch_word) {
+          uint32_t vfetch_bits = diag_constant_map.vertex_fetch_bitmap[vfetch_word];
+          uint32_t vfetch_bit_index;
+          while (rex::bit_scan_forward(vfetch_bits, &vfetch_bit_index)) {
+            vfetch_bits &= ~(uint32_t(1) << vfetch_bit_index);
+            uint32_t diag_vfetch_index = vfetch_word * 32 + vfetch_bit_index;
+            xenos::xe_gpu_vertex_fetch_t diag_vfetch = regs.GetVertexFetch(diag_vfetch_index);
+            used_vfetches += fmt::format(" vf{}=[raw 0x{:08X} 0x{:08X}]", diag_vfetch_index,
+                                         diag_vfetch.dword_0, diag_vfetch.dword_1);
+          }
+        }
+        const float* c =
+            reinterpret_cast<const float*>(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]);
+        REXGPU_INFO(
+            "  adaptive quad draw: vs={:016X} ps={:016X} dma_base=0x{:08X}{} fcb_up_to_date={} "
+            "c4=({}, {}, {}, {})",
+            vertex_shader->ucode_data_hash(),
+            pixel_shader ? pixel_shader->ucode_data_hash() : 0, regs[XE_GPU_REG_VGT_DMA_BASE],
+            used_vfetches, cbuffer_binding_float_vertex_.up_to_date, c[16], c[17], c[18], c[19]);
+      }
+    }
+  }
+
   reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
 
   // Shader modifications.
@@ -2534,6 +2638,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // Must not call anything that can change the descriptor heap from now on!
 
   // Ensure vertex buffers are resident.
+  // If any watched shared memory pages were invalidated since the last draw,
+  // previously requested ranges may need reuploading - drop the residency
+  // cache so RequestRange runs again for all used fetch constants.
+  if (vertex_buffer_cache_invalidated_.exchange(false, std::memory_order_acquire)) {
+    InvalidateAllVertexBufferResidency();
+  }
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
   for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
     uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
@@ -3415,6 +3525,14 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
   if (is_opening_frame) {
     frame_open_ = true;
+
+    if (REXCVAR_GET(d3d12_invalidate_shared_memory_per_frame)) {
+      // Diagnostic for stale guest buffer data (CPU writes that bypass the
+      // write watch, e.g. through the 0xE0000000 mirror): drop all shared
+      // memory residency so every range used this frame is reuploaded from
+      // guest RAM. Extremely slow - testing only.
+      shared_memory_->InvalidateAllPages();
+    }
 
     // Latch the cvar before any scope can open, so a mid-frame toggle can't
     // leave a begin timestamp without its matching end.
