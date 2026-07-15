@@ -12,6 +12,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 
@@ -66,6 +67,11 @@ enum class GpuStat : uint32_t {
   kTransferPixelsRasterized,
   // The subset of the above spent on stencil bit planes.
   kTransferStencilBitPixels,
+  // Guest draws submitted and vertices they carried. High vertices/frame with a
+  // GPU-bound frame points at geometry throughput (LOD, culling); modest
+  // vertices with a GPU-bound frame points at fragment cost (overdraw, ALU).
+  kGuestDraws,
+  kGuestVertices,
 
   kCount,
 };
@@ -193,6 +199,17 @@ class GpuProfiler {
   std::array<uint64_t, kStatCount> interval_stats_{};
   uint64_t interval_frame_ticks_ = 0;
   uint32_t interval_frames_ = 0;
+
+  // CPU wall-clock frame period, sampled at frame open. Compared against the GPU
+  // frame span so the report can say whether the GPU is the bottleneck: a busy
+  // percentage near 100 means GPU-bound, well under means the GPU is waiting on
+  // the CPU (guest code / draw submission). Accumulated on a different cadence
+  // than the GPU frames (record time vs fence retirement), so the two frame
+  // counts differ by the frames in flight - a ~2% bias, hence separate counters.
+  std::chrono::steady_clock::time_point last_frame_wall_{};
+  bool last_frame_wall_valid_ = false;
+  uint64_t interval_wall_ns_ = 0;
+  uint32_t interval_wall_frames_ = 0;
 
   uint64_t dropped_scopes_ = 0;
   uint64_t dropped_regions_ = 0;

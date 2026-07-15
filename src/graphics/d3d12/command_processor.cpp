@@ -2799,6 +2799,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     SubmitBarriers();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+    gpu_profiler_.AddStat(GpuStat::kGuestDraws, 1);
+    gpu_profiler_.AddStat(GpuStat::kGuestVertices,
+                          primitive_processing_result.host_draw_vertex_count);
     deferred_command_list_.D3DDrawInstanced(primitive_processing_result.host_draw_vertex_count, 1,
                                             0, 0);
   } else {
@@ -2858,6 +2861,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     SubmitBarriers();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+    gpu_profiler_.AddStat(GpuStat::kGuestDraws, 1);
+    gpu_profiler_.AddStat(GpuStat::kGuestVertices,
+                          primitive_processing_result.host_draw_vertex_count);
     deferred_command_list_.D3DDrawIndexedInstanced(
         primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
     if (scratch_index_buffer != nullptr) {

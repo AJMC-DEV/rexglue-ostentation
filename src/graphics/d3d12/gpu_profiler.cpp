@@ -51,6 +51,10 @@ const char* GetGpuStatName(GpuStat stat) {
       return "transfer_pixels_rasterized";
     case GpuStat::kTransferStencilBitPixels:
       return "transfer_stencil_bit_pixels";
+    case GpuStat::kGuestDraws:
+      return "guest_draws";
+    case GpuStat::kGuestVertices:
+      return "guest_vertices";
     default:
       return "unknown";
   }
@@ -138,6 +142,7 @@ void GpuProfiler::Shutdown() {
   frame_pending_.fill(false);
   frame_cursor_ = 0;
   open_frame_slot_ = kInvalidFrameSlot;
+  last_frame_wall_valid_ = false;
 
   ResetAccumulators();
   dropped_scopes_ = 0;
@@ -150,6 +155,9 @@ void GpuProfiler::ResetAccumulators() {
   interval_stats_.fill(0);
   interval_frame_ticks_ = 0;
   interval_frames_ = 0;
+  interval_wall_ns_ = 0;
+  interval_wall_frames_ = 0;
+  // Keep last_frame_wall_ so the next interval's first delta stays continuous.
   // Per-interval, not cumulative: a running total says nothing about whether
   // the numbers in the report next to it are trustworthy.
   dropped_scopes_ = 0;
@@ -234,6 +242,18 @@ void GpuProfiler::BeginFrame(DeferredCommandList& command_list) {
     open_frame_slot_ = kInvalidFrameSlot;
     return;
   }
+  // Wall-clock period between frame opens, independent of the GPU query ring so
+  // it is captured even on frames whose GPU timing is skipped below.
+  auto now = std::chrono::steady_clock::now();
+  if (last_frame_wall_valid_) {
+    interval_wall_ns_ +=
+        uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last_frame_wall_)
+                     .count());
+    ++interval_wall_frames_;
+  }
+  last_frame_wall_ = now;
+  last_frame_wall_valid_ = true;
+
   uint32_t slot = frame_cursor_ % kFrameRingCount;
   if (frame_pending_[slot]) {
     // The oldest frame in the ring has not retired yet - skip timing this one.
@@ -375,10 +395,20 @@ void GpuProfiler::Report() {
 
   double emulation_pct = frame_ms > 0.0 ? emulation_ms / frame_ms * 100.0 : 0.0;
 
+  double wall_ms = interval_wall_frames_
+                       ? double(interval_wall_ns_) / 1.0e6 / double(interval_wall_frames_)
+                       : 0.0;
+  // GPU frame span over wall-clock frame period. ~100% => GPU-bound, so attack
+  // shading / overdraw / vertex work. Well under => the GPU is idle waiting on
+  // the CPU (guest PPC code or draw submission), so batching draws or trimming
+  // per-draw CPU work is what moves the frame, not shaders.
+  double gpu_busy_pct = wall_ms > 0.0 ? frame_ms / wall_ms * 100.0 : 0.0;
+
   REXGPU_INFO(
-      "GPU profile ({} frames): frame {:.2f} ms | EDRAM emulation {:.2f} ms ({:.1f}%) | "
-      "guest draws + everything else {:.2f} ms",
-      interval_frames_, frame_ms, emulation_ms, emulation_pct, frame_ms - emulation_ms);
+      "GPU profile ({} frames): wall {:.2f} ms ({:.0f} fps) | GPU {:.2f} ms ({:.0f}% busy) | "
+      "EDRAM emulation {:.2f} ms ({:.1f}%) | guest draws + everything else {:.2f} ms",
+      interval_frames_, wall_ms, wall_ms > 0.0 ? 1000.0 / wall_ms : 0.0, frame_ms, gpu_busy_pct,
+      emulation_ms, emulation_pct, frame_ms - emulation_ms);
   for (uint32_t i = 0; i < kPassCount; ++i) {
     if (interval_pass_counts_[i] == 0) {
       continue;
@@ -416,7 +446,7 @@ void GpuProfiler::Report() {
       REXGPU_WARN("GpuProfiler: failed to open '{}' for the CSV log", csv_path);
       return;
     }
-    std::fprintf(csv_file_, "frames,frame_ms,emulation_ms");
+    std::fprintf(csv_file_, "frames,wall_ms,gpu_busy_pct,frame_ms,emulation_ms");
     for (uint32_t i = 0; i < kPassCount; ++i) {
       std::fprintf(csv_file_, ",%s_ms,%s_calls", GetGpuPassName(GpuPass(i)),
                    GetGpuPassName(GpuPass(i)));
@@ -429,7 +459,8 @@ void GpuProfiler::Report() {
   if (!csv_file_) {
     return;
   }
-  std::fprintf(csv_file_, "%u,%.4f,%.4f", interval_frames_, frame_ms, emulation_ms);
+  std::fprintf(csv_file_, "%u,%.4f,%.2f,%.4f,%.4f", interval_frames_, wall_ms, gpu_busy_pct,
+               frame_ms, emulation_ms);
   for (uint32_t i = 0; i < kPassCount; ++i) {
     std::fprintf(csv_file_, ",%.4f,%.2f", pass_ms[i], pass_per_frame[i]);
   }
