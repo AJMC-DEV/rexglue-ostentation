@@ -214,6 +214,10 @@ void UnregisterBind(std::string_view name) {
 }
 
 bool ProcessKeyEvent(KeyEvent& e) {
+  if (e.prev_state()) {
+    // Ignore OS auto-repeat: binds are one-shot toggles, not held-key actions.
+    return false;
+  }
   std::lock_guard lock(g_binds_mutex);
   bool matched = false;
   for (auto& entry : g_binds) {

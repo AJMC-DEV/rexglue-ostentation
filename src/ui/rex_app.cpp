@@ -387,6 +387,13 @@ bool ReXApp::SetupPresentation() {
   if (REXCVAR_GET(fullscreen)) {
     window_->SetFullscreen(true);
   }
+  // Apply future changes to the "fullscreen" cvar (console, settings overlay,
+  // config reload) to the live window instead of requiring a restart.
+  rex::cvar::RegisterChangeCallback("fullscreen", [this](std::string_view, std::string_view) {
+    if (window_) {
+      window_->SetFullscreen(REXCVAR_GET(fullscreen));
+    }
+  });
   window_->Open();
 
   auto* graphics_system = config_.graphics.get();
@@ -567,6 +574,14 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
     }
     UpdateBuiltinOverlayInputMode();
   });
+  rex::ui::RegisterBind("bind_fullscreen", "F12", "Toggle fullscreen", [this] {
+    // Source the current state from the window, not the cvar: other code
+    // (e.g. an in-game UI button) may have called window_->SetFullscreen()
+    // directly without updating the cvar.
+    if (window_) {
+      rex::cvar::SetFlagByName("fullscreen", window_->IsFullscreen() ? "false" : "true");
+    }
+  });
   rex::ui::RegisterBind("bind_mods_menu", "F5", "Toggle mods menu overlay", [this] {
     if (mods_menu_overlay_) {
       mods_menu_overlay_.reset();
@@ -644,6 +659,15 @@ std::function<void(PathConfig)> ReXApp::MakeResumeCallback() {
 }
 
 void ReXApp::OnKeyDown(ui::KeyEvent& e) {
+  // Alt+Enter is a de facto standard fullscreen toggle; handle it directly
+  // rather than through the rebindable bind registry (not remappable).
+  if (e.virtual_key() == ui::VirtualKey::kReturn && e.is_alt_pressed() && !e.prev_state()) {
+    if (window_) {
+      rex::cvar::SetFlagByName("fullscreen", window_->IsFullscreen() ? "false" : "true");
+    }
+    e.set_handled(true);
+    return;
+  }
   rex::ui::ProcessKeyEvent(e);
 }
 

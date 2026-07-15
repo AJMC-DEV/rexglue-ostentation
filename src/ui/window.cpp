@@ -31,8 +31,10 @@ REXCVAR_DEFINE_INT32(window_height, 0, "UI/Window",
     .range(0, 8192)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_BOOL(fullscreen, true, "UI/Window", "Start the window in fullscreen mode")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fullscreen, true, "UI/Window",
+                    "Whether the window is fullscreen (live-togglable via F12, Alt+Enter, "
+                    "or this setting)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(monitor, 0, "UI/Window",
                      "Monitor index to display on (0 = default, 1 = primary, 2 = "
