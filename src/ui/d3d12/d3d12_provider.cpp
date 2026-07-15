@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cstdlib>
 
 #include <rex/cvar.h>
@@ -36,6 +37,14 @@ REXCVAR_DEFINE_INT32(d3d12_adapter, -1, "UI/D3D12",
 REXCVAR_DEFINE_INT32(d3d12_queue_priority, 1, "UI/D3D12",
                      "Graphics command queue priority (0=normal, 1=high, 2=realtime)")
     .range(0, 2);
+
+REXCVAR_DEFINE_BOOL(d3d12_min_spec, false, "UI/D3D12",
+                    "Report only the guaranteed feature level 11_0 capabilities (resource "
+                    "binding tier 1, no rasterizer-ordered views, no tiled resources, no "
+                    "programmable sample positions, no pixel-shader stencil reference, no "
+                    "unaligned block-compressed textures) to test the fallback paths used "
+                    "on minimum-specification GPUs")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::ui::d3d12 {
 
@@ -449,6 +458,22 @@ bool D3D12Provider::Initialize() {
                                             sizeof(virtual_address_support)))) {
     virtual_address_bits_per_resource_ =
         virtual_address_support.MaxGPUVirtualAddressBitsPerResource;
+  }
+  if (REXCVAR_GET(d3d12_min_spec)) {
+    // Downgrade every optional capability to the feature level 11_0 baseline
+    // so the fallback paths taken on minimum-specification GPUs (Fermi, early
+    // GCN, Haswell) can be exercised on any development machine.
+    heap_flag_create_not_zeroed_ = D3D12_HEAP_FLAG_NONE;
+    programmable_sample_positions_tier_ = D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
+    ps_specified_stencil_reference_supported_ = false;
+    rasterizer_ordered_views_supported_ = false;
+    resource_binding_tier_ = D3D12_RESOURCE_BINDING_TIER_1;
+    tiled_resources_tier_ = D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
+    unaligned_block_textures_supported_ = false;
+    virtual_address_bits_per_resource_ = std::min(virtual_address_bits_per_resource_, 31u);
+    REXGPU_INFO(
+        "d3d12_min_spec is enabled - reporting only feature level 11_0 "
+        "baseline capabilities to test minimum-specification GPU paths");
   }
   REXGPU_INFO(
       "Direct3D 12 device and OS features:\n"

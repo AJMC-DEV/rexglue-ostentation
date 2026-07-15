@@ -936,6 +936,9 @@ bool D3D12CommandProcessor::SetupContext() {
 
   bindless_resources_used_ = REXCVAR_GET(d3d12_bindless) &&
                              provider.GetResourceBindingTier() >= D3D12_RESOURCE_BINDING_TIER_2;
+  REXGPU_INFO("D3D12CommandProcessor: Using {} resources (resource binding tier {})",
+              bindless_resources_used_ ? "bindless" : "bindful",
+              uint32_t(provider.GetResourceBindingTier()));
 
   // Get the draw resolution scale for the render target cache and the texture
   // cache.
