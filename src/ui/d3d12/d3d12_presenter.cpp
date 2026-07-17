@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <memory>
@@ -40,6 +41,12 @@ REXCVAR_DEFINE_BOOL(present_fsr3_frame_generation_debug, false, "UI/Presentation
                     "Draw the FSR3 frame generation debug view and tear lines on generated "
                     "frames only - if frame generation is active, they flicker at half the "
                     "displayed rate");
+REXCVAR_DEFINE_DOUBLE(present_fsr3_generated_fps, 0.0, "UI/Presentation",
+                      "Read-only telemetry: generated (interpolated) frames per second "
+                      "currently produced by FSR3 frame generation, 0 when inactive");
+REXCVAR_DEFINE_DOUBLE(present_host_fps, 0.0, "UI/Presentation",
+                      "Read-only telemetry: real frames per second presented by the host "
+                      "swap chain (excludes FSR3 generated frames)");
 
 namespace rex::ui::d3d12 {
 
@@ -205,11 +212,22 @@ bool D3D12Presenter::DispatchTemporalUpscaler(ID3D12GraphicsCommandList* command
 }
 
 namespace {
+// Number of interpolated frames generated so far. Written on the frame
+// interpolation swap chain's worker thread, read on the UI thread to publish
+// the present_fsr3_generated_fps telemetry cvar.
+std::atomic<uint64_t> frame_generation_generated_frame_count{0};
+
 // Forwards the frame interpolation swap chain's generation request to the
 // frame generation context (the user context is a pointer to the ffxContext).
 ffxReturnCode_t FrameGenerationDispatchCallback(ffxDispatchDescFrameGeneration* params,
                                                 void* user_context) {
-  return ffxDispatch(reinterpret_cast<ffxContext*>(user_context), &params->header);
+  ffxReturnCode_t result =
+      ffxDispatch(reinterpret_cast<ffxContext*>(user_context), &params->header);
+  if (result == FFX_API_RETURN_OK) {
+    frame_generation_generated_frame_count.fetch_add(
+        params->numGeneratedFrames ? params->numGeneratedFrames : 1, std::memory_order_relaxed);
+  }
+  return result;
 }
 }  // namespace
 
@@ -407,6 +425,30 @@ void D3D12Presenter::DispatchAndConfigureFrameGeneration(ID3D12GraphicsCommandLi
                               FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
     if (ffxDispatch(context, &prepare_desc.header) != FFX_API_RETURN_OK) {
       REXLOG_WARN("D3D12Presenter: FidelityFX frame generation prepare dispatch failed");
+    }
+  }
+
+  // Publish the generated-frame rate for FPS overlays (~4 times per second).
+  // Statics are fine here - the counter itself is global, and only one paint
+  // connection samples it at a time.
+  static std::chrono::steady_clock::time_point generated_fps_sample_time;
+  static uint64_t generated_fps_sample_count;
+  if (!enabled) {
+    REXCVAR_SET(present_fsr3_generated_fps, 0.0);
+    generated_fps_sample_time = {};
+  } else if (generated_fps_sample_time.time_since_epoch().count() == 0) {
+    generated_fps_sample_time = now;
+    generated_fps_sample_count =
+        frame_generation_generated_frame_count.load(std::memory_order_relaxed);
+  } else {
+    float sample_ms =
+        std::chrono::duration<float, std::milli>(now - generated_fps_sample_time).count();
+    if (sample_ms >= 250.0f) {
+      uint64_t count = frame_generation_generated_frame_count.load(std::memory_order_relaxed);
+      REXCVAR_SET(present_fsr3_generated_fps,
+                  double(count - generated_fps_sample_count) * 1000.0 / double(sample_ms));
+      generated_fps_sample_time = now;
+      generated_fps_sample_count = count;
     }
   }
 
@@ -847,6 +889,7 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
   frame_generation_height = 0;
   frame_generation_frame_id = 0;
   frame_generation_last_paint_time = {};
+  REXCVAR_SET(present_fsr3_generated_fps, 0.0);
 #endif
   for (Microsoft::WRL::ComPtr<ID3D12Resource>& swap_chain_buffer_ref : swap_chain_buffers) {
     swap_chain_buffer_ref.Reset();
@@ -1505,6 +1548,27 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.
   paint_context_.present_submission_tracker.NextSubmission();
+
+  // Publish the real (non-generated) present rate for FPS overlays (~4 times
+  // per second). Statics are fine - painting happens on one thread at a time.
+  if (SUCCEEDED(present_result)) {
+    static std::chrono::steady_clock::time_point host_fps_sample_time;
+    static uint32_t host_fps_present_count;
+    ++host_fps_present_count;
+    std::chrono::steady_clock::time_point host_fps_now = std::chrono::steady_clock::now();
+    if (host_fps_sample_time.time_since_epoch().count() == 0) {
+      host_fps_sample_time = host_fps_now;
+      host_fps_present_count = 0;
+    } else {
+      float sample_ms =
+          std::chrono::duration<float, std::milli>(host_fps_now - host_fps_sample_time).count();
+      if (sample_ms >= 250.0f) {
+        REXCVAR_SET(present_host_fps, double(host_fps_present_count) * 1000.0 / double(sample_ms));
+        host_fps_sample_time = host_fps_now;
+        host_fps_present_count = 0;
+      }
+    }
+  }
   switch (present_result) {
     case DXGI_ERROR_DEVICE_REMOVED:
       return PaintResult::kGpuLostExternally;
