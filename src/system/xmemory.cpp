@@ -47,6 +47,51 @@ REXCVAR_DEFINE_BOOL(scribble_heap, false, "Memory", "Scribble 0xCD into all allo
 
 namespace rex::memory {
 
+namespace {
+// The recompiled guest code and the engine hooks address guest memory at a
+// fixed host base of 0x100000000 (see the generated GUEST_* macros in
+// rex_macros.h). The guest address space must therefore be mapped at exactly
+// that base - unlike a JIT emulator, a static recompile cannot be relocated.
+//
+// Overlay injectors such as RivaTuner Statistics Server (RTSSHooks64.dll) and
+// MSI Afterburner load their DLLs and allocate working memory low in the
+// address space, and can occupy part of [0x100000000, 0x220000000) before the
+// emulator maps it. When that happened the mapping loop below used to fall
+// back to a higher base, after which every hardcoded 0x100000000 access read
+// the overlay's memory instead of the guest's - an immediate crash.
+//
+// Claim the range as a bare reservation during static initialization, which
+// runs before the graphics stack (and therefore the overlay's D3D-triggered
+// allocations) comes up. Memory::Initialize releases it just before mapping
+// the file views over the same range.
+constexpr uintptr_t kGuestRequiredBase = 0x100000000ull;
+// 4 GiB guest space + 512 MiB physical mirror (matches the 0x11FFFFFFF file
+// mapping size), rounded up to a round reservation.
+constexpr size_t kGuestReservationSize = 0x120000000ull;
+
+#if REX_PLATFORM_WIN32
+void* g_guest_va_reservation = nullptr;
+
+struct GuestAddressSpaceReserver {
+  GuestAddressSpaceReserver() {
+    g_guest_va_reservation = VirtualAlloc(reinterpret_cast<void*>(kGuestRequiredBase),
+                                          kGuestReservationSize, MEM_RESERVE, PAGE_NOACCESS);
+  }
+};
+// Constructed during CRT static initialization - as early as our code can run.
+GuestAddressSpaceReserver g_guest_address_space_reserver;
+
+void ReleaseGuestAddressSpaceReservation() {
+  if (g_guest_va_reservation) {
+    VirtualFree(g_guest_va_reservation, 0, MEM_RELEASE);
+    g_guest_va_reservation = nullptr;
+  }
+}
+#else
+void ReleaseGuestAddressSpaceReservation() {}
+#endif
+}  // namespace
+
 uint32_t get_page_count(uint32_t value, uint32_t page_size, uint32_t page_size_shift) {
   return rex::round_up(value, page_size) >> page_size_shift;
 }
@@ -192,6 +237,12 @@ bool Memory::Initialize() {
     return false;
   }
 
+  // Release the early static-init placeholder (if we managed to grab it) so
+  // the file views can be mapped over the guest base. The gap between the
+  // release and MapViews is a single statement on this thread, so an overlay
+  // injector can't slip an allocation into it.
+  ReleaseGuestAddressSpaceReservation();
+
   // Attempt to create our views. This may fail at the first address
   // we pick, so try a few times.
   mapping_base_ = 0;
@@ -205,6 +256,22 @@ bool Memory::Initialize() {
   if (!mapping_base_) {
     REXSYS_ERROR("Unable to find a continuous block in the 64bit address space.");
     assert_always();
+    return false;
+  }
+  // The recompiled guest code hardcodes the 0x100000000 base, so mapping
+  // anywhere else cannot work - fail with an actionable message instead of
+  // limping on to a mystery crash on the first guest memory access.
+  if (mapping_base_ != reinterpret_cast<uint8_t*>(kGuestRequiredBase)) {
+    REXSYS_ERROR(
+        "The guest address space was mapped at {} instead of the required base "
+        "0x100000000. An overlay or injector (e.g. RivaTuner Statistics Server "
+        "/ MSI Afterburner) is occupying the guest memory range. Close it and "
+        "restart the game.",
+        fmt::ptr(mapping_base_));
+    UnmapViews();
+    mapping_base_ = nullptr;
+    rex::memory::CloseFileMappingHandle(mapping_, file_name_);
+    mapping_ = rex::memory::kFileMappingHandleInvalid;
     return false;
   }
   virtual_membase_ = mapping_base_;
