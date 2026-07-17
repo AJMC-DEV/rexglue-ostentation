@@ -40,18 +40,19 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
                      "Vertical safe area percentage (0-100)")
     .range(0, 100);
 
+// present_effect, sharpness and quality-mode cvars are hot-reloadable: the
+// presenter re-reads them at the start of every UI-thread paint and applies
+// differences through SetGuestOutputPaintConfigFromUIThread.
 #if defined(REX_HAS_FIDELITYFX_SDK)
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
                       "Guest output effect: bilinear, cas, fsr, fsr2, fsr3")
-    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"})
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"});
 
 REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
                       rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessDefault,
                       "UI/Presenter", "Additional CAS sharpness in [0, 1]")
     .range(rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessMin,
-           rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessMax)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+           rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessMax);
 
 REXCVAR_DEFINE_INT32(present_fsr_max_upsampling_passes,
                      rex::ui::Presenter::GuestOutputPaintConfig::kFsrMaxUpscalingPassesMax,
@@ -63,23 +64,19 @@ REXCVAR_DEFINE_DOUBLE(present_fsr_sharpness_reduction,
                       rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionDefault,
                       "UI/Presenter", "FSR RCAS sharpness reduction in stops")
     .range(rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMin,
-           rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMax)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+           rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMax);
 
 REXCVAR_DEFINE_STRING(
     present_fsr_quality_mode, "auto", "UI/Presenter",
     "Temporal FSR quality mode: auto, nativeaa, quality, balanced, performance, ultra_performance")
-    .allowed({"auto", "nativeaa", "quality", "balanced", "performance", "ultra_performance"})
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .allowed({"auto", "nativeaa", "quality", "balanced", "performance", "ultra_performance"});
 #else
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter", "Guest output effect: bilinear")
-    .allowed({"bilinear"})
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .allowed({"bilinear"});
 #endif
 
 REXCVAR_DEFINE_BOOL(present_dither, false, "UI/Presenter",
-                    "Enable output dithering in the final present pass")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+                    "Enable output dithering in the final present pass");
 
 REXCVAR_DEFINE_BOOL(present_allow_overscan_cutoff, false, "UI/Presenter",
                     "Allow overscan cutoff based on safe area settings")
@@ -432,6 +429,12 @@ void Presenter::PaintFromUIThread(bool force_paint) {
   is_in_ui_thread_paint_ = true;
   request_guest_output_paint_after_current_ui_thread_paint_ = false;
   request_ui_paint_after_current_ui_thread_paint_ = false;
+
+  // Pick up runtime changes to the present_* cvars (effect, sharpness,
+  // FSR quality mode, dither) made through the console, overlays or
+  // rex::cvar::SetFlagByName. Cheap no-op when nothing changed; a guest
+  // output repaint is requested via the deferred path above when it did.
+  SetGuestOutputPaintConfigFromUIThread(BuildGuestOutputPaintConfigFromCVar());
 
   // Actualize the connection if the UI needs to be drawn if there was some
   // explicit paint request (the guest output has been refreshed, and the guest

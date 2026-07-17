@@ -12,6 +12,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <memory>
 #include <utility>
 
@@ -253,6 +254,31 @@ class D3D12Presenter final : public Presenter {
     bool swap_chain_allows_tearing = false;
     Microsoft::WRL::ComPtr<IDXGISwapChain3> swap_chain;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kSwapChainBufferCount> swap_chain_buffers;
+
+    // FidelityFX FSR3 frame generation state. The members are unconditional so
+    // the class layout doesn't depend on the FidelityFX build configuration.
+    // When frame_generation_swap_chain_wrapped is true, swap_chain is the
+    // FidelityFX frame interpolation proxy swap chain owned by
+    // frame_generation_swap_chain_context.
+    bool frame_generation_swap_chain_wrapped = false;
+    // Sticky until the frame generation cvar is turned off - prevents endlessly
+    // retrying swap chain or context creation that has already failed once.
+    bool frame_generation_unavailable = false;
+    // ffxContext handles.
+    void* frame_generation_swap_chain_context = nullptr;
+    void* frame_generation_context = nullptr;
+    uint32_t frame_generation_width = 0;
+    uint32_t frame_generation_height = 0;
+    // Must increment by exactly 1 every configure + prepare pair.
+    uint64_t frame_generation_frame_id = 0;
+    bool frame_generation_was_enabled = false;
+    // Zero-filled placeholder inputs for the frame generation prepare pass (the
+    // presenter has no real depth or motion vectors - interpolation relies on
+    // the optical flow field computed from the back buffer).
+    Microsoft::WRL::ComPtr<ID3D12Resource> frame_generation_depth;
+    Microsoft::WRL::ComPtr<ID3D12Resource> frame_generation_motion_vectors;
+    bool frame_generation_inputs_transitioned = false;
+    std::chrono::steady_clock::time_point frame_generation_last_paint_time{};
   };
 
   explicit D3D12Presenter(HostGpuLossCallback host_gpu_loss_callback, const D3D12Provider& provider)
@@ -271,6 +297,19 @@ class D3D12Presenter final : public Presenter {
                                 uint32_t output_width, uint32_t output_height,
                                 const GuestOutputPaintConfig& config);
   void DestroyTemporalUpscalerContext();
+
+  // Whether the next swap chain should be created through the FidelityFX frame
+  // interpolation proxy. False after a creation failure until the cvar is
+  // toggled off and on again.
+  bool IsFrameGenerationWantedForSwapChain();
+  // Creates or recreates the frame generation context and the placeholder
+  // prepare-pass inputs to match the current swap chain size. Records the
+  // one-time placeholder resource state transitions on the command list.
+  bool EnsureFrameGenerationContext(ID3D12GraphicsCommandList* command_list);
+  // Records the frame generation prepare pass on the command list and
+  // configures the frame interpolation swap chain for the current frame. Uses
+  // and then advances frame_generation_frame_id.
+  void DispatchAndConfigureFrameGeneration(ID3D12GraphicsCommandList* command_list, bool enabled);
 #endif
 
   const D3D12Provider& provider_;

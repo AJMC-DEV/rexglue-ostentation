@@ -27,11 +27,19 @@
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
 #include <ffx_api/dx12/ffx_api_dx12.h>
 #include <ffx_api/ffx_api.h>
+#include <ffx_api/ffx_framegeneration.h>
 #include <ffx_api/ffx_upscale.h>
 #endif
 
 REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
                     "Allow variable refresh rate and tearing");
+REXCVAR_DEFINE_BOOL(present_fsr3_frame_generation, false, "UI/Presentation",
+                    "FSR3 frame generation - interpolate an extra frame between presented frames "
+                    "(D3D12 only, requires the FidelityFX runtime)");
+REXCVAR_DEFINE_BOOL(present_fsr3_frame_generation_debug, false, "UI/Presentation",
+                    "Draw the FSR3 frame generation debug view and tear lines on generated "
+                    "frames only - if frame generation is active, they flicker at half the "
+                    "displayed rate");
 
 namespace rex::ui::d3d12 {
 
@@ -54,7 +62,10 @@ namespace shaders {
 D3D12Presenter::~D3D12Presenter() {
   // Await completion of the usage of everything before destroying anything.
   // From most likely the latest to most likely the earliest to be signaled, so
-  // just one sleep will likely be needed.
+  // just one sleep will likely be needed. Destroying the swap chain explicitly
+  // also shuts down the FidelityFX frame interpolation swap chain's threads
+  // and contexts if they are still alive.
+  paint_context_.DestroySwapChain();
   paint_context_.AwaitSwapChainUsageCompletion();
   guest_output_resource_refresher_submission_tracker_.Shutdown();
   ui_submission_tracker_.Shutdown();
@@ -191,6 +202,215 @@ bool D3D12Presenter::DispatchTemporalUpscaler(ID3D12GraphicsCommandList* command
   }
 
   return true;
+}
+
+namespace {
+// Forwards the frame interpolation swap chain's generation request to the
+// frame generation context (the user context is a pointer to the ffxContext).
+ffxReturnCode_t FrameGenerationDispatchCallback(ffxDispatchDescFrameGeneration* params,
+                                                void* user_context) {
+  return ffxDispatch(reinterpret_cast<ffxContext*>(user_context), &params->header);
+}
+}  // namespace
+
+bool D3D12Presenter::IsFrameGenerationWantedForSwapChain() {
+  if (!REXCVAR_GET(present_fsr3_frame_generation)) {
+    // Allow retrying a previously failed setup once the setting is toggled.
+    paint_context_.frame_generation_unavailable = false;
+    return false;
+  }
+  return !paint_context_.frame_generation_unavailable;
+}
+
+bool D3D12Presenter::EnsureFrameGenerationContext(ID3D12GraphicsCommandList* command_list) {
+  uint32_t width = paint_context_.swap_chain_width;
+  uint32_t height = paint_context_.swap_chain_height;
+  if (!width || !height) {
+    return false;
+  }
+
+  if (paint_context_.frame_generation_context &&
+      (paint_context_.frame_generation_width != width ||
+       paint_context_.frame_generation_height != height)) {
+    // The display size has changed - recreate the context and the placeholder
+    // inputs. Their previous usage must have completed on the GPU.
+    paint_context_.paint_submission_tracker.AwaitAllSubmissionsCompletion();
+    ffxDestroyContext(reinterpret_cast<ffxContext*>(&paint_context_.frame_generation_context),
+                      nullptr);
+    paint_context_.frame_generation_context = nullptr;
+    paint_context_.frame_generation_depth.Reset();
+    paint_context_.frame_generation_motion_vectors.Reset();
+    paint_context_.frame_generation_inputs_transitioned = false;
+  }
+
+  if (!paint_context_.frame_generation_context) {
+    ffxCreateContextDescFrameGeneration create_desc = {};
+    create_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+    create_desc.flags = 0;
+    create_desc.displaySize.width = width;
+    create_desc.displaySize.height = height;
+    create_desc.maxRenderSize.width = width;
+    create_desc.maxRenderSize.height = height;
+    create_desc.backBufferFormat = ffxApiGetSurfaceFormatDX12(kSwapChainFormat);
+
+    ffxCreateBackendDX12Desc backend_desc = {};
+    backend_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
+    backend_desc.device = provider_.GetDevice();
+    create_desc.header.pNext = &backend_desc.header;
+
+    if (ffxCreateContext(reinterpret_cast<ffxContext*>(&paint_context_.frame_generation_context),
+                         &create_desc.header, nullptr) != FFX_API_RETURN_OK) {
+      REXLOG_WARN("D3D12Presenter: Failed to create the FidelityFX frame generation context");
+      paint_context_.frame_generation_context = nullptr;
+      paint_context_.frame_generation_unavailable = true;
+      return false;
+    }
+    paint_context_.frame_generation_width = width;
+    paint_context_.frame_generation_height = height;
+    paint_context_.frame_generation_frame_id = 0;
+    REXLOG_INFO("D3D12Presenter: Created the FidelityFX frame generation context ({}x{})", width,
+                height);
+  }
+
+  if (!paint_context_.frame_generation_depth || !paint_context_.frame_generation_motion_vectors) {
+    // The presenter has no real depth or motion vectors - create zero-filled
+    // placeholders (created without CREATE_NOT_ZEROED, so the contents are
+    // guaranteed to be zero). Interpolation is driven by the optical flow field
+    // computed from the back buffer.
+    ID3D12Device* device = provider_.GetDevice();
+    D3D12_RESOURCE_DESC input_desc;
+    input_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    input_desc.Alignment = 0;
+    input_desc.Width = width;
+    input_desc.Height = height;
+    input_desc.DepthOrArraySize = 1;
+    input_desc.MipLevels = 1;
+    input_desc.Format = DXGI_FORMAT_R32_FLOAT;
+    input_desc.SampleDesc.Count = 1;
+    input_desc.SampleDesc.Quality = 0;
+    input_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    input_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    bool inputs_created =
+        SUCCEEDED(device->CreateCommittedResource(&util::kHeapPropertiesDefault,
+                                                  D3D12_HEAP_FLAG_NONE, &input_desc,
+                                                  D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                  IID_PPV_ARGS(&paint_context_.frame_generation_depth)));
+    if (inputs_created) {
+      input_desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+      inputs_created = SUCCEEDED(device->CreateCommittedResource(
+          &util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &input_desc,
+          D3D12_RESOURCE_STATE_COMMON, nullptr,
+          IID_PPV_ARGS(&paint_context_.frame_generation_motion_vectors)));
+    }
+    if (!inputs_created) {
+      REXLOG_WARN(
+          "D3D12Presenter: Failed to create the FidelityFX frame generation "
+          "placeholder inputs");
+      paint_context_.frame_generation_depth.Reset();
+      paint_context_.frame_generation_motion_vectors.Reset();
+      ffxDestroyContext(reinterpret_cast<ffxContext*>(&paint_context_.frame_generation_context),
+                        nullptr);
+      paint_context_.frame_generation_context = nullptr;
+      paint_context_.frame_generation_unavailable = true;
+      return false;
+    }
+    paint_context_.frame_generation_inputs_transitioned = false;
+  }
+
+  if (!paint_context_.frame_generation_inputs_transitioned) {
+    D3D12_RESOURCE_BARRIER barriers[2];
+    for (size_t i = 0; i < 2; ++i) {
+      barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      barriers[i].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+      barriers[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      barriers[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+      barriers[i].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    }
+    barriers[0].Transition.pResource = paint_context_.frame_generation_depth.Get();
+    barriers[1].Transition.pResource = paint_context_.frame_generation_motion_vectors.Get();
+    command_list->ResourceBarrier(2, barriers);
+    paint_context_.frame_generation_inputs_transitioned = true;
+  }
+
+  return true;
+}
+
+void D3D12Presenter::DispatchAndConfigureFrameGeneration(ID3D12GraphicsCommandList* command_list,
+                                                         bool enabled) {
+  uint64_t frame_id = paint_context_.frame_generation_frame_id;
+
+  std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+  float frame_time_ms = 16.666f;
+  if (paint_context_.frame_generation_last_paint_time.time_since_epoch().count()) {
+    frame_time_ms =
+        std::chrono::duration<float, std::milli>(now -
+                                                 paint_context_.frame_generation_last_paint_time)
+            .count();
+    frame_time_ms = std::clamp(frame_time_ms, 0.1f, 100.0f);
+  }
+  paint_context_.frame_generation_last_paint_time = now;
+
+  ffxContext* context = reinterpret_cast<ffxContext*>(&paint_context_.frame_generation_context);
+
+  ffxConfigureDescFrameGeneration config_desc = {};
+  config_desc.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+  config_desc.swapChain = paint_context_.swap_chain.Get();
+  config_desc.presentCallback = nullptr;
+  config_desc.presentCallbackUserContext = nullptr;
+  config_desc.frameGenerationCallback = FrameGenerationDispatchCallback;
+  config_desc.frameGenerationCallbackUserContext = &paint_context_.frame_generation_context;
+  config_desc.frameGenerationEnabled = enabled;
+  config_desc.allowAsyncWorkloads = false;
+  config_desc.HUDLessColor =
+      ffxApiGetResourceDX12(nullptr, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+  config_desc.flags = 0;
+  if (REXCVAR_GET(present_fsr3_frame_generation_debug)) {
+    // Drawn on generated frames only - a direct visual confirmation that
+    // interpolated frames are actually being displayed.
+    config_desc.flags |= FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES |
+                         FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW;
+  }
+  config_desc.onlyPresentGenerated = false;
+  config_desc.generationRect.left = 0;
+  config_desc.generationRect.top = 0;
+  config_desc.generationRect.width = int32_t(paint_context_.frame_generation_width);
+  config_desc.generationRect.height = int32_t(paint_context_.frame_generation_height);
+  config_desc.frameID = frame_id;
+  if (ffxConfigure(context, &config_desc.header) != FFX_API_RETURN_OK) {
+    REXLOG_WARN("D3D12Presenter: Failed to configure FidelityFX frame generation");
+  }
+  paint_context_.frame_generation_was_enabled = enabled;
+
+  if (enabled) {
+    ffxDispatchDescFrameGenerationPrepare prepare_desc = {};
+    prepare_desc.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
+    prepare_desc.frameID = frame_id;
+    prepare_desc.flags = 0;
+    prepare_desc.commandList = command_list;
+    prepare_desc.renderSize.width = paint_context_.frame_generation_width;
+    prepare_desc.renderSize.height = paint_context_.frame_generation_height;
+    prepare_desc.jitterOffset.x = 0.0f;
+    prepare_desc.jitterOffset.y = 0.0f;
+    prepare_desc.motionVectorScale.x = 1.0f;
+    prepare_desc.motionVectorScale.y = 1.0f;
+    prepare_desc.frameTimeDelta = frame_time_ms;
+    prepare_desc.unused_reset = false;
+    prepare_desc.cameraNear = 0.1f;
+    prepare_desc.cameraFar = 1000.0f;
+    prepare_desc.cameraFovAngleVertical = 1.0472f;
+    prepare_desc.viewSpaceToMetersFactor = 1.0f;
+    prepare_desc.depth = ffxApiGetResourceDX12(paint_context_.frame_generation_depth.Get(),
+                                               FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    prepare_desc.motionVectors =
+        ffxApiGetResourceDX12(paint_context_.frame_generation_motion_vectors.Get(),
+                              FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    if (ffxDispatch(context, &prepare_desc.header) != FFX_API_RETURN_OK) {
+      REXLOG_WARN("D3D12Presenter: FidelityFX frame generation prepare dispatch failed");
+    }
+  }
+
+  paint_context_.frame_generation_frame_id = frame_id + 1;
 }
 #endif
 
@@ -344,9 +564,22 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
   uint32_t new_swap_chain_height =
       std::min(new_surface_height, uint32_t(D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION));
 
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  bool frame_generation_wanted = IsFrameGenerationWantedForSwapChain();
+#else
+  constexpr bool frame_generation_wanted = false;
+#endif
+
   // ConnectOrReconnectPaintingToSurfaceFromUIThread may be called only for the
   // surface of the current swap chain or when the old swap chain has already
   // been destroyed, if the surface is the same, try resizing.
+  if (paint_context_.swap_chain &&
+      paint_context_.frame_generation_swap_chain_wrapped != frame_generation_wanted) {
+    // The frame generation setting has changed - the swap chain must be
+    // recreated through or without the frame interpolation proxy, resizing
+    // can't toggle it.
+    paint_context_.DestroySwapChain();
+  }
   if (paint_context_.swap_chain) {
     if (was_paintable && paint_context_.swap_chain_width == new_swap_chain_width &&
         paint_context_.swap_chain_height == new_swap_chain_height) {
@@ -420,10 +653,45 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
 #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP | WINAPI_PARTITION_GAMES)
       case Surface::kTypeIndex_Win32Hwnd: {
         HWND surface_hwnd = static_cast<const Win32HwndSurface&>(new_surface).hwnd();
-        if (FAILED(dxgi_factory->CreateSwapChainForHwnd(
-                direct_queue, surface_hwnd, &swap_chain_desc, nullptr, nullptr, &swap_chain_1))) {
-          REXLOG_ERROR("D3D12Presenter: Failed to create a swap chain for the HWND");
-          return SurfacePaintConnectResult::kFailure;
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+        if (frame_generation_wanted) {
+          // Create the swap chain through the FidelityFX frame interpolation
+          // proxy - it presents both rendered and generated frames, and its
+          // GetBuffer/Present/ResizeBuffers behave like the real swap chain's.
+          IDXGISwapChain4* frame_generation_swap_chain = nullptr;
+          ffxCreateContextDescFrameGenerationSwapChainForHwndDX12 fg_swap_chain_desc = {};
+          fg_swap_chain_desc.header.type =
+              FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_FOR_HWND_DX12;
+          fg_swap_chain_desc.swapchain = &frame_generation_swap_chain;
+          fg_swap_chain_desc.hwnd = surface_hwnd;
+          fg_swap_chain_desc.desc = &swap_chain_desc;
+          fg_swap_chain_desc.fullscreenDesc = nullptr;
+          fg_swap_chain_desc.dxgiFactory = dxgi_factory;
+          fg_swap_chain_desc.gameQueue = direct_queue;
+          if (ffxCreateContext(
+                  reinterpret_cast<ffxContext*>(&paint_context_.frame_generation_swap_chain_context),
+                  &fg_swap_chain_desc.header, nullptr) == FFX_API_RETURN_OK) {
+            swap_chain_1.Attach(frame_generation_swap_chain);
+            paint_context_.frame_generation_swap_chain_wrapped = true;
+            REXLOG_INFO(
+                "D3D12Presenter: Created the FidelityFX frame interpolation "
+                "swap chain");
+          } else {
+            paint_context_.frame_generation_swap_chain_context = nullptr;
+            paint_context_.frame_generation_unavailable = true;
+            REXLOG_WARN(
+                "D3D12Presenter: Failed to create the FidelityFX frame "
+                "interpolation swap chain - falling back to the DXGI swap "
+                "chain without frame generation");
+          }
+        }
+#endif
+        if (!swap_chain_1) {
+          if (FAILED(dxgi_factory->CreateSwapChainForHwnd(
+                  direct_queue, surface_hwnd, &swap_chain_desc, nullptr, nullptr, &swap_chain_1))) {
+            REXLOG_ERROR("D3D12Presenter: Failed to create a swap chain for the HWND");
+            return SurfacePaintConnectResult::kFailure;
+          }
         }
         // Disable automatic Alt+Enter handling - DXGI fullscreen doesn't
         // support ALLOW_TEARING, and the window implementation provides
@@ -442,6 +710,9 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
       REXLOG_ERROR(
           "D3D12Presenter: Failed to get version 3 of the swap chain "
           "interface");
+      // Destroys the frame generation swap chain context if the swap chain was
+      // created through the frame interpolation proxy.
+      paint_context_.DestroySwapChain();
       return SurfacePaintConnectResult::kFailure;
     }
     // From now on, in case of any failure, DestroySwapChain must be called
@@ -541,20 +812,74 @@ bool D3D12Presenter::RefreshGuestOutputImpl(
 }
 
 void D3D12Presenter::PaintContext::DestroySwapChain() {
-  if (!swap_chain) {
+  if (!swap_chain && !frame_generation_swap_chain_context) {
     return;
   }
   AwaitSwapChainUsageCompletion();
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  if (frame_generation_context) {
+    if (frame_generation_was_enabled && swap_chain) {
+      // Stop frame generation before tearing the proxy down.
+      ffxConfigureDescFrameGeneration config_desc = {};
+      config_desc.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+      config_desc.swapChain = swap_chain.Get();
+      config_desc.frameGenerationEnabled = false;
+      config_desc.frameID = frame_generation_frame_id;
+      ffxConfigure(reinterpret_cast<ffxContext*>(&frame_generation_context), &config_desc.header);
+      frame_generation_was_enabled = false;
+    }
+  }
+  if (frame_generation_swap_chain_context) {
+    // Flush the frame interpolation and pacing threads.
+    ffxDispatchDescFrameGenerationSwapChainWaitForPresentsDX12 wait_desc = {};
+    wait_desc.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WAIT_FOR_PRESENTS_DX12;
+    ffxDispatch(reinterpret_cast<ffxContext*>(&frame_generation_swap_chain_context),
+                &wait_desc.header);
+  }
+  if (frame_generation_context) {
+    ffxDestroyContext(reinterpret_cast<ffxContext*>(&frame_generation_context), nullptr);
+    frame_generation_context = nullptr;
+  }
+  frame_generation_depth.Reset();
+  frame_generation_motion_vectors.Reset();
+  frame_generation_inputs_transitioned = false;
+  frame_generation_width = 0;
+  frame_generation_height = 0;
+  frame_generation_frame_id = 0;
+  frame_generation_last_paint_time = {};
+#endif
   for (Microsoft::WRL::ComPtr<ID3D12Resource>& swap_chain_buffer_ref : swap_chain_buffers) {
     swap_chain_buffer_ref.Reset();
   }
   swap_chain.Reset();
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  if (frame_generation_swap_chain_context) {
+    // Destroying the swap chain context releases the proxy swap chain, so all
+    // references to it must have been released above.
+    ffxDestroyContext(reinterpret_cast<ffxContext*>(&frame_generation_swap_chain_context),
+                      nullptr);
+    frame_generation_swap_chain_context = nullptr;
+  }
+  // frame_generation_unavailable is deliberately kept - it's reset when the
+  // frame generation setting is turned off.
+  frame_generation_swap_chain_wrapped = false;
+#endif
   swap_chain_allows_tearing = false;
   swap_chain_height = 0;
   swap_chain_width = 0;
 }
 
 Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  // If the frame generation setting no longer matches how the swap chain was
+  // created, request a reconnection so the swap chain is recreated through or
+  // without the frame interpolation proxy.
+  if (IsFrameGenerationWantedForSwapChain() !=
+      paint_context_.frame_generation_swap_chain_wrapped) {
+    return PaintResult::kNotPresentedConnectionOutdated;
+  }
+#endif
+
   // Begin the command list with the command allocator not currently potentially
   // used on the GPU.
   UINT64 current_paint_submission = paint_context_.paint_submission_tracker.GetCurrentSubmission();
@@ -1139,6 +1464,18 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   barrier_rtv_to_present.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
   command_list->ResourceBarrier(1, &barrier_rtv_to_present);
 
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  if (paint_context_.frame_generation_swap_chain_wrapped) {
+    // Record the frame generation prepare pass and configure the frame
+    // interpolation swap chain for this frame. If the context can't be set up,
+    // present through the proxy without generation.
+    bool frame_generation_ready = EnsureFrameGenerationContext(command_list);
+    if (paint_context_.frame_generation_context) {
+      DispatchAndConfigureFrameGeneration(command_list, frame_generation_ready);
+    }
+  }
+#endif
+
   // Execute and present.
   command_list->Close();
   ID3D12CommandList* execute_command_list = command_list;
@@ -1155,9 +1492,15 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // fullscreen is ever used in, the allow tearing flag must not be passed in
   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
   // presentation model used in Direct3D 12).
-  HRESULT present_result = paint_context_.swap_chain->Present(
-      0, DXGI_PRESENT_RESTART |
-             (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
+  UINT present_flags =
+      DXGI_PRESENT_RESTART |
+      (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
+  if (paint_context_.frame_generation_swap_chain_wrapped) {
+    // DXGI_PRESENT_RESTART discards queued presents, which would fight the
+    // frame interpolation swap chain's internal pacing queue.
+    present_flags &= ~UINT(DXGI_PRESENT_RESTART);
+  }
+  HRESULT present_result = paint_context_.swap_chain->Present(0, present_flags);
   // Even if presentation has failed, work might have been enqueued anyway
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.

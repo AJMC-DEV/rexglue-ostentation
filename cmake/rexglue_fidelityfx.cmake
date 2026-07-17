@@ -64,22 +64,35 @@ endif()
 # `llvm-rc` (used by clang on Windows) rejects UTF-16 with:
 #   "fatal error: UTF-16 (LE) byte order mark detected ..."
 # Rewrite any such file in place as UTF-8 so the build succeeds with clang.
-file(GLOB_RECURSE _rexglue_ffx_rc_files
-    "${fidelityfx_SOURCE_DIR}/*.rc")
-foreach(_rc IN LISTS _rexglue_ffx_rc_files)
-    file(READ "${_rc}" _rc_head LIMIT 2 HEX)
-    # UTF-16 LE BOM = 0xFF 0xFE
-    if(_rc_head STREQUAL "fffe")
-        message(STATUS "rexglue: converting UTF-16 .rc to UTF-8: ${_rc}")
-        file(STRINGS "${_rc}" _rc_lines ENCODING UTF-8)
-        set(_rc_text "")
-        foreach(_line IN LISTS _rc_lines)
-            string(APPEND _rc_text "${_line}\n")
-        endforeach()
-        file(WRITE "${_rc}" "${_rc_text}")
-    endif()
-endforeach()
-unset(_rexglue_ffx_rc_files)
+# The transcode must be byte-exact: cmake's file(STRINGS) list round-trip
+# corrupts lines containing `\` or `;` (list-escape ambiguity), and a
+# corrupted .rc deadlocks `cmake -E cmake_llvm_rc` at build time (clang
+# blocks on a full, undrained stderr pipe). Use PowerShell instead; .rc
+# compilation only happens on Windows, where it is always available.
+if(WIN32)
+    file(GLOB_RECURSE _rexglue_ffx_rc_files
+        "${fidelityfx_SOURCE_DIR}/*.rc")
+    foreach(_rc IN LISTS _rexglue_ffx_rc_files)
+        file(READ "${_rc}" _rc_head LIMIT 2 HEX)
+        # UTF-16 LE BOM = 0xFF 0xFE
+        if(_rc_head STREQUAL "fffe")
+            message(STATUS "rexglue: converting UTF-16 .rc to UTF-8: ${_rc}")
+            execute_process(
+                COMMAND powershell -NoProfile -NonInteractive -Command
+                    "[IO.File]::WriteAllText('${_rc}', \
+[IO.File]::ReadAllText('${_rc}', [Text.Encoding]::Unicode), \
+(New-Object Text.UTF8Encoding $false))"
+                RESULT_VARIABLE _rc_convert_result
+                ERROR_VARIABLE _rc_convert_error)
+            if(NOT _rc_convert_result EQUAL 0)
+                message(FATAL_ERROR
+                    "rexglue: UTF-16 -> UTF-8 conversion failed for ${_rc}:\n"
+                    "${_rc_convert_error}")
+            endif()
+        endif()
+    endforeach()
+    unset(_rexglue_ffx_rc_files)
+endif()
 
 set(REXGLUE_FIDELITYFX_SOURCE_DIR "${fidelityfx_SOURCE_DIR}" CACHE INTERNAL
     "Root of the fetched FidelityFX SDK source tree")
@@ -127,7 +140,16 @@ if(REXGLUE_USE_VULKAN AND REXGLUE_USE_D3D12)
 endif()
 
 # ── Build FidelityFX ─────────────────────────────────────────────────────
-set(FFX_API_ENABLE_FRAMEGEN_PROVIDER OFF CACHE BOOL "" FORCE)
+# Frame generation providers (FSR3 frame interpolation, optical flow and the
+# frame interpolation swapchain), used by the D3D12 presenter for
+# present-level frame generation.
+option(REXGLUE_FIDELITYFX_FRAMEGEN
+    "Build the FidelityFX frame generation providers (FSR3 frame interpolation)" ON)
+if(REXGLUE_FIDELITYFX_FRAMEGEN)
+    set(FFX_API_ENABLE_FRAMEGEN_PROVIDER ON CACHE BOOL "" FORCE)
+else()
+    set(FFX_API_ENABLE_FRAMEGEN_PROVIDER OFF CACHE BOOL "" FORCE)
+endif()
 # Disable upstream auto shader compilation. On Windows the FXC permutation
 # build for FSR3 hangs indefinitely under CI (observed >50 min with no
 # progress on GitHub Actions). The libs link without prebaked shaders;
