@@ -34,6 +34,8 @@
 #include <rex/ui/surface_gnulinux.h>
 #endif
 
+REXCVAR_DECLARE(bool, fullscreen_span_monitors);
+
 namespace rex::ui {
 
 namespace {
@@ -158,8 +160,7 @@ bool WindowSDL::OpenImpl() {
   }
 
   if (IsFullscreen()) {
-    // Borderless desktop fullscreen (a NULL display mode is SDL3's default).
-    SDL_SetWindowFullscreen(sdl_window_, true);
+    ApplyFullscreenState();
   }
   // SDL3 requires explicit opt-in for text input events.
   SDL_StartTextInput(sdl_window_);
@@ -233,6 +234,66 @@ uint32_t WindowSDL::GetLatestDpiImpl() const {
 void WindowSDL::ApplyNewFullscreen() {
   if (!sdl_window_) {
     return;
+  }
+  ApplyFullscreenState();
+}
+
+bool WindowSDL::ComputeSpanBounds(SDL_Rect& out_bounds) {
+  int display_count = 0;
+  SDL_DisplayID* displays = SDL_GetDisplays(&display_count);
+  if (!displays) {
+    return false;
+  }
+  bool any = false;
+  SDL_Rect united{};
+  for (int i = 0; i < display_count; ++i) {
+    SDL_Rect bounds;
+    if (!SDL_GetDisplayBounds(displays[i], &bounds)) {
+      continue;
+    }
+    if (!any) {
+      united = bounds;
+      any = true;
+    } else {
+      int right = std::max(united.x + united.w, bounds.x + bounds.w);
+      int bottom = std::max(united.y + united.h, bounds.y + bounds.h);
+      united.x = std::min(united.x, bounds.x);
+      united.y = std::min(united.y, bounds.y);
+      united.w = right - united.x;
+      united.h = bottom - united.y;
+    }
+  }
+  SDL_free(displays);
+  if (!any || display_count < 2) {
+    return false;
+  }
+  out_bounds = united;
+  return true;
+}
+
+void WindowSDL::ApplyFullscreenState() {
+  SDL_Rect span_bounds;
+  bool want_span =
+      IsFullscreen() && REXCVAR_GET(fullscreen_span_monitors) && ComputeSpanBounds(span_bounds);
+  if (want_span) {
+    if (!spanning_) {
+      SDL_GetWindowPosition(sdl_window_, &pre_span_bounds_.x, &pre_span_bounds_.y);
+      SDL_GetWindowSize(sdl_window_, &pre_span_bounds_.w, &pre_span_bounds_.h);
+      spanning_ = true;
+    }
+    // SDL's fullscreen is per-display; spanning is a borderless window covering
+    // the union of all display bounds instead.
+    SDL_SetWindowFullscreen(sdl_window_, false);
+    SDL_SetWindowBordered(sdl_window_, false);
+    SDL_SetWindowPosition(sdl_window_, span_bounds.x, span_bounds.y);
+    SDL_SetWindowSize(sdl_window_, span_bounds.w, span_bounds.h);
+    return;
+  }
+  if (spanning_) {
+    spanning_ = false;
+    SDL_SetWindowBordered(sdl_window_, true);
+    SDL_SetWindowPosition(sdl_window_, pre_span_bounds_.x, pre_span_bounds_.y);
+    SDL_SetWindowSize(sdl_window_, pre_span_bounds_.w, pre_span_bounds_.h);
   }
   SDL_SetWindowFullscreen(sdl_window_, IsFullscreen());
 }
@@ -352,9 +413,12 @@ void WindowSDL::HandleWindowEvent(SDL_Event& event) {
       break;
     case SDL_EVENT_WINDOW_RESIZED: {
       // Track the user-driven size as the desired size for the normal state
-      // only (mirrors the Win32 WM_SIZE handling).
+      // only (mirrors the Win32 WM_SIZE handling). The multi-monitor span is
+      // borderless rather than SDL_WINDOW_FULLSCREEN, so it must be excluded
+      // explicitly - its size is not a normal-state size to restore to.
       SDL_WindowFlags flags = SDL_GetWindowFlags(sdl_window_);
-      if (!(flags & (SDL_WINDOW_MAXIMIZED | SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MINIMIZED))) {
+      if (!spanning_ &&
+          !(flags & (SDL_WINDOW_MAXIMIZED | SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MINIMIZED))) {
         OnDesiredLogicalSizeUpdate(SizeToLogical(uint32_t(event.window.data1)),
                                    SizeToLogical(uint32_t(event.window.data2)));
       }

@@ -36,6 +36,13 @@ REXCVAR_DEFINE_BOOL(fullscreen, true, "UI/Window",
                     "or this setting)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(fullscreen_span_monitors, false, "UI/Window",
+                    "Fullscreen spans every connected monitor as one borderless window, from the "
+                    "top-left of the leftmost display to the bottom-right of the rightmost (for "
+                    "super-ultrawide aspect ratios such as 32:9 across two 16:9 displays). "
+                    "Ignored with a single monitor.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(monitor, 0, "UI/Window",
                      "Monitor index to display on (0 = default, 1 = primary, 2 = "
                      "second monitor, etc.)")

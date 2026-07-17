@@ -394,6 +394,16 @@ bool ReXApp::SetupPresentation() {
       window_->SetFullscreen(REXCVAR_GET(fullscreen));
     }
   });
+  // fullscreen_span_monitors only takes effect when fullscreen is applied;
+  // if it changes while already fullscreen, cycle fullscreen to re-apply
+  // (Window::SetFullscreen early-outs on an unchanged value).
+  rex::cvar::RegisterChangeCallback("fullscreen_span_monitors",
+                                    [this](std::string_view, std::string_view) {
+                                      if (window_ && window_->IsFullscreen()) {
+                                        window_->SetFullscreen(false);
+                                        window_->SetFullscreen(true);
+                                      }
+                                    });
   window_->Open();
 
   auto* graphics_system = config_.graphics.get();

@@ -71,11 +71,23 @@ class WindowSDL final : public Window {
   void ApplyCursorVisibilityNow();
   void RearmCursorAutoHideTimer();
 
+  // Applies the current IsFullscreen() state, choosing between SDL's
+  // single-display fullscreen and the multi-monitor borderless span
+  // (fullscreen_span_monitors cvar). Used by OpenImpl and ApplyNewFullscreen.
+  void ApplyFullscreenState();
+  // Union of all display bounds in SDL (physical) coordinates. Returns false
+  // with fewer than two displays - spanning is meaningless then.
+  bool ComputeSpanBounds(SDL_Rect& out_bounds);
+
   SDL_Window* sdl_window_ = nullptr;
   SDL_WindowID sdl_window_id_ = 0;
   std::atomic<bool> paint_pending_{false};
   // Auto-hide cursor bookkeeping (CursorVisibility::kAutoHidden).
   SDL_TimerID cursor_hide_timer_ = 0;
+  // Multi-monitor spanning fullscreen state: whether the borderless span is
+  // active, and the windowed geometry to restore when it ends.
+  bool spanning_ = false;
+  SDL_Rect pre_span_bounds_{};
 };
 
 }  // namespace rex::ui
