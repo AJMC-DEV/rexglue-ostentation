@@ -133,6 +133,8 @@ class D3D12Presenter final : public Presenter {
 
   enum GuestOutputPaintRootSignatureIndex : size_t {
     kGuestOutputPaintRootSignatureIndexBilinear,
+    // Same layout and shaders as bilinear, but with a point static sampler.
+    kGuestOutputPaintRootSignatureIndexNearest,
 #if defined(REX_HAS_FIDELITYFX_SDK)
     kGuestOutputPaintRootSignatureIndexCasSharpen,
     kGuestOutputPaintRootSignatureIndexCasResample,
@@ -149,6 +151,9 @@ class D3D12Presenter final : public Presenter {
       case GuestOutputPaintEffect::kBilinear:
       case GuestOutputPaintEffect::kBilinearDither:
         return kGuestOutputPaintRootSignatureIndexBilinear;
+      case GuestOutputPaintEffect::kNearest:
+      case GuestOutputPaintEffect::kNearestDither:
+        return kGuestOutputPaintRootSignatureIndexNearest;
 #if defined(REX_HAS_FIDELITYFX_SDK)
       case GuestOutputPaintEffect::kCasSharpen:
       case GuestOutputPaintEffect::kCasSharpenDither:

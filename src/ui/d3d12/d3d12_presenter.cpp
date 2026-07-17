@@ -1330,7 +1330,8 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
 #endif
           } effect_constants;
           switch (guest_output_paint_root_signature_index) {
-            case kGuestOutputPaintRootSignatureIndexBilinear: {
+            case kGuestOutputPaintRootSignatureIndexBilinear:
+            case kGuestOutputPaintRootSignatureIndexNearest: {
               effect_constants_size = sizeof(effect_constants.bilinear);
               effect_constants.bilinear.Initialize(guest_output_flow, i);
             } break;
@@ -1684,6 +1685,22 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
     *(guest_output_paint_root_signatures_[kGuestOutputPaintRootSignatureIndexBilinear]
           .ReleaseAndGetAddressOf()) = guest_output_paint_root_signature;
   }
+  // Nearest (unfiltered) - the bilinear layout and shaders, but with a point
+  // sampler.
+  guest_output_paint_root_sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+  {
+    ID3D12RootSignature* guest_output_paint_root_signature =
+        util::CreateRootSignature(provider_, guest_output_paint_root_signature_desc);
+    if (!guest_output_paint_root_signature) {
+      REXLOG_ERROR(
+          "D3D12Presenter: Failed to create the guest output nearest-neighbor "
+          "presentation root signature");
+      return false;
+    }
+    *(guest_output_paint_root_signatures_[kGuestOutputPaintRootSignatureIndexNearest]
+          .ReleaseAndGetAddressOf()) = guest_output_paint_root_signature;
+  }
+  guest_output_paint_root_sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
 #if defined(REX_HAS_FIDELITYFX_SDK)
   // EASU (needs the sampler).
   guest_output_paint_root_parameter_effect_constants.Constants.Num32BitValues =
@@ -1773,6 +1790,19 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
             sizeof(shaders::guest_output_bilinear_ps);
         break;
       case GuestOutputPaintEffect::kBilinearDither:
+        guest_output_paint_pipeline_desc.PS.pShaderBytecode =
+            shaders::guest_output_bilinear_dither_ps;
+        guest_output_paint_pipeline_desc.PS.BytecodeLength =
+            sizeof(shaders::guest_output_bilinear_dither_ps);
+        break;
+      // Nearest reuses the bilinear shaders - the filtering difference is
+      // entirely in the root signature's static sampler.
+      case GuestOutputPaintEffect::kNearest:
+        guest_output_paint_pipeline_desc.PS.pShaderBytecode = shaders::guest_output_bilinear_ps;
+        guest_output_paint_pipeline_desc.PS.BytecodeLength =
+            sizeof(shaders::guest_output_bilinear_ps);
+        break;
+      case GuestOutputPaintEffect::kNearestDither:
         guest_output_paint_pipeline_desc.PS.pShaderBytecode =
             shaders::guest_output_bilinear_dither_ps;
         guest_output_paint_pipeline_desc.PS.BytecodeLength =

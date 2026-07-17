@@ -212,6 +212,9 @@ class Presenter {
    public:
     enum class Effect {
       kBilinear,
+      // Unfiltered point sampling - crisp pixels when upscaling from a low
+      // guest resolution.
+      kNearest,
 #if defined(REX_HAS_FIDELITYFX_SDK)
       kCas,
       // AMD FidelityFX Super Resolution upsampling, Contrast Adaptive
@@ -427,6 +430,8 @@ class Presenter {
   enum class GuestOutputPaintEffect {
     kBilinear,
     kBilinearDither,
+    kNearest,
+    kNearestDither,
 #if defined(REX_HAS_FIDELITYFX_SDK)
     kCasSharpen,
     kCasSharpenDither,
@@ -446,6 +451,9 @@ class Presenter {
       // Dithering is never performed in intermediate passes because it may be
       // interpreted as features by the subsequent passes.
       case GuestOutputPaintEffect::kBilinearDither:
+      // Nearest is only a final stretch, like bilinear.
+      case GuestOutputPaintEffect::kNearest:
+      case GuestOutputPaintEffect::kNearestDither:
 #if defined(REX_HAS_FIDELITYFX_SDK)
       case GuestOutputPaintEffect::kCasSharpenDither:
       case GuestOutputPaintEffect::kCasResampleDither:

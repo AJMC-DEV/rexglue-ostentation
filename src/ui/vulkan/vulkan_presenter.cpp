@@ -2356,6 +2356,16 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
         shader_module_create_info.codeSize = sizeof(shaders::guest_output_bilinear_dither_ps);
         shader_module_create_info.pCode = shaders::guest_output_bilinear_dither_ps;
         break;
+      // Nearest falls back to bilinear here - the guest output descriptor set
+      // layout uses an immutable linear sampler.
+      case GuestOutputPaintEffect::kNearest:
+        shader_module_create_info.codeSize = sizeof(shaders::guest_output_bilinear_ps);
+        shader_module_create_info.pCode = shaders::guest_output_bilinear_ps;
+        break;
+      case GuestOutputPaintEffect::kNearestDither:
+        shader_module_create_info.codeSize = sizeof(shaders::guest_output_bilinear_dither_ps);
+        shader_module_create_info.pCode = shaders::guest_output_bilinear_dither_ps;
+        break;
 #if defined(REX_HAS_FIDELITYFX_SDK)
       case GuestOutputPaintEffect::kCasSharpen:
         shader_module_create_info.codeSize = sizeof(shaders::guest_output_ffx_cas_sharpen_ps);

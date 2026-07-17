@@ -52,8 +52,8 @@ REXCVAR_DEFINE_INT32(present_guest_height, 0, "UI/Presenter",
 // differences through SetGuestOutputPaintConfigFromUIThread.
 #if defined(REX_HAS_FIDELITYFX_SDK)
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
-                      "Guest output effect: bilinear, cas, fsr, fsr2, fsr3")
-    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"});
+                      "Guest output effect: bilinear, nearest (unfiltered), cas, fsr, fsr2, fsr3")
+    .allowed({"bilinear", "nearest", "cas", "fsr", "fsr2", "fsr3"});
 
 REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
                       rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessDefault,
@@ -78,8 +78,9 @@ REXCVAR_DEFINE_STRING(
     "Temporal FSR quality mode: auto, nativeaa, quality, balanced, performance, ultra_performance")
     .allowed({"auto", "nativeaa", "quality", "balanced", "performance", "ultra_performance"});
 #else
-REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter", "Guest output effect: bilinear")
-    .allowed({"bilinear"});
+REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
+                      "Guest output effect: bilinear, nearest (unfiltered)")
+    .allowed({"bilinear", "nearest"});
 #endif
 
 REXCVAR_DEFINE_BOOL(present_dither, false, "UI/Presenter",
@@ -96,6 +97,9 @@ GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name
   std::string lowered = effect_name;
   std::transform(lowered.begin(), lowered.end(), lowered.begin(),
                  [](unsigned char c) { return char(std::tolower(c)); });
+  if (lowered == "nearest" || lowered == "unfiltered" || lowered == "point") {
+    return GuestOutputPaintConfig::Effect::kNearest;
+  }
 #if defined(REX_HAS_FIDELITYFX_SDK)
   if (lowered == "cas") {
     return GuestOutputPaintConfig::Effect::kCas;
@@ -1181,7 +1185,10 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
     }
     assert_true(flow.effect_count < flow.effects.size());
     flow.effect_output_sizes[flow.effect_count] = std::make_pair(output_width, output_height);
-    flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kBilinear;
+    flow.effects[flow.effect_count++] =
+        config.GetEffect() == GuestOutputPaintConfig::Effect::kNearest
+            ? GuestOutputPaintEffect::kNearest
+            : GuestOutputPaintEffect::kBilinear;
   }
 
   assert_not_zero(flow.effect_count);
@@ -1198,6 +1205,13 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
             output_width != properties.frontbuffer_width ||
             output_height != properties.frontbuffer_height) {
           last_effect = GuestOutputPaintEffect::kBilinearDither;
+        }
+        break;
+      case GuestOutputPaintEffect::kNearest:
+        if (!properties.is_8bpc || flow.effect_count > 1 ||
+            output_width != properties.frontbuffer_width ||
+            output_height != properties.frontbuffer_height) {
+          last_effect = GuestOutputPaintEffect::kNearestDither;
         }
         break;
 #if defined(REX_HAS_FIDELITYFX_SDK)

@@ -95,6 +95,10 @@ REXCVAR_DEFINE_DOUBLE(gpu_stat_frame_triangles, 0.0, "GPU/Stats",
 REXCVAR_DEFINE_DOUBLE(gpu_stat_cp_busy_ms, 0.0, "GPU/Stats",
                       "Telemetry (read-only): average command processor (GPU worker thread) "
                       "busy milliseconds per guest frame, for stat overlays");
+REXCVAR_DEFINE_DOUBLE(gpu_stat_cp_stall_ms, 0.0, "GPU/Stats",
+                      "Telemetry (read-only): average command processor (GPU worker thread) "
+                      "stall milliseconds per guest frame (ring buffer empty, guest-commanded "
+                      "waits, GPU fence waits)");
 
 namespace rex::graphics {
 
@@ -1167,6 +1171,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
       REXCVAR_SET(gpu_stat_frame_triangles, double(stat_window_triangles_) / stat_window_frames_);
       REXCVAR_SET(gpu_stat_cp_busy_ms,
                   std::max(0.0, window_ms - stall_ms) / stat_window_frames_);
+      REXCVAR_SET(gpu_stat_cp_stall_ms, stall_ms / stat_window_frames_);
       stat_window_start_ = stat_now;
       stat_window_frames_ = 0;
       stat_window_draws_ = 0;
@@ -1201,6 +1206,12 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   uint32_t wait = reader->ReadAndSwap<uint32_t>();
 
   bool is_memory = (wait_info & 0x10) != 0;
+
+  // The whole polling loop counts as stall for the gpu_stat_cp_busy_ms
+  // telemetry once the first poll misses - re-polling is waiting for the
+  // guest, not processing.
+  bool stat_waited = false;
+  std::chrono::steady_clock::time_point stat_wait_begin;
 
   bool matched = false;
   do {
@@ -1245,6 +1256,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
     }
     if (!matched) {
       // Wait.
+      if (!stat_waited) {
+        stat_waited = true;
+        stat_wait_begin = std::chrono::steady_clock::now();
+      }
       if (wait >= 0x100) {
         PrepareForWait();
         if (!REXCVAR_GET(vsync)) {
@@ -1265,6 +1280,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+
+  if (stat_waited) {
+    stat_window_stall_ += std::chrono::steady_clock::now() - stat_wait_begin;
+  }
 
   return true;
 }

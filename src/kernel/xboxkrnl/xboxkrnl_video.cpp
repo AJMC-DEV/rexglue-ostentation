@@ -53,7 +53,7 @@ uint32_t GetConfiguredVideoModeWidth() {
       }
     }
   }
-  return uint32_t(std::clamp(configured_width, 640, 0x0FFF));
+  return uint32_t(std::clamp(configured_width, 320, 0x0FFF));
 }
 
 uint32_t GetConfiguredVideoModeHeight() {
@@ -70,7 +70,7 @@ uint32_t GetConfiguredVideoModeHeight() {
       }
     }
   }
-  return uint32_t(std::clamp(configured_height, 480, 0x0FFF));
+  return uint32_t(std::clamp(configured_height, 180, 0x0FFF));
 }
 
 float GetConfiguredVideoModeRefreshRate() {

@@ -3319,7 +3319,9 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
                     SUCCEEDED(queue_operations_since_submission_fence_->SetEventOnCompletion(
                         fence_value, fence_completion_event_)))) {
         PROFILE_CMD_BUFFER_STALL();
+        std::chrono::steady_clock::time_point stat_wait_begin = std::chrono::steady_clock::now();
         WaitForSingleObject(fence_completion_event_, INFINITE);
+        stat_window_stall_ += std::chrono::steady_clock::now() - stat_wait_begin;
         queue_operations_done_since_submission_signal_ = false;
       } else {
         REXGPU_ERROR(
@@ -3338,7 +3340,9 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
     if (SUCCEEDED(
             submission_fence_->SetEventOnCompletion(await_submission, fence_completion_event_))) {
       PROFILE_CMD_BUFFER_STALL();
+      std::chrono::steady_clock::time_point stat_wait_begin = std::chrono::steady_clock::now();
       WaitForSingleObject(fence_completion_event_, INFINITE);
+      stat_window_stall_ += std::chrono::steady_clock::now() - stat_wait_begin;
       submission_completed_ = submission_fence_->GetCompletedValue();
     }
   }

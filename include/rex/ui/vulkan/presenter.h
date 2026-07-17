@@ -245,6 +245,10 @@ class VulkanPresenter final : public Presenter {
     switch (effect) {
       case GuestOutputPaintEffect::kBilinear:
       case GuestOutputPaintEffect::kBilinearDither:
+      // Nearest falls back to bilinear filtering in the Vulkan presenter - the
+      // guest output descriptor set layout uses an immutable linear sampler.
+      case GuestOutputPaintEffect::kNearest:
+      case GuestOutputPaintEffect::kNearestDither:
         return kGuestOutputPaintPipelineLayoutIndexBilinear;
 #if defined(REX_HAS_FIDELITYFX_SDK)
       case GuestOutputPaintEffect::kCasSharpen:
