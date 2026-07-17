@@ -47,6 +47,12 @@ REXCVAR_DEFINE_DOUBLE(present_fsr3_generated_fps, 0.0, "UI/Presentation",
 REXCVAR_DEFINE_DOUBLE(present_host_fps, 0.0, "UI/Presentation",
                       "Read-only telemetry: real frames per second presented by the host "
                       "swap chain (excludes FSR3 generated frames)");
+REXCVAR_DEFINE_INT32(present_host_width, 0, "UI/Presentation",
+                     "Read-only telemetry: current host swap chain width in pixels, 0 before "
+                     "the first present");
+REXCVAR_DEFINE_INT32(present_host_height, 0, "UI/Presentation",
+                     "Read-only telemetry: current host swap chain height in pixels, 0 before "
+                     "the first present");
 
 namespace rex::ui::d3d12 {
 
@@ -1552,6 +1558,8 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // Publish the real (non-generated) present rate for FPS overlays (~4 times
   // per second). Statics are fine - painting happens on one thread at a time.
   if (SUCCEEDED(present_result)) {
+    REXCVAR_SET(present_host_width, int32_t(paint_context_.swap_chain_width));
+    REXCVAR_SET(present_host_height, int32_t(paint_context_.swap_chain_height));
     static std::chrono::steady_clock::time_point host_fps_sample_time;
     static uint32_t host_fps_present_count;
     ++host_fps_present_count;

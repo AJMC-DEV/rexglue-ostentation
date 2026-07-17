@@ -40,6 +40,13 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
                      "Vertical safe area percentage (0-100)")
     .range(0, 100);
 
+REXCVAR_DEFINE_INT32(present_guest_width, 0, "UI/Presenter",
+                     "Telemetry (read-only): current guest output width in pixels, after draw "
+                     "resolution scaling, 0 while the guest output is inactive");
+REXCVAR_DEFINE_INT32(present_guest_height, 0, "UI/Presenter",
+                     "Telemetry (read-only): current guest output height in pixels, after draw "
+                     "resolution scaling, 0 while the guest output is inactive");
+
 // present_effect, sharpness and quality-mode cvars are hot-reloadable: the
 // presenter re-reads them at the start of every UI-thread paint and applies
 // differences through SetGuestOutputPaintConfigFromUIThread.
@@ -561,6 +568,8 @@ bool Presenter::RefreshGuestOutput(
   writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
   writable_properties.is_8bpc = false;
   bool is_active = writable_properties.IsActive();
+  REXCVAR_SET(present_guest_width, is_active ? int32_t(frontbuffer_width) : 0);
+  REXCVAR_SET(present_guest_height, is_active ? int32_t(frontbuffer_height) : 0);
   if (is_active) {
     if (!RefreshGuestOutputImpl(guest_output_mailbox_writable_, frontbuffer_width,
                                 frontbuffer_height, refresher, writable_properties.is_8bpc)) {

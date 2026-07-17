@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <utility>
 
@@ -27,7 +28,27 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
     .allowed({"sdl", "xinput"});
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
+
+REXCVAR_DEFINE_DOUBLE(input_stat_poll_ms, 0.0, "Input",
+                      "Telemetry (read-only): smoothed milliseconds spent servicing a guest "
+                      "input state poll, for stat overlays");
+
 namespace rex::input {
+
+namespace {
+// Publishes the duration of the enclosing scope to input_stat_poll_ms as an
+// exponential moving average.
+struct PollTimeTelemetry {
+  std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+  ~PollTimeTelemetry() {
+    double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+            .count();
+    double smoothed = REXCVAR_GET(input_stat_poll_ms);
+    REXCVAR_SET(input_stat_poll_ms, smoothed + (ms - smoothed) * 0.05);
+  }
+};
+}  // namespace
 
 InputSystem::InputSystem(rex::ui::Window* window) : window_(window) {}
 
@@ -113,6 +134,7 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
 
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
+  PollTimeTelemetry poll_time_telemetry;
 
   bool any_connected = false;
   bool first_result = true;

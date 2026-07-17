@@ -86,11 +86,45 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
                     "pipelines are being prepared.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_DOUBLE(gpu_stat_frame_draws, 0.0, "GPU/Stats",
+                      "Telemetry (read-only): average guest draw calls per frame, sampled over "
+                      "~250 ms windows, for stat overlays");
+REXCVAR_DEFINE_DOUBLE(gpu_stat_frame_triangles, 0.0, "GPU/Stats",
+                      "Telemetry (read-only): average triangles submitted by the guest per "
+                      "frame, sampled over ~250 ms windows, for stat overlays");
+REXCVAR_DEFINE_DOUBLE(gpu_stat_cp_busy_ms, 0.0, "GPU/Stats",
+                      "Telemetry (read-only): average command processor (GPU worker thread) "
+                      "busy milliseconds per guest frame, for stat overlays");
+
 namespace rex::graphics {
 
 using namespace rex::graphics::xenos;
 
 namespace {
+
+// Triangles a guest draw rasterizes, for the gpu_stat_frame_triangles
+// telemetry. Point/line/2D-copy topologies contribute nothing.
+uint64_t GuestDrawTriangleCount(xenos::PrimitiveType prim_type, uint32_t index_count) {
+  switch (prim_type) {
+    case xenos::PrimitiveType::kTriangleList:
+      return index_count / 3;
+    case xenos::PrimitiveType::kTriangleFan:
+    case xenos::PrimitiveType::kTriangleStrip:
+    case xenos::PrimitiveType::kTriangleWithWFlags:
+    case xenos::PrimitiveType::kPolygon:
+    case xenos::PrimitiveType::k2DTriStrip:
+      return index_count >= 3 ? index_count - 2 : 0;
+    case xenos::PrimitiveType::kRectangleList:
+      // 3 vertices per rectangle, each expanded to 2 host triangles.
+      return (index_count / 3) * 2;
+    case xenos::PrimitiveType::kQuadList:
+      return (index_count / 4) * 2;
+    case xenos::PrimitiveType::kQuadStrip:
+      return index_count >= 4 ? (index_count - 2) & ~uint32_t(1) : 0;
+    default:
+      return 0;
+  }
+}
 
 ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
   if (value == "fast") {
@@ -301,6 +335,7 @@ void CommandProcessor::WorkerThreadMain() {
       // We've run out of commands to execute.
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
+      std::chrono::steady_clock::time_point stat_stall_begin = std::chrono::steady_clock::now();
       PrepareForWait();
       uint32_t loop_count = 0;
       do {
@@ -317,6 +352,7 @@ void CommandProcessor::WorkerThreadMain() {
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
+      stat_window_stall_ += std::chrono::steady_clock::now() - stat_stall_begin;
       if (!worker_running_ || !pending_fns_.empty()) {
         continue;
       }
@@ -1110,6 +1146,34 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
   ++counter_;
+
+  // Publish the per-frame stat telemetry (~4 times per second). The busy time
+  // is the wall time between swaps minus the ring buffer stall time, i.e. how
+  // long the worker thread actually spent processing guest commands.
+  ++stat_window_frames_;
+  std::chrono::steady_clock::time_point stat_now = std::chrono::steady_clock::now();
+  if (stat_window_start_.time_since_epoch().count() == 0) {
+    stat_window_start_ = stat_now;
+    stat_window_frames_ = 0;
+    stat_window_draws_ = 0;
+    stat_window_triangles_ = 0;
+    stat_window_stall_ = {};
+  } else {
+    double window_ms =
+        std::chrono::duration<double, std::milli>(stat_now - stat_window_start_).count();
+    if (window_ms >= 250.0 && stat_window_frames_) {
+      double stall_ms = std::chrono::duration<double, std::milli>(stat_window_stall_).count();
+      REXCVAR_SET(gpu_stat_frame_draws, double(stat_window_draws_) / stat_window_frames_);
+      REXCVAR_SET(gpu_stat_frame_triangles, double(stat_window_triangles_) / stat_window_frames_);
+      REXCVAR_SET(gpu_stat_cp_busy_ms,
+                  std::max(0.0, window_ms - stall_ms) / stat_window_frames_);
+      stat_window_start_ = stat_now;
+      stat_window_frames_ = 0;
+      stat_window_draws_ = 0;
+      stat_window_triangles_ = 0;
+      stat_window_stall_ = {};
+    }
+  }
   return true;
 }
 
@@ -1536,6 +1600,11 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
+      if (draw_succeeded) {
+        ++stat_window_draws_;
+        stat_window_triangles_ +=
+            GuestDrawTriangleCount(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices);
+      }
       if (!draw_succeeded) {
         auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
         auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();

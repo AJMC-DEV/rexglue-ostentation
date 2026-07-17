@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -357,6 +358,14 @@ class CommandProcessor {
   std::vector<uint32_t> me_bin_;
 
   uint32_t counter_ = 0;
+
+  // Stat telemetry accumulators (worker thread only), published to the
+  // gpu_stat_* cvars every ~250 ms at XE_SWAP.
+  uint32_t stat_window_frames_ = 0;
+  uint64_t stat_window_draws_ = 0;
+  uint64_t stat_window_triangles_ = 0;
+  std::chrono::steady_clock::duration stat_window_stall_{};
+  std::chrono::steady_clock::time_point stat_window_start_{};
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;
