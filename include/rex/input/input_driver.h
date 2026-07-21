@@ -46,6 +46,11 @@ class InputDriver {
   virtual void OnWindowAvailable(rex::ui::Window* /*window*/) {}
   virtual void OnInputModeChanged(InputMode /*mode*/, bool /*show_mouse_cursor*/) {}
 
+  // True when the driver's user_index addresses a physical pad slot, letting
+  // the input system point the guest's controller at whichever pad is actually
+  // being used. Emulated devices claim a fixed guest slot and opt out.
+  virtual bool UsesPadSlots() const { return true; }
+
   void set_is_active_callback(std::function<bool()> is_active_callback) {
     is_active_callback_ = is_active_callback;
   }

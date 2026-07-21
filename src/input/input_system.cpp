@@ -48,6 +48,31 @@ struct PollTimeTelemetry {
     REXCVAR_SET(input_stat_poll_ms, smoothed + (ms - smoothed) * 0.05);
   }
 };
+
+// Thresholds a pad has to clear before it is treated as "the player is using
+// this one" - loose enough for a light stick nudge, tight enough that a drifting
+// stick on an idle pad doesn't steal the guest controller.
+constexpr int kPadActivityStick = 12000;
+constexpr uint8_t kPadActivityTrigger = 64;
+
+// Scanning every poll would multiply driver calls by the slot count for no
+// benefit; a pad takeover this often still feels immediate.
+constexpr uint64_t kPadScanIntervalMs = 16;
+
+bool HasPadActivity(const X_INPUT_STATE& state) {
+  const auto& pad = state.gamepad;
+  if (static_cast<uint16_t>(pad.buttons)) {
+    return true;
+  }
+  if (pad.left_trigger > kPadActivityTrigger || pad.right_trigger > kPadActivityTrigger) {
+    return true;
+  }
+  auto deflected = [](int16_t axis) {
+    return std::abs(static_cast<int>(axis)) > kPadActivityStick;
+  };
+  return deflected(pad.thumb_lx) || deflected(pad.thumb_ly) || deflected(pad.thumb_rx) ||
+         deflected(pad.thumb_ry);
+}
 }  // namespace
 
 InputSystem::InputSystem(rex::ui::Window* window) : window_(window) {}
@@ -115,13 +140,77 @@ void InputSystem::NotifyInputModeChanged() {
   }
 }
 
+uint32_t InputSystem::ResolveDriverSlot(const InputDriver& driver, uint32_t user_index) const {
+  // Only the guest's first controller follows the player; higher guest slots
+  // (when a second profile is signed in) keep their own pad.
+  if (user_index != 0 || !driver.UsesPadSlots()) {
+    return user_index;
+  }
+  return active_pad_slot_.load(std::memory_order_relaxed);
+}
+
+void InputSystem::UpdateActivePadSlot() {
+  const uint64_t now_ms = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+  const uint64_t last_scan_ms = last_pad_scan_ms_.load(std::memory_order_relaxed);
+  if (now_ms - last_scan_ms < kPadScanIntervalMs) {
+    return;
+  }
+  last_pad_scan_ms_.store(now_ms, std::memory_order_relaxed);
+
+  const uint32_t active_slot = active_pad_slot_.load(std::memory_order_relaxed);
+
+  // Poll every pad slot once; a slot counts as connected if any pad driver
+  // answers for it.
+  bool connected[kMaxPadSlots] = {};
+  bool active[kMaxPadSlots] = {};
+  for (uint32_t slot = 0; slot < kMaxPadSlots; ++slot) {
+    for (auto& driver : drivers_) {
+      if (!driver->UsesPadSlots()) {
+        continue;
+      }
+      X_INPUT_STATE state = {};
+      if (driver->GetState(slot, &state) != X_ERROR_SUCCESS) {
+        continue;
+      }
+      connected[slot] = true;
+      active[slot] = active[slot] || HasPadActivity(state);
+    }
+  }
+
+  // Never pull the controller out from under a pad that is mid-input, or two
+  // people playing at once would fight over it every scan.
+  if (active[active_slot]) {
+    return;
+  }
+
+  for (uint32_t slot = 0; slot < kMaxPadSlots; ++slot) {
+    if (slot == active_slot || !active[slot]) {
+      continue;
+    }
+    active_pad_slot_.store(slot, std::memory_order_relaxed);
+    REXLOG_INFO("Input: pad slot {} is now driving the guest controller", slot);
+    return;
+  }
+
+  // The pad we were following went away - fall back so slot 0 works again
+  // without the player having to press anything on a dead pad.
+  if (active_slot != 0 && !connected[active_slot]) {
+    active_pad_slot_.store(0, std::memory_order_relaxed);
+    REXLOG_INFO("Input: pad slot {} disconnected, guest controller back on slot 0", active_slot);
+  }
+}
+
 X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
                                       X_INPUT_CAPABILITIES* out_caps) {
   SCOPE_profile_cpu_f("hid");
 
   bool any_connected = false;
   for (auto& driver : drivers_) {
-    X_RESULT result = driver->GetCapabilities(user_index, flags, out_caps);
+    X_RESULT result =
+        driver->GetCapabilities(ResolveDriverSlot(*driver, user_index), flags, out_caps);
     if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
       any_connected = true;
     }
@@ -136,13 +225,17 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
   PollTimeTelemetry poll_time_telemetry;
 
+  if (user_index == 0) {
+    UpdateActivePadSlot();
+  }
+
   bool any_connected = false;
   bool first_result = true;
   X_INPUT_STATE merged = {};
 
   for (auto& driver : drivers_) {
     X_INPUT_STATE state = {};
-    X_RESULT result = driver->GetState(user_index, &state);
+    X_RESULT result = driver->GetState(ResolveDriverSlot(*driver, user_index), &state);
     if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
       any_connected = true;
     }
@@ -190,7 +283,7 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
 
   bool any_connected = false;
   for (auto& driver : drivers_) {
-    X_RESULT result = driver->SetState(user_index, vibration);
+    X_RESULT result = driver->SetState(ResolveDriverSlot(*driver, user_index), vibration);
     if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
       any_connected = true;
     }
@@ -205,12 +298,21 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
                                    X_INPUT_KEYSTROKE* out_keystroke) {
   SCOPE_profile_cpu_f("hid");
 
+  if (user_index == 0) {
+    UpdateActivePadSlot();
+  }
+
   bool any_connected = false;
   bool saw_empty = false;
   X_RESULT first_error = X_ERROR_DEVICE_NOT_CONNECTED;
   for (auto& driver : drivers_) {
-    X_RESULT result = driver->GetKeystroke(user_index, flags, out_keystroke);
+    X_RESULT result =
+        driver->GetKeystroke(ResolveDriverSlot(*driver, user_index), flags, out_keystroke);
     if (result == X_ERROR_SUCCESS) {
+      // Drivers stamp the pad slot they read; the guest only knows its own.
+      if (out_keystroke) {
+        out_keystroke->user_index = static_cast<uint8_t>(user_index);
+      }
       return result;
     }
     if (result == X_ERROR_DEVICE_NOT_CONNECTED) {

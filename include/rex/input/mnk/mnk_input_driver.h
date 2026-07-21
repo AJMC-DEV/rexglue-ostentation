@@ -41,6 +41,10 @@ class MnkInputDriver final : public InputDriver,
   void OnWindowAvailable(rex::ui::Window* window) override;
   void OnInputModeChanged(InputMode mode, bool show_mouse_cursor) override;
 
+  // Keyboard/mouse sits on the fixed slot named by the mnk_user_index cvar, so
+  // it must not follow the active pad.
+  bool UsesPadSlots() const override { return false; }
+
   // WindowInputListener
   void OnKeyDown(rex::ui::KeyEvent& e) override;
   void OnKeyUp(rex::ui::KeyEvent& e) override;

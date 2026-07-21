@@ -27,6 +27,9 @@ class NopInputDriver final : public InputDriver {
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) override;
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
                         X_INPUT_KEYSTROKE* out_keystroke) override;
+
+  // Answers for guest slot 0 only; there is no physical pad to follow.
+  bool UsesPadSlots() const override { return false; }
 };
 
 }  // namespace rex::input::nop

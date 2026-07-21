@@ -25,6 +25,7 @@ namespace rex {
 namespace kernel {
 namespace xam {
 using namespace rex::system;
+using rex::system::xam::XUserMaxUserCount;
 
 using rex::input::X_INPUT_CAPABILITIES;
 using rex::input::X_INPUT_KEYSTROKE;
@@ -36,6 +37,17 @@ constexpr uint32_t XINPUT_FLAG_ANY_USER = 1 << 30;
 
 rex::input::InputSystem* input_system() {
   return static_cast<rex::input::InputSystem*>(REX_KERNEL_STATE()->emulator()->input_system());
+}
+
+// A guest controller slot only exists if a profile is signed in to it. Without
+// this the host's second pad shows up on slot 1 with no profile behind it, and
+// titles that pair pads to profiles ask the player to sign in.
+bool IsUserSignedIn(uint32_t user_index) {
+  if (user_index >= ::rex::system::xam::XUserMaxUserCount) {
+    return false;
+  }
+  return REX_KERNEL_STATE()->profile_manager()->GetProfile(
+             static_cast<uint8_t>(user_index)) != nullptr;
 }
 
 void XamResetInactivity_entry() {
@@ -65,6 +77,10 @@ u32 XamInputGetCapabilities_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_C
     actual_user_index = 0;
   }
 
+  if (!IsUserSignedIn(actual_user_index)) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+
   auto* is = input_system();
   return is->GetCapabilities(actual_user_index, flags, caps);
 }
@@ -84,6 +100,10 @@ u32 XamInputGetCapabilitiesEx_entry(u32 unk, u32 user_index, u32 flags,
   if ((actual_user_index & 0xFF) == 0xFF || (flags & XINPUT_FLAG_ANY_USER)) {
     // Always pin user to 0.
     actual_user_index = 0;
+  }
+
+  if (!IsUserSignedIn(actual_user_index)) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
   (void)unk;  // Unused in this implementation
@@ -111,6 +131,10 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
     actual_user_index = 0;
   }
 
+  if (!IsUserSignedIn(actual_user_index)) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+
   auto* is = input_system();
   return is->GetState(actual_user_index, input_state);
 }
@@ -125,6 +149,10 @@ u32 XamInputSetState_entry(u32 user_index, u32 unk, ppc_ptr_t<X_INPUT_VIBRATION>
   if ((user_index & 0xFF) == 0xFF) {
     // Always pin user to 0.
     actual_user_index = 0;
+  }
+
+  if (!IsUserSignedIn(actual_user_index)) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
   (void)unk;  // Unused in this implementation
@@ -153,6 +181,10 @@ u32 XamInputGetKeystroke_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_KEYS
     actual_user_index = 0;
   }
 
+  if (!IsUserSignedIn(actual_user_index)) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+
   auto* is = input_system();
   return is->GetKeystroke(actual_user_index, flags, keystroke);
 }
@@ -173,6 +205,10 @@ u32 XamInputGetKeystrokeEx_entry(mapped_u32 user_index_ptr, u32 flags,
   if ((user_index & 0xFF) == 0xFF || (flags & XINPUT_FLAG_ANY_USER)) {
     // Always pin user to 0.
     user_index = 0;
+  }
+
+  if (!IsUserSignedIn(user_index)) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
   auto* is = input_system();
