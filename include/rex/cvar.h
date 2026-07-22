@@ -124,6 +124,11 @@ void FinalizeInit();
 bool IsFinalized();
 void SaveConfig(const std::filesystem::path& config_path);
 
+/// Path most recently passed to LoadConfig/SaveConfig, so runtime UI that
+/// mutates cvars can persist without having the path plumbed through to it.
+/// Empty when no config file has been loaded.
+const std::filesystem::path& GetConfigPath();
+
 //=============================================================================
 // Flag Registry
 //=============================================================================

@@ -15,6 +15,12 @@
 
 #include <rex/kernel/xam/apps/xlivebase_app.h>
 
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
 #include <fmt/format.h>
 
 #include <rex/cvar.h>
@@ -23,6 +29,7 @@
 #include <rex/system/xam/account_info.h>
 #include <rex/system/xam/profile_manager.h>
 #include <rex/system/xenumerator.h>
+#include <rex/system/xlive_web_client.h>
 #include <rex/thread.h>
 
 REXCVAR_DECLARE(bool, xlive_web_enabled);
@@ -39,20 +46,72 @@ XLiveBaseApp::XLiveBaseApp(KernelState* kernel_state) : App(kernel_state, 0xFC) 
 
 namespace {
 
-// Empty friends list enumerator: correct item size, zero items.
+bool HexToBytes(const std::string& hex, uint8_t* out, size_t out_len) {
+  if (hex.size() < out_len * 2) return false;
+  for (size_t i = 0; i < out_len; ++i) {
+    unsigned int byte = 0;
+    if (std::sscanf(hex.c_str() + i * 2, "%02x", &byte) != 1) return false;
+    out[i] = static_cast<uint8_t>(byte);
+  }
+  return true;
+}
+
+// Friends list enumerator. Pages through the entries the title asked for,
+// matching XStaticUntypedEnumerator's contract: hand out at most
+// items_per_enumerate() per call and report NO_MORE_FILES once drained.
 class XStaticFriendsEnumerator : public XEnumerator {
  public:
   XStaticFriendsEnumerator(KernelState* kernel_state, size_t items_per_enumerate)
       : XEnumerator(kernel_state, items_per_enumerate, sizeof(X_ONLINE_FRIEND)) {}
 
+  void AppendItem(const X_ONLINE_FRIEND& item) { items_.push_back(item); }
+  size_t item_count() const { return items_.size(); }
+
   uint32_t WriteItems(uint32_t buffer_ptr, uint8_t* buffer_data,
                       uint32_t* written_count) override {
-    if (written_count) {
-      *written_count = 0;
+    const size_t count =
+        std::min(items_.size() - current_item_, items_per_enumerate());
+    if (!count) {
+      if (written_count) *written_count = 0;
+      return X_ERROR_NO_MORE_FILES;
     }
-    return X_ERROR_NO_MORE_FILES;
+    std::memcpy(buffer_data, &items_[current_item_],
+                count * sizeof(X_ONLINE_FRIEND));
+    current_item_ += count;
+    if (written_count) *written_count = static_cast<uint32_t>(count);
+    return X_ERROR_SUCCESS;
   }
+
+ private:
+  std::vector<X_ONLINE_FRIEND> items_;
+  size_t current_item_ = 0;
 };
+
+// Builds one X_ONLINE_FRIEND. Presence is optional: a friend the backend has
+// never seen still has to appear in the list, just offline.
+X_ONLINE_FRIEND MakeFriend(uint64_t xuid, const rex::system::PlayerPresence* p) {
+  X_ONLINE_FRIEND f{};
+  f.xuid = xuid;
+
+  // Titles display Gamertag directly; fall back to the XUID so an unknown
+  // friend still renders as something identifiable rather than blank.
+  const std::string tag =
+      (p && !p->gamertag.empty()) ? p->gamertag : fmt::format("{:016X}", xuid);
+  std::snprintf(f.Gamertag, sizeof(f.Gamertag), "%s", tag.c_str());
+
+  if (p) {
+    // Backend StateFlag bits line up 1:1 with X_ONLINE_FRIENDSTATE_FLAG_*.
+    f.state = p->state | X_ONLINE_FRIENDSTATE_ENUM_CONSOLE_XBOX360;
+    f.title_id = p->title_id;
+    // The session id doubles as the XNKID a title uses to join this friend.
+    if (p->session_id.size() == 16) {
+      HexToBytes(p->session_id, f.session_id, sizeof(f.session_id));
+    }
+  } else {
+    f.state = X_ONLINE_FRIENDSTATE_FLAG_NONE;
+  }
+  return f;
+}
 
 }  // namespace
 
@@ -213,14 +272,48 @@ X_HRESULT XLiveBaseApp::XFriendsCreateEnumerator(uint32_t buffer_ptr,
     return result;
   }
 
+  // Friends come from the friends_xuids cvar (the netplay overlay writes it).
+  // The window the title asked for is [starting_index, +amount).
+  const std::vector<uint64_t> all = rex::system::ParseFriendsXuids();
+  std::vector<uint64_t> window;
+  for (size_t i = friends_starting_index;
+       i < all.size() && window.size() < friends_amount; ++i) {
+    window.push_back(all[i]);
+  }
+
+  // One presence round-trip for the whole window. A failure here is not fatal:
+  // the list still enumerates, just with everyone offline.
+  std::vector<rex::system::PlayerPresence> presence;
+  if (!window.empty() && REXCVAR_GET(xlive_web_enabled)) {
+    auto& wc = rex::system::XLiveWebClient::Get();
+    wc.EnsureReady();
+    if (!wc.GetPlayersPresence(window, presence)) {
+      REXKRNL_WARN("XFriendsCreateEnumerator: presence lookup failed");
+    }
+  }
+
+  for (uint64_t xuid : window) {
+    const rex::system::PlayerPresence* match = nullptr;
+    for (const auto& p : presence) {
+      if (p.xuid == xuid) {
+        match = &p;
+        break;
+      }
+    }
+    e->AppendItem(MakeFriend(xuid, match));
+  }
+
   const uint32_t friends_buffer_size =
       static_cast<uint32_t>(e->items_per_enumerate() * e->item_size());
 
   *buffer_size_ptr = friends_buffer_size;
   *handle_ptr = e->handle();
 
-  REXKRNL_DEBUG("XFriendsCreateEnumerator: user={} count={} -> empty list",
-                user_index, friends_amount);
+  REXKRNL_DEBUG(
+      "XFriendsCreateEnumerator: user={} start={} count={} -> {} friend(s), "
+      "{} with presence",
+      user_index, friends_starting_index, friends_amount, e->item_count(),
+      presence.size());
   return X_E_SUCCESS;
 }
 

@@ -7,9 +7,12 @@
  */
 #include <rex/ui/overlay/netplay_overlay.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <string>
 #include <vector>
 
 #include <fmt/format.h>
@@ -24,8 +27,32 @@
 #include <rex/system/xlive_web_client.h>
 
 REXCVAR_DECLARE(bool, xlive_web_enabled);
+REXCVAR_DECLARE(std::string, friends_xuids);
 
 namespace rex::ui {
+
+namespace {
+
+// Friends storage lives in the system layer (friends_xuids cvar) so the
+// XLiveBase friends enumerator reads the same list this tab edits.
+using rex::system::kMaxFriends;
+using rex::system::ParseFriendsXuids;
+using rex::system::SaveFriendsXuids;
+
+// "Copy" button that puts a bare 16-hex-digit XUID on the clipboard in the
+// same format the friend input expects, so an XUID can be moved between two
+// instances (or handed to another player) without retyping it.
+void CopyXuidButton(const char* id, uint64_t xuid, std::string* status) {
+  ImGui::PushID(id);
+  if (ImGui::SmallButton("Copy")) {
+    const std::string text = fmt::format("{:016X}", xuid);
+    ImGui::SetClipboardText(text.c_str());
+    if (status) *status = fmt::format("Copied {}", text);
+  }
+  ImGui::PopID();
+}
+
+}  // namespace
 
 using rex::system::XLiveWebClient;
 using rex::system::xam::ProfileManager;
@@ -178,8 +205,13 @@ void NetplayOverlayDialog::DrawProfileTab() {
 
   ImGui::Text("XUID (offline): %016llX",
               static_cast<unsigned long long>(profile->xuid()));
+  ImGui::SameLine();
+  CopyXuidButton("offlinexuid", profile->xuid(), &last_status_);
+
   ImGui::Text("XUID (online):  %016llX",
               static_cast<unsigned long long>(profile->GetOnlineXUID()));
+  ImGui::SameLine();
+  CopyXuidButton("onlinexuid", profile->GetOnlineXUID(), &last_status_);
   ImGui::SameLine();
   if (ImGui::SmallButton("Regenerate##onlinexuid")) {
     if (pm->RegenerateOnlineXUID(profile->xuid())) {
@@ -257,23 +289,68 @@ void NetplayOverlayDialog::DrawProfileTab() {
 }
 
 void NetplayOverlayDialog::DrawFriendsTab() {
+  // The dialog is recreated each time the overlay opens, so the list has to be
+  // rehydrated from the config rather than kept in the member across opens.
+  if (!friends_loaded_) {
+    friends_ = ParseFriendsXuids();
+    friends_loaded_ = true;
+  }
+
   ImGui::TextWrapped(
-      "Friends are session-local. The web service does not expose a friends "
-      "API yet, so entries here are not persisted or synced.");
+      "Friends are stored in the config file (friends_xuids) and persist "
+      "across restarts. The web service exposes no friends API, so this list "
+      "is local to this machine and is not synced with other players. The "
+      "title's own friends list stays empty until the friends enumerator is "
+      "implemented.");
   ImGui::Spacing();
 
-  ImGui::InputText("XUID (hex)##friend", friend_xuid_buf_,
-                   sizeof(friend_xuid_buf_),
+  ImGui::InputText("##friendxuid", friend_xuid_buf_, sizeof(friend_xuid_buf_),
                    ImGuiInputTextFlags_CharsHexadecimal);
   ImGui::SameLine();
+  if (ImGui::Button("Paste")) {
+    const char* clip = ImGui::GetClipboardText();
+    if (clip && *clip) {
+      // Keep only hex digits: tolerates a pasted "0x" prefix, surrounding
+      // whitespace, or a copied line that includes a label.
+      std::string filtered;
+      for (const char* p = clip; *p && filtered.size() < 16; ++p) {
+        if (std::isxdigit(static_cast<unsigned char>(*p))) filtered += *p;
+      }
+      if (filtered.empty()) {
+        last_status_ = "Clipboard has no hex digits";
+      } else {
+        std::snprintf(friend_xuid_buf_, sizeof(friend_xuid_buf_), "%s",
+                      filtered.c_str());
+        last_status_ = fmt::format("Pasted {}", filtered);
+      }
+    } else {
+      last_status_ = "Clipboard is empty";
+    }
+  }
+  ImGui::SameLine();
+  ImGui::TextUnformatted("XUID (hex)");
+
   if (ImGui::Button("Add friend")) {
     try {
       uint64_t xuid = std::stoull(friend_xuid_buf_, nullptr, 16);
-      if (xuid) {
+      auto* profile = PrimaryProfile();
+      if (!xuid) {
+        last_status_ = "Enter a non-zero XUID";
+      } else if (friends_.size() >= kMaxFriends) {
+        last_status_ = fmt::format("Friends list is full ({})", kMaxFriends);
+      } else if (profile && xuid == profile->GetOnlineXUID()) {
+        last_status_ = "That is your own XUID";
+      } else if (std::find(friends_.begin(), friends_.end(), xuid) !=
+                 friends_.end()) {
+        last_status_ = "Already in the list";
+      } else {
         friends_.push_back(xuid);
+        SaveFriendsXuids(friends_);
         friend_xuid_buf_[0] = '\0';
+        last_status_ = fmt::format("Added {:016X}", xuid);
       }
     } catch (...) {
+      last_status_ = "Could not parse that XUID";
     }
   }
 
@@ -286,13 +363,21 @@ void NetplayOverlayDialog::DrawFriendsTab() {
       ImGui::Text("%016llX", static_cast<unsigned long long>(friends_[i]));
       ImGui::SameLine();
       ImGui::PushID(static_cast<int>(i));
+      CopyXuidButton("copyfriend", friends_[i], &last_status_);
+      ImGui::SameLine();
       if (ImGui::SmallButton("Remove")) {
         friends_.erase(friends_.begin() + i);
+        SaveFriendsXuids(friends_);
         ImGui::PopID();
         break;
       }
       ImGui::PopID();
     }
+  }
+
+  if (!last_status_.empty()) {
+    ImGui::Spacing();
+    ImGui::TextUnformatted(last_status_.c_str());
   }
 }
 

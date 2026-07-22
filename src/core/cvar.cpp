@@ -629,7 +629,19 @@ std::vector<std::string> Init(int argc, char** argv) {
   return positional;
 }
 
+namespace {
+// Remembered so runtime UI that mutates cvars can persist them without the
+// path being plumbed through every dialog constructor.
+std::filesystem::path& ConfigPathStorage() {
+  static std::filesystem::path path;
+  return path;
+}
+}  // namespace
+
+const std::filesystem::path& GetConfigPath() { return ConfigPathStorage(); }
+
 void LoadConfig(const std::filesystem::path& config_path) {
+  ConfigPathStorage() = config_path;
   if (!std::filesystem::exists(config_path)) {
     REXLOG_DEBUG("Config file not found: {}", config_path.string());
     return;

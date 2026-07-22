@@ -30,6 +30,7 @@ REXCVAR_DECLARE(std::string, user_gamertag);
 REXCVAR_DECLARE(std::string, user_xuid);
 REXCVAR_DECLARE(int32_t,     systemlink_port_offset);
 REXCVAR_DECLARE(std::string, lan_ip);
+REXCVAR_DECLARE(std::string, friends_xuids);
 
 #if REX_PLATFORM_WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -677,6 +678,89 @@ bool XLiveWebClient::RegisterPlayer(uint64_t xuid, const std::string& gamertag,
               fmt::format("{:016X}", xuid));
   }
   return ok;
+}
+
+std::vector<uint64_t> ParseFriendsXuids() {
+  std::vector<uint64_t> out;
+  const std::string& csv = REXCVAR_GET(friends_xuids);
+  size_t start = 0;
+  while (start <= csv.size() && out.size() < kMaxFriends) {
+    size_t comma = csv.find(',', start);
+    if (comma == std::string::npos) comma = csv.size();
+    std::string token = csv.substr(start, comma - start);
+    // Trim so a hand-edited config still parses.
+    size_t b = token.find_first_not_of(" \t");
+    size_t e = token.find_last_not_of(" \t");
+    if (b != std::string::npos) {
+      token = token.substr(b, e - b + 1);
+      try {
+        uint64_t xuid = std::stoull(token, nullptr, 16);
+        if (xuid) out.push_back(xuid);
+      } catch (...) {
+        XLIVE_ERR("friends_xuids: ignoring unparseable entry '{}'", token);
+      }
+    }
+    if (comma == csv.size()) break;
+    start = comma + 1;
+  }
+  return out;
+}
+
+void SaveFriendsXuids(const std::vector<uint64_t>& xuids) {
+  std::string csv;
+  for (size_t i = 0; i < xuids.size() && i < kMaxFriends; ++i) {
+    if (i) csv += ",";
+    csv += fmt::format("{:016X}", xuids[i]);
+  }
+  REXCVAR_SET(friends_xuids, csv);
+
+  const auto& path = rex::cvar::GetConfigPath();
+  if (path.empty()) {
+    XLIVE_ERR("friends_xuids: no config path known, list is session-only");
+    return;
+  }
+  rex::cvar::SaveConfig(path);
+}
+
+bool XLiveWebClient::GetPlayersPresence(const std::vector<uint64_t>& xuids,
+                                        std::vector<PlayerPresence>& out) {
+  if (xuids.empty()) return true;
+
+  std::string arr;
+  for (size_t i = 0; i < xuids.size(); ++i) {
+    if (i) arr += ",";
+    arr += fmt::format("\"{:016X}\"", xuids[i]);
+  }
+  std::string payload = "{\"xuids\":[" + arr + "]}";
+
+  std::string resp;
+  if (!HttpPost("/players/presence", payload, resp)) return false;
+
+  // Response is a bare JSON array of presence objects.
+  auto objs = json::GetArray("{\"s\":" + resp + "}", "s");
+  for (const auto& obj : objs) {
+    PlayerPresence p;
+    std::string xuid_str = json::GetString(obj, "xuid");
+    if (xuid_str.empty()) continue;
+    try {
+      p.xuid = std::stoull(xuid_str, nullptr, 16);
+    } catch (...) {
+      continue;
+    }
+    p.gamertag      = json::GetString(obj, "gamertag");
+    p.state         = json::GetUInt32(obj, "state");
+    p.session_id    = json::GetString(obj, "sessionId");
+    p.rich_presence = json::GetString(obj, "richPresence");
+    // titleId comes back as a hex string, not a number.
+    std::string title_str = json::GetString(obj, "titleId");
+    if (!title_str.empty()) {
+      try { p.title_id = static_cast<uint32_t>(std::stoul(title_str, nullptr, 16)); }
+      catch (...) {}
+    }
+    out.push_back(std::move(p));
+  }
+  XLIVE_LOG("GetPlayersPresence: asked {} -> {} known", xuids.size(), out.size());
+  return true;
 }
 
 bool XLiveWebClient::CreateSession(uint32_t title_id, const WebSession& info,

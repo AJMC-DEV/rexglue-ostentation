@@ -58,6 +58,32 @@ struct WebSession {
 };
 
 // ---------------------------------------------------------------------------
+// Friends list
+// ---------------------------------------------------------------------------
+// Friends live in the friends_xuids cvar as a comma-delimited list of
+// 16-hex-digit online XUIDs (same format as xenia netplay's cvar of the same
+// name). Shared here because both the netplay overlay and the XLiveBase
+// friends enumerator need to agree on it.
+constexpr size_t kMaxFriends = 100;
+
+std::vector<uint64_t> ParseFriendsXuids();
+
+/// Writes the list back to the cvar and persists it to the loaded config file.
+void SaveFriendsXuids(const std::vector<uint64_t>& xuids);
+
+// ---------------------------------------------------------------------------
+// Player presence returned by /players/presence
+// ---------------------------------------------------------------------------
+struct PlayerPresence {
+  uint64_t    xuid  = 0;
+  std::string gamertag;
+  uint32_t    state = 0;   ///< Backend StateFlag bits (ONLINE/JOINABLE/PLAYING)
+  std::string session_id;  ///< Session the player is in, "" when not in one
+  uint32_t    title_id = 0;
+  std::string rich_presence;
+};
+
+// ---------------------------------------------------------------------------
 // XLiveWebClient
 // ---------------------------------------------------------------------------
 class XLiveWebClient {
@@ -101,6 +127,12 @@ class XLiveWebClient {
   // -------------------------------------------------------------------------
   bool RegisterPlayer(uint64_t xuid, const std::string& gamertag,
                       const std::string& machine_id);
+
+  /// Look up presence for a set of players (POST /players/presence). Players
+  /// the backend has never seen are simply absent from the result, so the
+  /// caller must treat a missing entry as "offline" rather than an error.
+  bool GetPlayersPresence(const std::vector<uint64_t>& xuids,
+                          std::vector<PlayerPresence>& out);
 
   // -------------------------------------------------------------------------
   // Sessions

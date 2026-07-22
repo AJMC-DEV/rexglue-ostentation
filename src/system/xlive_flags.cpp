@@ -16,6 +16,10 @@ REXCVAR_DEFINE_STRING(user_xuid, "", "XLive",
                       "Leave empty to derive from gamertag + machine ID.")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_STRING(friends_xuids, "", "XLive",
+                      "Comma-delimited list of friend online XUIDs in hex. "
+                      "Written by the netplay overlay's friends tab.");
+
 // ---------------------------------------------------------------------------
 // Web client
 // ---------------------------------------------------------------------------

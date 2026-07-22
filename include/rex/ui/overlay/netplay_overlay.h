@@ -36,10 +36,13 @@ class NetplayOverlayDialog : public ImGuiDialog {
   char gamerpic_path_buf_[512] = {};
   bool loaded_from_profile_ = false;
 
-  // Friends list (add-by-XUID). Stored per session; there is no friends
-  // backend in the web client yet.
+  // Friends list (add-by-XUID). Persisted in the config file via the
+  // friends_xuids cvar; there is no friends backend in the web client, so the
+  // list is local to this machine. Loaded lazily because the dialog is
+  // recreated every time the overlay opens.
   char friend_xuid_buf_[32] = {};
   std::vector<uint64_t> friends_;
+  bool friends_loaded_ = false;
 
   std::string last_status_;
   double last_refresh_time_ = 0.0;

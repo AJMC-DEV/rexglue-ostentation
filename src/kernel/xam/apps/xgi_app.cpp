@@ -370,6 +370,66 @@ static uint32_t WriteSearchResults(memory::Memory* mem, KernelState* kernel_stat
   return out_index;
 }
 
+// Resolves explicit session IDs (XNKIDs) into search results. This is how a
+// title joins from a friends list: it holds only the friend's session id and
+// needs the host's XNADDR/XNKEY/port to build a client session. Returning
+// success with an empty results buffer is what makes a title report a generic
+// "connection problem" — the join never gets an address to reach.
+static X_RESULT ResolveSessionsById(memory::Memory* mem,
+                                    KernelState* kernel_state, const char* tag,
+                                    const std::vector<std::string>& id_hexes,
+                                    uint32_t results_buffer_size,
+                                    uint32_t search_results_ptr) {
+  if (!search_results_ptr) {
+    return X_E_SUCCESS;
+  }
+  auto* out = mem->TranslateVirtual(search_results_ptr);
+  if (!out) {
+    REXKRNL_WARN("{}: search_results_ptr {:08X} unmapped", tag, search_results_ptr);
+    return X_E_SUCCESS;
+  }
+
+  constexpr uint32_t kResultSize = 92;
+  constexpr uint32_t kHeaderSize = 0x0C;
+  uint32_t max_results = static_cast<uint32_t>(id_hexes.size());
+  if (results_buffer_size >= kHeaderSize) {
+    const uint32_t by_buf = (results_buffer_size - kHeaderSize) / kResultSize;
+    if (by_buf < max_results) max_results = by_buf;
+  }
+
+  if (!REXCVAR_GET(xlive_web_enabled) || id_hexes.empty()) {
+    memory::store_and_swap<uint32_t>(out + 0, 0);
+    memory::store_and_swap<uint32_t>(out + 4, 0);
+    memory::store_and_swap<uint32_t>(out + 8, 0);
+    return X_E_SUCCESS;
+  }
+
+  auto& wc = system::XLiveWebClient::Get();
+  wc.EnsureReady();
+
+  std::vector<system::WebSession> sessions;
+  for (const auto& id_hex : id_hexes) {
+    // An all-zero XNKID means "no session" (a friend who isn't hosting).
+    if (id_hex.find_first_not_of('0') == std::string::npos) {
+      REXKRNL_INFO("{}: skipping null session id", tag);
+      continue;
+    }
+    system::WebSession ws;
+    if (wc.FetchSession(kernel_state->title_id(), id_hex, ws)) {
+      sessions.push_back(std::move(ws));
+    } else {
+      REXKRNL_WARN("{}: session {} not found on backend", tag, id_hex);
+    }
+  }
+
+  const uint32_t written =
+      WriteSearchResults(mem, kernel_state, tag, sessions, out,
+                         search_results_ptr, max_results, 0, 0, 0, 0);
+  REXKRNL_INFO("{}: resolved {}/{} session(s), wrote {}", tag, sessions.size(),
+               id_hexes.size(), written);
+  return X_E_SUCCESS;
+}
+
 // --- Host-advertised session attributes -----------------------------------
 // The game sets matchmaking contexts/properties via XGIUserSetContextEx /
 // XGIUserSetPropertyEx before hosting. We capture them here and, on session
@@ -1034,22 +1094,24 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B001B: {
-      assert_true(!buffer_length || buffer_length == 32);
+      // XSessionSearchByID — XGI_SESSION_SEARCH_BYID is 0x14, NOT the 0x20
+      // ByIds layout: the XNKID sits inline at +4, so the two are not
+      // interchangeable.
+      assert_true(!buffer_length || buffer_length == 20);
 
       uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t num_session_ids = memory::load_and_swap<uint32_t>(buffer + 4);
-      uint32_t session_ids_ptr = memory::load_and_swap<uint32_t>(buffer + 8);
+      uint8_t session_id[8] = {};
+      std::memcpy(session_id, buffer + 4, sizeof(session_id));
       uint32_t results_buffer_size = memory::load_and_swap<uint32_t>(buffer + 12);
       uint32_t search_results_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
-      uint32_t reserved1 = memory::load_and_swap<uint32_t>(buffer + 20);
-      uint32_t reserved2 = memory::load_and_swap<uint32_t>(buffer + 24);
-      uint32_t reserved3 = memory::load_and_swap<uint32_t>(buffer + 28);
 
-      REXKRNL_DEBUG("XSessionSearchByID({}, {:08X}, {:08X}, {:08X}, {:08X}, {}, {}, {})",
-                    user_index, num_session_ids, session_ids_ptr, results_buffer_size,
-                    search_results_ptr, reserved1, reserved2, reserved3);
+      const std::string id_hex = ToHex(session_id, sizeof(session_id));
+      REXKRNL_INFO("XSessionSearchByID(user={}, id={}, buf_size={}, results={:08X})",
+                   user_index, id_hex, results_buffer_size, search_results_ptr);
 
-      return X_E_SUCCESS;
+      return ResolveSessionsById(memory_, kernel_state_, "XSessionSearchByID",
+                                 {id_hex}, results_buffer_size,
+                                 search_results_ptr);
     }
     case 0x000B001F: {
       assert_true(!buffer_length || buffer_length == 24);
@@ -1166,11 +1228,24 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t reserved2 = memory::load_and_swap<uint32_t>(buffer + 24);
       uint32_t reserved3 = memory::load_and_swap<uint32_t>(buffer + 28);
 
-      REXKRNL_DEBUG("XSessionSearchByIds({:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {}, {}, {})",
-                    user_index, num_session_ids, session_ids_ptr, results_buffer_size,
-                    search_results_ptr, reserved1, reserved2, reserved3);
+      REXKRNL_INFO("XSessionSearchByIds({:08X}, {}, {:08X}, {:08X}, {:08X}, {}, {}, {})",
+                   user_index, num_session_ids, session_ids_ptr, results_buffer_size,
+                   search_results_ptr, reserved1, reserved2, reserved3);
 
-      return X_E_SUCCESS;
+      // session_ids_ptr is an array of XNKIDs (8 raw bytes each).
+      std::vector<std::string> ids;
+      if (session_ids_ptr) {
+        auto* ids_base = memory_->TranslateVirtual(session_ids_ptr);
+        if (ids_base) {
+          auto* ids_bytes = static_cast<const uint8_t*>(static_cast<void*>(ids_base));
+          for (uint32_t i = 0; i < num_session_ids; ++i) {
+            ids.push_back(ToHex(ids_bytes + i * 8, 8));
+          }
+        }
+      }
+
+      return ResolveSessionsById(memory_, kernel_state_, "XSessionSearchByIds",
+                                 ids, results_buffer_size, search_results_ptr);
     }
     case 0x000B0065: {
       assert_true(!buffer_length || buffer_length == 52);
