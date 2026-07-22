@@ -1227,7 +1227,7 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
       if (REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
         break;
       }
-      REXGPU_WARN(
+      REXGPU_TRACE(
           "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
           "has \"invalid\" type! This is incorrect behavior, but you can try "
           "bypassing this by launching Xenia with "
@@ -1235,7 +1235,7 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
           fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
       return;
     default:
-      REXGPU_WARN(
+      REXGPU_TRACE(
           "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
           "is completely invalid!",
           fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
