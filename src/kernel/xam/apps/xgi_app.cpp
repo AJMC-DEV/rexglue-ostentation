@@ -746,16 +746,87 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_STATUS_SUCCESS;
     }
     case 0x000B0012: {
+      // XSessionJoin. One opcode serves both variants, distinguished by
+      // xuid_array_ptr: null => local users joining (indices_array holds user
+      // indices), non-null => remote members (xuid_array holds online XUIDs).
+      // Mirrors xenia XSession::JoinSession.
       assert_true(!buffer_length || buffer_length == 20);
-      uint32_t session_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t user_count = memory::load_and_swap<uint32_t>(buffer + 4);
-      uint32_t unk_0 = memory::load_and_swap<uint32_t>(buffer + 8);
-      uint32_t user_index_array = memory::load_and_swap<uint32_t>(buffer + 12);
-      uint32_t private_slots_array = memory::load_and_swap<uint32_t>(buffer + 16);
+      uint32_t session_ptr        = memory::load_and_swap<uint32_t>(buffer + 0);
+      uint32_t array_count        = memory::load_and_swap<uint32_t>(buffer + 4);
+      uint32_t xuid_array_ptr     = memory::load_and_swap<uint32_t>(buffer + 8);
+      uint32_t indices_array_ptr  = memory::load_and_swap<uint32_t>(buffer + 12);
+      uint32_t private_slots_ptr  = memory::load_and_swap<uint32_t>(buffer + 16);
 
-      assert_zero(unk_0);
-      REXKRNL_INFO("XGISessionJoinLocal({:08X}, {}, {}, {:08X}, {:08X})", session_ptr, user_count,
-                   unk_0, user_index_array, private_slots_array);
+      const bool join_local = (xuid_array_ptr == 0);
+      REXKRNL_INFO("{}({:08X}, {}, {:08X}, {:08X}, {:08X})",
+                   join_local ? "XGISessionJoinLocal" : "XGISessionJoinRemote",
+                   session_ptr, array_count, xuid_array_ptr, indices_array_ptr,
+                   private_slots_ptr);
+
+      if (!REXCVAR_GET(xlive_web_enabled)) {
+        return X_E_SUCCESS;
+      }
+
+      std::vector<uint64_t> xuids;
+      std::vector<bool> private_slots;
+      for (uint32_t i = 0; i < array_count; ++i) {
+        uint64_t xuid = 0;
+        if (join_local) {
+          // The guest names a local user index; resolve it to that profile's
+          // online XUID, which is the identity the backend knows us by.
+          uint32_t user_index = 0;
+          if (indices_array_ptr) {
+            user_index = memory::load_and_swap<uint32_t>(
+                memory_->TranslateVirtual(indices_array_ptr + i * 4));
+          }
+          auto* profile = kernel_state_->profile_manager()->GetProfile(
+              static_cast<uint8_t>(user_index));
+          if (!profile) {
+            REXKRNL_WARN("XSessionJoin: no profile at user index {}", user_index);
+            continue;
+          }
+          xuid = profile->GetOnlineXUID();
+        } else {
+          xuid = memory::load_and_swap<uint64_t>(
+              memory_->TranslateVirtual(xuid_array_ptr + i * 8));
+        }
+        if (!xuid) continue;
+
+        bool is_private = false;
+        if (private_slots_ptr) {
+          is_private = memory::load_and_swap<uint32_t>(
+                           memory_->TranslateVirtual(private_slots_ptr + i * 4)) != 0;
+        }
+        xuids.push_back(xuid);
+        private_slots.push_back(is_private);
+        REXKRNL_INFO("XSessionJoin: XUID {:016X} occupying {} slot", xuid,
+                     is_private ? "private" : "public");
+      }
+
+      if (xuids.empty()) {
+        return X_E_SUCCESS;
+      }
+
+      auto& session = system::GetActiveSession();
+      // The backend keys sessions by the host's XNKID, which the client-join
+      // path already holds even though it never received a web session id.
+      std::string web_id = session.web_session_id();
+      if (web_id.empty()) web_id = ToHex(session.session_id().ab, 8);
+      const bool is_host = session.is_host();
+      uint32_t title_id = kernel_state_->title_id();
+
+      // Detached: these are synchronous HTTP posts and the guest thread is
+      // mid-join. Host publishes the member set, joiners announce themselves.
+      std::thread([title_id, web_id, is_host, xuids, private_slots]() {
+        auto& wc = system::XLiveWebClient::Get();
+        wc.EnsureReady();
+        if (is_host) {
+          wc.JoinSession(title_id, web_id, xuids, private_slots);
+        } else {
+          wc.PrejoinSession(title_id, web_id, xuids);
+        }
+      }).detach();
+
       return X_E_SUCCESS;
     }
     case 0x000B0013: {

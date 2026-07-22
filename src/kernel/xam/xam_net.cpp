@@ -15,6 +15,8 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <thread>
+#include <vector>
 
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
@@ -454,15 +456,14 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
     wc.EnsureReady();
     if (wc.is_ready()) {
       uint32_t pub_net = wc.public_address_net();
-      addr_ptr->ina.s_addr       = htonl(INADDR_LOOPBACK);
+      const uint32_t lan_net = wc.lan_address_net();
+      addr_ptr->ina.s_addr       = lan_net ? lan_net : htonl(INADDR_LOOPBACK);
       addr_ptr->inaOnline.s_addr = pub_net;
       addr_ptr->wPortOnline      = htons(static_cast<uint16_t>(
           REXCVAR_GET(systemlink_base_port) + REXCVAR_GET(systemlink_port_offset)));
-      auto xuid_str = REXCVAR_GET(user_xuid);
-      uint64_t xuid = xuid_str.empty() ? 0xB13EBABEBABEBEBULL
-                                       : std::stoull(xuid_str, nullptr, 16);
+      const uint64_t mac = wc.machine_mac();
       for (int i = 0; i < 6; ++i)
-        addr_ptr->abEnet[i] = static_cast<uint8_t>(xuid >> (i * 8));
+        addr_ptr->abEnet[i] = static_cast<uint8_t>(mac >> (i * 8));
       std::memset(addr_ptr->abOnline, 0, 20);
       REXKRNL_INFO("XNetGetTitleXnAddr: -> ETHERNET|STATIC|ONLINE inaOnline={:08X} port={}",
                    ntohl(pub_net), ntohs(addr_ptr->wPortOnline));
@@ -470,13 +471,22 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
     }
   }
 
-  addr_ptr->ina.s_addr       = htonl(INADDR_LOOPBACK);
+  // Pure-LAN fallback (web netplay disabled or not ready): still advertise a
+  // reachable LAN ina and a per-machine MAC. The title broadcasts SL probes
+  // every second regardless of the web stack, so a fixed 0xCC MAC here made
+  // every machine on a LAN look identical and get filtered as "self".
+  const uint32_t lan_net = rex::system::XLiveWebClient::Get().lan_address_net();
+  addr_ptr->ina.s_addr       = lan_net ? lan_net : htonl(INADDR_LOOPBACK);
   addr_ptr->inaOnline.s_addr = 0;
-  addr_ptr->wPortOnline      = 0;
-  std::memset(addr_ptr->abEnet, 0xCC, 6);
+  addr_ptr->wPortOnline      = htons(static_cast<uint16_t>(
+      REXCVAR_GET(systemlink_base_port) + REXCVAR_GET(systemlink_port_offset)));
+  const uint64_t mac = rex::system::XLiveWebClient::Get().machine_mac();
+  for (int i = 0; i < 6; ++i)
+    addr_ptr->abEnet[i] = static_cast<uint8_t>(mac >> (i * 8));
   std::memset(addr_ptr->abOnline, 0, 20);
-  REXKRNL_INFO("XNetGetTitleXnAddr: -> STATIC (fallback/loopback)");
-  return XnAddrStatus::XNET_GET_XNADDR_STATIC;
+  REXKRNL_INFO("XNetGetTitleXnAddr: -> ETHERNET|STATIC (LAN fallback, ina={:08X})",
+               ntohl(addr_ptr->ina.s_addr));
+  return XnAddrStatus::XNET_GET_XNADDR_ETHERNET | XnAddrStatus::XNET_GET_XNADDR_STATIC;
 }
 
 u32 NetDll_XNetGetDebugXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
@@ -496,7 +506,9 @@ u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, m
     return 10022;  // WSAEINVAL
   }
 
-  if (!addr_ptr->inaOnline.s_addr || !addr_ptr->wPortOnline) {
+  // Pure-LAN XNADDRs have inaOnline==0 (no web session), so only reject when
+  // both the online and LAN addresses are unset.
+  if (!addr_ptr->inaOnline.s_addr && !addr_ptr->ina.s_addr) {
     return 10022;  // WSAEINVAL
   }
 
@@ -545,8 +557,22 @@ u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mappe
 
   if (REXCVAR_GET(xlive_web_bridge_loopback_same_public_ip)) {
     auto& wc = XLiveWebClient::Get();
-    if (wc.is_ready() && addr.inaOnline == wc.public_address_net())
-      addr.ina = htonl(INADDR_LOOPBACK);
+    if (wc.is_ready() && addr.inaOnline == wc.public_address_net()) {
+      const uint32_t my_lan_net = wc.lan_address_net();
+      // ina only carries LAN information when it differs from inaOnline. A web
+      // session has a single address field that the search-result writer copies
+      // into both, so ina == inaOnline means "public IP, LAN unknown" — which
+      // must NOT be mistaken for a peer sitting on our subnet.
+      const bool peer_on_our_lan = addr.ina && addr.ina != addr.inaOnline &&
+                                   addr.ina != htonl(INADDR_LOOPBACK) &&
+                                   addr.ina != my_lan_net;
+      if (!peer_on_our_lan) {
+        // Another instance on this same machine: reach it via loopback.
+        addr.ina = htonl(INADDR_LOOPBACK);
+      }
+      // else: same public IP but a different machine on our subnet — keep the
+      // peer's LAN address so traffic crosses the LAN instead of looping back.
+    }
   }
 
   uint32_t token = XNetAddrCache::Get().Store(addr, kid);
@@ -657,6 +683,39 @@ u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32
   REXKRNL_INFO("XNetQosListen: id={:08X} data_size={} flags={:08X}",
                id.guest_address(), (uint32_t)data_size, (uint32_t)flags);
   if (!REXCVAR_GET(xlive_web_enabled)) return 0;
+
+  // XNET_QOS_LISTEN_SET_DATA: the title is handing us the payload it wants
+  // served to anyone probing this session. Publish it so remote joiners can
+  // fetch it during their XNetQosLookup — a joiner that gets no blob back
+  // never sets DATA_RECEIVED and abandons the join. Mirrors xenia
+  // NetDll_XNetQosListen's LISTEN_SET_DATA -> QoSPost path.
+  constexpr uint32_t kListenSetData = 0x04;
+  if (!(flags & kListenSetData) || !data_size || !data || !id) {
+    return 0;
+  }
+
+  uint8_t id_bytes[8] = {};
+  std::memcpy(id_bytes, id, sizeof(id_bytes));
+
+  std::vector<uint8_t> payload(static_cast<uint32_t>(data_size));
+  std::memcpy(payload.data(), data, payload.size());
+
+  // Backend session ids are the lowercase hex of the XNKID bytes.
+  static const char kHex[] = "0123456789abcdef";
+  std::string session_id;
+  session_id.reserve(16);
+  for (uint8_t b : id_bytes) {
+    session_id += kHex[(b >> 4) & 0xF];
+    session_id += kHex[b & 0xF];
+  }
+  uint32_t title_id = REX_KERNEL_STATE()->title_id();
+
+  REXKRNL_INFO("XNetQosListen: publishing {} byte QoS blob for session {}",
+               payload.size(), session_id);
+
+  std::thread([title_id, session_id, payload = std::move(payload)]() {
+    rex::system::XLiveWebClient::Get().UploadQos(title_id, session_id, payload);
+  }).detach();
   return 0;
 }
 
@@ -874,18 +933,59 @@ struct host_set {
     }
   }
 
-  void Store(fd_set* native_set) {
+  void StorePrimary(fd_set* native_set) {
     FD_ZERO(native_set);
     for (uint32_t i = 0; i < this->count; ++i) {
       FD_SET(this->sockets[i]->native_handle(), native_set);
     }
   }
 
-  void UpdateFrom(fd_set* native_set) {
+  void StoreRead(fd_set* native_set) {
+    // Preserve the primary-only behavior for every guest socket first. The
+    // Windows fd_set can hold only FD_SETSIZE entries, so helper handles use
+    // only remaining capacity and can never crowd out a later primary.
+    StorePrimary(native_set);
+    for (uint32_t i = 0; i < this->count; ++i) {
+      uint64_t handles[2] = {};
+      const size_t handle_count =
+          this->sockets[i]->GetNativeReadHandles(handles, rex::countof(handles));
+      for (size_t j = 1; j < handle_count; ++j) {
+#if REX_PLATFORM_WIN32
+        if (native_set->fd_count >= FD_SETSIZE) {
+          REXKRNL_WARN("NetDll_select native read set is full; skipping helper handle");
+          return;
+        }
+#endif
+        FD_SET(handles[j], native_set);
+      }
+    }
+  }
+
+  void UpdatePrimary(fd_set* native_set) {
     uint32_t new_count = 0;
     for (uint32_t i = 0; i < this->count; ++i) {
       auto socket = this->sockets[i];
       if (FD_ISSET(socket->native_handle(), native_set)) {
+        this->sockets[new_count++] = socket;
+      }
+    }
+    this->count = new_count;
+  }
+
+  void UpdateRead(fd_set* native_set) {
+    uint32_t new_count = 0;
+    for (uint32_t i = 0; i < this->count; ++i) {
+      auto socket = this->sockets[i];
+      uint64_t handles[2] = {};
+      const size_t handle_count = socket->GetNativeReadHandles(handles, rex::countof(handles));
+      bool is_ready = false;
+      for (size_t j = 0; j < handle_count; ++j) {
+        if (FD_ISSET(handles[j], native_set)) {
+          is_ready = true;
+          break;
+        }
+      }
+      if (is_ready) {
         this->sockets[new_count++] = socket;
       }
     }
@@ -900,19 +1000,19 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
   fd_set native_readfds = {};
   if (readfds) {
     host_readfds.Load(readfds);
-    host_readfds.Store(&native_readfds);
+    host_readfds.StoreRead(&native_readfds);
   }
   host_set host_writefds = {};
   fd_set native_writefds = {};
   if (writefds) {
     host_writefds.Load(writefds);
-    host_writefds.Store(&native_writefds);
+    host_writefds.StorePrimary(&native_writefds);
   }
   host_set host_exceptfds = {};
   fd_set native_exceptfds = {};
   if (exceptfds) {
     host_exceptfds.Load(exceptfds);
-    host_exceptfds.Store(&native_exceptfds);
+    host_exceptfds.StorePrimary(&native_exceptfds);
   }
   timeval* timeout_in = nullptr;
   timeval timeout;
@@ -925,21 +1025,27 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
   }
   int ret = select(nfds, readfds ? &native_readfds : nullptr, writefds ? &native_writefds : nullptr,
                    exceptfds ? &native_exceptfds : nullptr, timeout_in);
+  if (ret < 0)
+    return ret;
+
+  uint32_t logical_ready_count = 0;
   if (readfds) {
-    host_readfds.UpdateFrom(&native_readfds);
+    host_readfds.UpdateRead(&native_readfds);
     host_readfds.Store(readfds);
+    logical_ready_count += host_readfds.count;
   }
   if (writefds) {
-    host_writefds.UpdateFrom(&native_writefds);
+    host_writefds.UpdatePrimary(&native_writefds);
     host_writefds.Store(writefds);
+    logical_ready_count += host_writefds.count;
   }
   if (exceptfds) {
-    host_exceptfds.UpdateFrom(&native_exceptfds);
+    host_exceptfds.UpdatePrimary(&native_exceptfds);
     host_exceptfds.Store(exceptfds);
+    logical_ready_count += host_exceptfds.count;
   }
 
-  // TODO(gibbed): modify ret to be what's actually copied to the guest fd_sets?
-  return ret;
+  return static_cast<int>(logical_ready_count);
 }
 
 u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags) {
@@ -1113,14 +1219,54 @@ u32 NetDll_XNetQosLookup_entry(u32 caller, u32 num_remote_consoles,
 
   for (uint32_t i = 0; i < count; ++i) {
     auto& info            = qos->info[i];
-    // COMPLETE | TARGET_CONTACTED — do NOT set DATA_RECEIVED (0x08) since we
-    // have no QoS data blob; that keeps the guest from dereferencing data_ptr.
+    // COMPLETE | TARGET_CONTACTED. DATA_RECEIVED (0x08) is added below only if
+    // the host actually published a blob, so the guest never dereferences a
+    // null data_ptr.
     info.flags            = 0x01 | 0x02;
     info.reserved         = 0;
     info.probes_xmit      = probes_count ? static_cast<uint16_t>(probes_count) : 4;
     info.probes_recv      = probes_count ? static_cast<uint16_t>(probes_count) : 4;
     info.data_len         = 0;
     info.data_ptr         = 0;
+
+    // Fetch the host's advertised QoS payload. Titles carry their session
+    // descriptor in here; without it the join is abandoned after the probe.
+    // sessionId_array_ptrs is an array of POINTERS to XNKIDs, not XNKIDs.
+    if (sessionId_array_ptrs && i < static_cast<uint32_t>(num_remote_consoles)) {
+      const auto* id_ptr_array = sessionId_array_ptrs.as<const uint8_t*>();
+      uint32_t id_guest_ptr =
+          memory::load_and_swap<uint32_t>(id_ptr_array + i * sizeof(uint32_t));
+      const auto* kid = REX_KERNEL_MEMORY()->TranslateVirtual<const uint8_t*>(id_guest_ptr);
+      if (kid) {
+        static const char kHex[] = "0123456789abcdef";
+        std::string session_id;
+        session_id.reserve(16);
+        for (int b = 0; b < 8; ++b) {
+          session_id += kHex[(kid[b] >> 4) & 0xF];
+          session_id += kHex[kid[b] & 0xF];
+        }
+
+        std::vector<uint8_t> blob;
+        if (rex::system::XLiveWebClient::Get().DownloadQos(
+                REX_KERNEL_STATE()->title_id(), session_id, blob) &&
+            !blob.empty()) {
+          auto blob_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(
+              static_cast<uint32_t>(blob.size()));
+          auto* blob_host = REX_KERNEL_MEMORY()->TranslateVirtual<uint8_t*>(blob_guest);
+          if (blob_host) {
+            std::memcpy(blob_host, blob.data(), blob.size());
+            info.data_ptr = blob_guest;
+            info.data_len = static_cast<uint16_t>(blob.size());
+            info.flags   |= 0x08;  // DATA_RECEIVED
+            REXKRNL_INFO("XNetQosLookup: session {} -> {} byte QoS blob",
+                         session_id, blob.size());
+          }
+        } else {
+          REXKRNL_WARN("XNetQosLookup: no QoS data published for session {}",
+                       session_id);
+        }
+      }
+    }
     info.rtt_min_in_msecs = static_cast<uint16_t>(REXCVAR_GET(xlive_web_qos_rtt_min_ms));
     info.rtt_med_in_msecs = static_cast<uint16_t>(REXCVAR_GET(xlive_web_qos_rtt_median_ms));
     info.up_bits_per_sec  = static_cast<uint32_t>(REXCVAR_GET(xlive_web_qos_up_bits_per_second));

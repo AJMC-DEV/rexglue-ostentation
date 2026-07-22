@@ -751,6 +751,28 @@ bool ProfileManager::ConvertToXboxLiveEnabledProfile(const uint64_t xuid) {
   return ModifyAccount(xuid, account, run);
 }
 
+bool ProfileManager::RegenerateOnlineXUID(const uint64_t xuid) {
+  if (!accounts_.count(xuid)) {
+    return false;
+  }
+  X_XAMACCOUNTINFO& account = accounts_[xuid];
+
+  auto run = [this](X_XAMACCOUNTINFO& account_info) {
+    // Unconditional, unlike ConvertToXboxLiveEnabledProfile's "once" guard —
+    // the whole point here is to replace an XUID that already exists but
+    // collides with another instance's.
+    account_info.xuid_online = GenerateXuidOnline();
+    return true;
+  };
+
+  const bool ok = ModifyAccount(xuid, account, run);
+  if (ok) {
+    REXSYS_INFO("ProfileManager: regenerated online XUID for {:016X} -> {:016X}",
+                xuid, static_cast<uint64_t>(accounts_[xuid].xuid_online));
+  }
+  return ok;
+}
+
 bool ProfileManager::ConvertToOfflineProfile(const uint64_t xuid) {
   X_XAMACCOUNTINFO& account = accounts_[xuid];
 

@@ -9,7 +9,10 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cerrno>
+#include <chrono>
 #include <cstring>
+#include <unordered_map>
 
 #include <rex/cvar.h>
 #include <rex/kernel/xam/module.h>
@@ -29,6 +32,7 @@ REXCVAR_DECLARE(bool,    xlive_web_bridge_synthesize_lan_info);
 REXCVAR_DECLARE(bool,    xlive_web_bridge_loopback_same_public_ip);
 REXCVAR_DECLARE(int32_t, systemlink_base_port);
 REXCVAR_DECLARE(int32_t, systemlink_port_offset);
+REXCVAR_DECLARE(bool,    systemlink_lan_discovery);
 
 // Standard socket types used by Xbox API emulation
 #if REX_PLATFORM_WIN32
@@ -37,12 +41,190 @@ REXCVAR_DECLARE(int32_t, systemlink_port_offset);
 #include <WS2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <sys/socket.h>
 #endif
 
 namespace rex::system {
+
+namespace {
+constexpr size_t kMaxIncomingPackets = 64;
+
+// Tag carried by LAN hole-punch datagrams; the receiving runtime swallows
+// these before the title sees them.
+constexpr uint8_t kLanPunchTag[4] = {'R', 'X', 'P', 'H'};
+
+std::mutex g_bound_udp_mutex;
+std::unordered_map<uint16_t, XSocket*>& BoundUdpSockets() {
+  static std::unordered_map<uint16_t, XSocket*> sockets;
+  return sockets;
+}
+
+std::mutex g_punch_history_mutex;
+std::unordered_map<uint32_t, std::chrono::steady_clock::time_point>& PunchHistory() {
+  static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> history;
+  return history;
+}
+
+int GetNativeSocketError() {
+#if REX_PLATFORM_WIN32
+  return WSAGetLastError();
+#else
+  return errno;
+#endif
+}
+
+bool IsLanPunchDatagram(const uint8_t* buf, uint32_t buf_len, int received) {
+  return received == static_cast<int>(sizeof(kLanPunchTag)) &&
+         buf_len >= sizeof(kLanPunchTag) &&
+         std::memcmp(buf, kLanPunchTag, sizeof(kLanPunchTag)) == 0;
+}
+
+// A peer probe heard on the announce port proves the peer is reachable; the
+// session-port socket then punches that peer so its inbound filter state
+// opens before the title attempts the join exchange.
+void MaybeLanJoinPunch(uint16_t local_port, const sockaddr_in& src) {
+  if (!REXCVAR_GET(systemlink_lan_discovery) ||
+      !REXCVAR_GET(xlive_web_bridge_systemlink_broadcast)) {
+    return;
+  }
+  const uint16_t base_port = static_cast<uint16_t>(REXCVAR_GET(systemlink_base_port));
+  const uint16_t announce_port =
+      static_cast<uint16_t>(base_port + REXCVAR_GET(systemlink_port_offset));
+  const uint16_t session_port = static_cast<uint16_t>(base_port - 1);
+  if (base_port == 0 || session_port == 0 || local_port != announce_port) {
+    return;
+  }
+  const uint32_t peer_net = src.sin_addr.s_addr;
+  if (peer_net == htonl(INADDR_LOOPBACK) ||
+      peer_net == XLiveWebClient::Get().lan_address_net()) {
+    return;
+  }
+  {
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(g_punch_history_mutex);
+    auto& last = PunchHistory()[peer_net];
+    if (last.time_since_epoch().count() != 0 && now - last < std::chrono::seconds(5)) {
+      return;
+    }
+    last = now;
+  }
+  XSocket::PunchFromBoundUdpSocket(session_port, peer_net, session_port);
+}
+}  // namespace
+
+bool XSocket::EnsureLanProbeSocket(uint32_t bind_address_net) {
+  std::lock_guard<std::mutex> lock(lan_probe_mutex_);
+  if (lan_probe_handle_ != ~0ull)
+    return true;
+  if (lan_probe_failed_)
+    return false;
+
+  const auto probe = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+#if REX_PLATFORM_WIN32
+  const bool invalid_probe = probe == INVALID_SOCKET;
+#else
+  const bool invalid_probe = probe < 0;
+#endif
+  if (invalid_probe) {
+    lan_probe_failed_ = true;
+    REXKRNL_WARN("XSocket LAN probe socket creation failed err={}", GetNativeSocketError());
+    return false;
+  }
+
+  const int broadcast = 1;
+  if (setsockopt(probe, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&broadcast),
+                 sizeof(broadcast)) != 0) {
+    const int error = GetNativeSocketError();
+    rex::net::socket_close(static_cast<uint64_t>(probe));
+    lan_probe_failed_ = true;
+    REXKRNL_WARN("XSocket LAN probe SO_BROADCAST failed err={}", error);
+    return false;
+  }
+
+  sockaddr_in local{};
+  local.sin_family = AF_INET;
+  // Pin the probe to the physical LAN adapter. A zero address preserves the
+  // previous INADDR_ANY fallback.
+  local.sin_addr.s_addr = bind_address_net;
+  if (bind(probe, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
+    const int error = GetNativeSocketError();
+    rex::net::socket_close(static_cast<uint64_t>(probe));
+    lan_probe_failed_ = true;
+    REXKRNL_WARN("XSocket LAN probe bind failed err={}", error);
+    return false;
+  }
+
+#if REX_PLATFORM_WIN32
+  u_long nonblocking = 1;
+  const int nonblocking_result = ioctlsocket(probe, FIONBIO, &nonblocking);
+#else
+  const int current_flags = fcntl(probe, F_GETFL, 0);
+  const int nonblocking_result =
+      current_flags < 0 ? -1 : fcntl(probe, F_SETFL, current_flags | O_NONBLOCK);
+#endif
+  if (nonblocking_result != 0) {
+    const int error = GetNativeSocketError();
+    rex::net::socket_close(static_cast<uint64_t>(probe));
+    lan_probe_failed_ = true;
+    REXKRNL_WARN("XSocket LAN probe nonblocking setup failed err={}", error);
+    return false;
+  }
+
+  char bound_ip[INET_ADDRSTRLEN] = {};
+  inet_ntop(AF_INET, &local.sin_addr, bound_ip, sizeof(bound_ip));
+  lan_probe_handle_ = static_cast<uint64_t>(probe);
+  REXKRNL_INFO("XSocket LAN probe socket bound to {}", bound_ip);
+  return true;
+}
+
+size_t XSocket::GetNativeReadHandles(uint64_t* handles, size_t capacity) const {
+  size_t count = 0;
+  if (native_handle_ != ~0ull && count < capacity) {
+    handles[count++] = native_handle_;
+  }
+
+  std::lock_guard<std::mutex> lock(lan_probe_mutex_);
+  if (lan_probe_handle_ != ~0ull && count < capacity) {
+    handles[count++] = lan_probe_handle_;
+  }
+  return count;
+}
+
+bool XSocket::IsNativeReadHandle(uint64_t handle) const {
+  if (handle == native_handle_)
+    return native_handle_ != ~0ull;
+  std::lock_guard<std::mutex> lock(lan_probe_mutex_);
+  return handle == lan_probe_handle_ && lan_probe_handle_ != ~0ull;
+}
+
+bool XSocket::PunchFromBoundUdpSocket(uint16_t local_port, uint32_t peer_ip_net,
+                                      uint16_t peer_port) {
+  std::lock_guard<std::mutex> lock(g_bound_udp_mutex);
+  auto& sockets = BoundUdpSockets();
+  const auto it = sockets.find(local_port);
+  if (it == sockets.end()) {
+    return false;
+  }
+  sockaddr_in peer{};
+  peer.sin_family = AF_INET;
+  peer.sin_port = htons(peer_port);
+  peer.sin_addr.s_addr = peer_ip_net;
+  const int sent =
+      sendto(it->second->native_handle_, reinterpret_cast<const char*>(kLanPunchTag),
+             sizeof(kLanPunchTag), 0, reinterpret_cast<sockaddr*>(&peer), sizeof(peer));
+  char peer_ip[INET_ADDRSTRLEN] = {};
+  inet_ntop(AF_INET, &peer.sin_addr, peer_ip, sizeof(peer_ip));
+  if (sent != static_cast<int>(sizeof(kLanPunchTag))) {
+    REXKRNL_WARN("XSocket LAN punch from port {} to {}:{} failed err={}", local_port, peer_ip,
+                 peer_port, GetNativeSocketError());
+    return false;
+  }
+  REXKRNL_INFO("XSocket LAN punch sent from port {} to {}:{}", local_port, peer_ip, peer_port);
+  return true;
+}
 
 XSocket::XSocket(KernelState* kernel_state) : XObject(kernel_state, kObjectType) {}
 
@@ -72,12 +254,35 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
 }
 
 X_STATUS XSocket::Close() {
-  int ret = rex::net::socket_close(native_handle_);
-  if (ret != 0) {
-    return X_STATUS_UNSUCCESSFUL;
+  bool close_failed = false;
+  {
+    std::lock_guard<std::mutex> lock(g_bound_udp_mutex);
+    auto& sockets = BoundUdpSockets();
+    const auto it = sockets.find(bound_port_);
+    if (it != sockets.end() && it->second == this) {
+      sockets.erase(it);
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(lan_probe_mutex_);
+    if (lan_probe_handle_ != ~0ull) {
+      close_failed = rex::net::socket_close(lan_probe_handle_) != 0;
+      lan_probe_handle_ = ~0ull;
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(incoming_packet_mutex_);
+    while (!incoming_packets_.empty()) {
+      delete[] incoming_packets_.front();
+      incoming_packets_.pop();
+    }
+  }
+  if (native_handle_ != ~0ull) {
+    close_failed = rex::net::socket_close(native_handle_) != 0 || close_failed;
+    native_handle_ = ~0ull;
   }
 
-  return X_STATUS_SUCCESS;
+  return close_failed ? X_STATUS_UNSUCCESSFUL : X_STATUS_SUCCESS;
 }
 
 X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr, uint32_t optlen) {
@@ -121,13 +326,58 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
 }
 
 X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
+  uint16_t req_port = 0;
+  if (name) {
+    const uint32_t req_addr_host = static_cast<uint32_t>(name->sin_addr);
+    req_port = static_cast<uint16_t>(name->sin_port);
+    if (req_addr_host != 0) {
+      // Titles may bind to the specific address advertised by
+      // XNetGetTitleXnAddr. A specifically-bound UDP socket never receives
+      // broadcast datagrams on Windows, which kills System Link discovery,
+      // so normalize to ANY - the port is what matters.
+      uint32_t nbo = htonl(req_addr_host);
+      char req_ip[INET_ADDRSTRLEN] = {};
+      inet_ntop(AF_INET, &nbo, req_ip, sizeof(req_ip));
+      REXKRNL_INFO("XSocket::Bind rewriting requested address {}:{} to ANY", req_ip,
+                   req_port);
+      name->sin_addr = 0u;
+    } else {
+      REXKRNL_INFO("XSocket::Bind ANY:{}", req_port);
+    }
+
+    // Apply systemlink_port_offset to the actual bind, not just to what we
+    // advertise. XNetGetTitleXnAddr already reports base+offset and the
+    // announce/punch paths already assume the local socket sits there, but
+    // without this the title bound its real ports and two local instances
+    // fought over them — the second one's bind just failed. Peers undo this
+    // in SendTo by shifting their destination by our advertised offset.
+    // Port 0 means "pick an ephemeral port"; never shift that.
+    const int32_t sl_offset = REXCVAR_GET(systemlink_port_offset);
+    if (sl_offset && req_port) {
+      const uint16_t shifted = static_cast<uint16_t>(req_port + sl_offset);
+      REXKRNL_INFO("XSocket::Bind applying systemlink_port_offset {}: {} -> {}",
+                   sl_offset, req_port, shifted);
+      name->sin_port = shifted;
+      req_port = shifted;
+    }
+  }
   int ret = bind(native_handle_, (sockaddr*)name, name_len);
   if (ret < 0) {
+    // Silent failure here is why a port collision looked like "the join just
+    // never happens": the title carries on with an unbound socket.
+    REXKRNL_ERROR("XSocket::Bind FAILED for port {} (err={}) — port already in "
+                  "use? Another emulator instance on this machine binds the "
+                  "same System Link ports unless systemlink_port_offset differs.",
+                  req_port, GetNativeSocketError());
     return X_STATUS_UNSUCCESSFUL;
   }
 
   bound_ = true;
   bound_port_ = name->sin_port;
+  if (type_ == SOCK_DGRAM && bound_port_ != 0) {
+    std::lock_guard<std::mutex> lock(g_bound_udp_mutex);
+    BoundUdpSockets()[bound_port_] = this;
+  }
 
   return X_STATUS_SUCCESS;
 }
@@ -174,6 +424,25 @@ int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
 
 int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_IN* from,
                       uint32_t* from_len) {
+  // A probe reply belongs only to the XSocket that owns this helper. Drain
+  // one datagram per guest receive so readiness and delivery stay paired.
+  {
+    std::lock_guard<std::mutex> lock(lan_probe_mutex_);
+    if (lan_probe_handle_ != ~0ull) {
+      uint8_t reply[2048];
+      sockaddr_in src{};
+      socklen_t src_len = sizeof(src);
+      const int n = recvfrom(lan_probe_handle_, reinterpret_cast<char*>(reply), sizeof(reply), 0,
+                             reinterpret_cast<sockaddr*>(&src), &src_len);
+      if (n > 0) {
+        QueuePacket(ntohl(src.sin_addr.s_addr), ntohs(src.sin_port), reply, static_cast<size_t>(n));
+        char src_ip_str[INET_ADDRSTRLEN] = {};
+        inet_ntop(AF_INET, &src.sin_addr, src_ip_str, sizeof(src_ip_str));
+        REXKRNL_DEBUG("XSocket::RecvFrom injected {} probe reply bytes from {}:{}", n, src_ip_str,
+                      ntohs(src.sin_port));
+      }
+    }
+  }
   {
     std::lock_guard<std::mutex> lock(incoming_packet_mutex_);
     if (!incoming_packets_.empty()) {
@@ -199,8 +468,20 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
 
   sockaddr_in nfrom;
   socklen_t nfromlen = sizeof(sockaddr_in);
-  int ret = recvfrom(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
-                     (sockaddr*)&nfrom, &nfromlen);
+  int ret;
+  for (;;) {
+    nfromlen = sizeof(sockaddr_in);
+    ret = recvfrom(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
+                   (sockaddr*)&nfrom, &nfromlen);
+    if (ret > 0 && IsLanPunchDatagram(buf, buf_len, ret)) {
+      char src_ip_str[INET_ADDRSTRLEN] = {};
+      inet_ntop(AF_INET, &nfrom.sin_addr, src_ip_str, sizeof(src_ip_str));
+      REXKRNL_DEBUG("XSocket::RecvFrom swallowed LAN punch from {}:{}", src_ip_str,
+                    ntohs(nfrom.sin_port));
+      continue;
+    }
+    break;
+  }
   if (ret > 0) {
     char src_ip_str[INET_ADDRSTRLEN] = {};
     inet_ntop(AF_INET, &nfrom.sin_addr, src_ip_str, sizeof(src_ip_str));
@@ -215,12 +496,16 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
       local_port = ntohs(local.sin_port);
     }
     REXKRNL_DEBUG("XSocket::RecvFrom got {} bytes from {}:{} (our local port={})", ret,
-                 src_ip_str, ntohs(nfrom.sin_port), local_port);
+                  src_ip_str, ntohs(nfrom.sin_port), local_port);
+    MaybeLanJoinPunch(local_port, nfrom);
   }
   if (from) {
     from->sin_family = nfrom.sin_family;
     from->sin_addr = ntohl(nfrom.sin_addr.s_addr);  // BE <- BE
-    from->sin_port = nfrom.sin_port;
+    // Host-order value through the big-endian guest field, matching the
+    // injected helper path: a raw network-order write reads back
+    // byte-swapped, so the title replies to port 59395 instead of 1000.
+    from->sin_port = ntohs(nfrom.sin_port);
     std::memset(from->x_sin_zero, 0, sizeof(from->x_sin_zero));
   }
 
@@ -248,18 +533,63 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
       if (XNetAddrCache::Get().Lookup(dest_addr, entry)) {
         // Cache stores addresses as NBO patterns; normalize to host order so
         // both the token and raw-address paths agree below.
+        bool lan_peer = false;
         dest_addr = ntohl(entry.xn_addr.inaOnline);
-        // The peer's socket listens on the port it advertised with the web
-        // session (e.g. xenia netplay's 36000 range), not on the guest-side
-        // game port the title puts in the sockaddr.
-        if (entry.xn_addr.wPortOnline) {
-          dest_port_nbo = entry.xn_addr.wPortOnline;  // already NBO
+        if (!dest_addr && entry.xn_addr.ina) {
+          dest_addr = ntohl(entry.xn_addr.ina);  // pure-LAN entry (no web)
+          lan_peer = true;
+        }
+
+        // Same public IP but a different machine on our LAN: use its LAN
+        // address; the same-public-IP loopback remap below won't match it.
+        //
+        // ina must differ from inaOnline to carry any LAN information. A web
+        // session has only one address field, and the search-result writer
+        // fills both ina and inaOnline from it, so ina == inaOnline means
+        // "public IP, LAN unknown". Treating that as a LAN peer skipped the
+        // port-offset shift below and sent every packet to our own port.
+        auto& wc = XLiveWebClient::Get();
+        if (wc.is_ready() && entry.xn_addr.inaOnline == wc.public_address_net() &&
+            entry.xn_addr.ina && entry.xn_addr.ina != entry.xn_addr.inaOnline &&
+            entry.xn_addr.ina != htonl(INADDR_LOOPBACK) &&
+            entry.xn_addr.ina != wc.lan_address_net()) {
+          dest_addr = ntohl(entry.xn_addr.ina);
+          lan_peer = true;
+        }
+
+        // The advertised port is only a real destination for a peer that binds
+        // an OFFSET copy of the title's System Link ports (another rexglue
+        // instance running with systemlink_port_offset). Xenia advertises a
+        // hardcoded 36000 (XLiveAPI::GetPlayerPort) that it never binds — it
+        // binds the title's real ports (verified: xenia listens on 1000/1001)
+        // and its own SendTo uses the guest's destination port verbatim.
+        // Replacing our port with the advertised one there fires every packet
+        // at a closed port, so the join silently times out.
+        //
+        // Shift the guest's port by the peer's offset instead of replacing it,
+        // so multi-port System Link titles keep their per-socket distinction.
+        if (entry.xn_addr.wPortOnline && !lan_peer) {
+          const uint16_t adv  = ntohs(entry.xn_addr.wPortOnline);
+          const uint16_t base =
+              static_cast<uint16_t>(REXCVAR_GET(systemlink_base_port));
+          const int32_t peer_offset =
+              static_cast<int32_t>(adv) - static_cast<int32_t>(base);
+          // Offset 0 means the peer binds the title's ports natively, and an
+          // implausibly large delta means the advertised value isn't a port
+          // the peer listens on at all (xenia's 36000). Both keep our port.
+          constexpr int32_t kMaxPeerPortOffset = 4096;
+          if (peer_offset > 0 && peer_offset <= kMaxPeerPortOffset) {
+            dest_port_nbo = htons(
+                static_cast<uint16_t>(ntohs(dest_port_nbo) + peer_offset));
+          }
         }
       }
     }
 
     nto.sin_addr.s_addr = htonl(dest_addr);
-    nto.sin_family = to->sin_family;
+    // Hardcode AF_INET: the guest-side family value isn't guaranteed to be a
+    // valid host AF, and only IPv4 is supported here anyway.
+    nto.sin_family = AF_INET;
     nto.sin_port   = dest_port_nbo;
 
     // Two instances behind one public IP can't reach each other through it
@@ -286,12 +616,12 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
     bool is_sl_port = (dest_port == base_port) || (dest_port == base_port - 1) ||
                       (dest_port == base_port + 12);
 
-    REXKRNL_INFO("XSocket::SendTo broadcast check: dest_addr={:08X} dest_port={} base_port={} sl_port={} is_broadcast={} is_sl_port={}",
-                 dest_addr, dest_port, base_port, sl_port, is_broadcast, is_sl_port);
+    REXKRNL_DEBUG("XSocket::SendTo broadcast check: dest_addr={:08X} dest_port={} base_port={} sl_port={} is_broadcast={} is_sl_port={}",
+                  dest_addr, dest_port, base_port, sl_port, is_broadcast, is_sl_port);
 
     if (is_broadcast && is_sl_port) {
-      REXKRNL_INFO("XSocket::SendTo intercepting SL broadcast to port {}, querying web sessions (title={:08X})...",
-                   dest_port, kernel_state_->title_id());
+      REXKRNL_DEBUG("XSocket::SendTo intercepting SL broadcast to port {}, querying web sessions (title={:08X})...",
+                    dest_port, kernel_state_->title_id());
       auto& wc = XLiveWebClient::Get();
       wc.EnsureReady();
 
@@ -299,11 +629,11 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
 
       std::vector<WebSession> sessions;
       bool search_ok = wc.SearchSessions(kernel_state_->title_id(), sessions);
-      REXKRNL_INFO("XSocket::SendTo SearchSessions ok={} count={}", search_ok, sessions.size());
+      REXKRNL_DEBUG("XSocket::SendTo SearchSessions ok={} count={}", search_ok, sessions.size());
       if (search_ok) {
         const std::string& my_ip = wc.public_address();
         bool loopback_enabled = REXCVAR_GET(xlive_web_bridge_loopback_same_public_ip);
-        REXKRNL_INFO("XSocket::SendTo my_ip={} sl_port={} loopback_same_public_ip={}", my_ip, sl_port, loopback_enabled);
+        REXKRNL_DEBUG("XSocket::SendTo my_ip={} sl_port={} loopback_same_public_ip={}", my_ip, sl_port, loopback_enabled);
         for (const auto& ws : sessions) {
           if (ws.host_address.empty()) {
             REXKRNL_WARN("XSocket::SendTo skipping session with empty host_address (xuid={:016X})", ws.host_xuid);
@@ -317,8 +647,8 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
           }
           bool same_public_ip = ws.host_address == my_ip;
           if (!loopback_enabled && same_public_ip) {
-            REXKRNL_INFO("XSocket::SendTo skipping same-IP session (loopback disabled): xuid={:016X} addr={} port={}",
-                         ws.host_xuid, ws.host_address, ws.port);
+            REXKRNL_DEBUG("XSocket::SendTo skipping same-IP session (loopback disabled): xuid={:016X} addr={} port={}",
+                          ws.host_xuid, ws.host_address, ws.port);
             continue;
           }
           uint32_t peer_ip =
@@ -328,9 +658,9 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
 
           char peer_ip_str[INET_ADDRSTRLEN] = {};
           inet_ntop(AF_INET, &peer_ip, peer_ip_str, sizeof(peer_ip_str));
-          REXKRNL_INFO("XSocket::SendTo forwarding {} bytes to {}:{} (web_addr={} port={} same_ip={} loopback={})",
-                       buf_len, peer_ip_str, peer_port,
-                       ws.host_address, ws.port, same_public_ip, loopback_enabled);
+          REXKRNL_DEBUG("XSocket::SendTo forwarding {} bytes to {}:{} (web_addr={} port={} same_ip={} loopback={})",
+                        buf_len, peer_ip_str, peer_port,
+                        ws.host_address, ws.port, same_public_ip, loopback_enabled);
 
           sockaddr_in peer{};
           peer.sin_family      = AF_INET;
@@ -344,12 +674,77 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
           }
         }
       }
+
+      if (REXCVAR_GET(systemlink_lan_discovery)) {
+        // Peers behind our own NAT are skipped or loopback-remapped by the web
+        // fan-out above; a genuine broadcast is the only way same-subnet
+        // machines can hear this probe (their replies come back unicast from
+        // their real LAN address on the normal recv path).
+        int bc_on = 1;
+        const int bc_opt_rc = setsockopt(native_handle_, SOL_SOCKET, SO_BROADCAST,
+                                         reinterpret_cast<const char*>(&bc_on), sizeof(bc_on));
+        sockaddr_in bcast{};
+        bcast.sin_family = AF_INET;
+        bcast.sin_port = htons(dest_port);
+        bcast.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+        const int bc_sent = sendto(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
+                                   reinterpret_cast<sockaddr*>(&bcast), sizeof(bcast));
+        if (bc_sent < 0) {
+          const int bc_err = WSAGetLastError();
+          int bc_state = 0;
+          socklen_t bc_state_len = sizeof(bc_state);
+          getsockopt(native_handle_, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<char*>(&bc_state),
+                     &bc_state_len);
+          int so_type = 0;
+          socklen_t so_type_len = sizeof(so_type);
+          getsockopt(native_handle_, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&so_type),
+                     &so_type_len);
+          REXKRNL_WARN(
+              "XSocket::SendTo LAN broadcast FAILED err={} opt_rc={} so_broadcast={} "
+              "so_type={} guest_flags={} handle={}",
+              bc_err, bc_opt_rc, bc_state, so_type, flags, native_handle_);
+          // Fall back to this logical socket's helper. Replies are surfaced
+          // through this same XSocket in select and RecvFrom.
+          if (EnsureLanProbeSocket(XLiveWebClient::Get().lan_address_net())) {
+            std::lock_guard<std::mutex> lock(lan_probe_mutex_);
+            const int alt_sent = sendto(lan_probe_handle_, reinterpret_cast<char*>(buf), buf_len, 0,
+                                        reinterpret_cast<sockaddr*>(&bcast), sizeof(bcast));
+            if (alt_sent < 0) {
+              REXKRNL_WARN("XSocket::SendTo LAN probe socket broadcast ALSO failed err={}",
+                           WSAGetLastError());
+            } else {
+              REXKRNL_DEBUG("XSocket::SendTo LAN probe socket sent {} bytes to port {}", alt_sent,
+                            dest_port);
+            }
+          }
+        } else {
+          REXKRNL_DEBUG("XSocket::SendTo LAN broadcast passthrough port {} -> {} bytes", dest_port,
+                        bc_sent);
+        }
+      }
       return static_cast<int>(buf_len);
     }
   }
 
+  if (to) {
+    // Genuine broadcasts (e.g. real UDP SL probes when the web bridge is
+    // disabled or didn't intercept this send) need SO_BROADCAST set on the
+    // socket or sendto() fails outright.
+    uint32_t nto_addr_host = ntohl(nto.sin_addr.s_addr);
+    bool direct_is_broadcast =
+        (nto_addr_host == 0xFFFFFFFFu) || ((nto_addr_host & 0xFFu) == 0xFFu);
+    if (direct_is_broadcast) {
+      int bc_on = 1;
+      setsockopt(native_handle_, SOL_SOCKET, SO_BROADCAST,
+                reinterpret_cast<const char*>(&bc_on), sizeof(bc_on));
+    }
+  }
+
   int direct_result = sendto(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
-                            to ? (sockaddr*)&nto : nullptr, to_len);
+                            to ? (sockaddr*)&nto : nullptr, to ? sizeof(nto) : to_len);
+  // Capture the error immediately: inet_ntop/getsockname below can clear it,
+  // which previously made every failure log as WSAError=0.
+  int direct_wsa_err = (direct_result < 0) ? WSAGetLastError() : 0;
   if (to) {
     char dest_ip_str[INET_ADDRSTRLEN] = {};
     inet_ntop(AF_INET, &nto.sin_addr, dest_ip_str, sizeof(dest_ip_str));
@@ -362,7 +757,7 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
     if (direct_result < 0) {
       REXKRNL_WARN("XSocket::SendTo direct unicast to {}:{} FAILED buf_len={} WSAError={} "
                    "(our local port={})",
-                   dest_ip_str, ntohs(nto.sin_port), buf_len, WSAGetLastError(), local_port);
+                   dest_ip_str, ntohs(nto.sin_port), buf_len, direct_wsa_err, local_port);
     } else {
       REXKRNL_DEBUG("XSocket::SendTo direct unicast to {}:{} ok, sent {} bytes "
                     "(our local port={})",
@@ -381,9 +776,11 @@ bool XSocket::QueuePacket(uint32_t src_ip, uint16_t src_port, const uint8_t* buf
   std::memcpy(pkt->data, buf, len);
 
   std::lock_guard<std::mutex> lock(incoming_packet_mutex_);
+  if (incoming_packets_.size() >= kMaxIncomingPackets) {
+    delete[] incoming_packets_.front();
+    incoming_packets_.pop();
+  }
   incoming_packets_.push((uint8_t*)pkt);
-
-  // TODO: Limit on number of incoming packets?
   return true;
 }
 

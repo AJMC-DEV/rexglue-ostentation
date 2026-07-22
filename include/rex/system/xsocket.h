@@ -99,6 +99,20 @@ class XSocket : public XObject {
   X_STATUS Initialize(AddressFamily af, Type type, Protocol proto);
   X_STATUS Close();
 
+  // A logical Xbox socket may use a second native UDP socket when the primary
+  // socket cannot transmit LAN broadcasts. Read readiness from either native
+  // handle belongs to this logical socket.
+  bool EnsureLanProbeSocket(uint32_t bind_address_net);
+  size_t GetNativeReadHandles(uint64_t* handles, size_t capacity) const;
+  bool IsNativeReadHandle(uint64_t handle) const;
+
+  // Stateful inbound filters drop session-port datagrams until that socket
+  // has transmitted, so LAN joins time out even after discovery succeeds.
+  // Send a tagged punch datagram from the UDP socket bound to local_port;
+  // the receiving runtime swallows the tag before the title sees it.
+  static bool PunchFromBoundUdpSocket(uint16_t local_port, uint32_t peer_ip_net,
+                                      uint16_t peer_port);
+
   X_STATUS SetOption(uint32_t level, uint32_t optname, void* optval_ptr, uint32_t optlen);
   X_STATUS IOControl(uint32_t cmd, uint8_t* arg_ptr);
 
@@ -140,6 +154,10 @@ class XSocket : public XObject {
   uint16_t bound_port_ = 0;
 
   bool broadcast_socket_ = false;
+
+  mutable std::mutex lan_probe_mutex_;
+  uint64_t lan_probe_handle_ = ~0ull;
+  bool lan_probe_failed_ = false;
 
   std::unique_ptr<rex::thread::Event> event_;
   std::mutex incoming_packet_mutex_;

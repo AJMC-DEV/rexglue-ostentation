@@ -180,6 +180,25 @@ void NetplayOverlayDialog::DrawProfileTab() {
               static_cast<unsigned long long>(profile->xuid()));
   ImGui::Text("XUID (online):  %016llX",
               static_cast<unsigned long long>(profile->GetOnlineXUID()));
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Regenerate##onlinexuid")) {
+    if (pm->RegenerateOnlineXUID(profile->xuid())) {
+      last_status_ = "New online XUID assigned - restart to re-register";
+      loaded_from_profile_ = false;
+    } else {
+      last_status_ = "Failed to regenerate online XUID";
+    }
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip(
+        "Assign a new random online XUID.\n\n"
+        "Use this when a profile folder was copied to make a second local\n"
+        "instance: both instances then share one netplay identity, so the\n"
+        "backend hides each host's session from the other and their startup\n"
+        "cleanup deletes each other's sessions.\n\n"
+        "Changes the identity the backend knows you by - leaderboard and\n"
+        "presence history tied to the old XUID stays with the old XUID.");
+  }
   ImGui::Text("LIVE enabled:   %s", profile->IsLiveEnabled() ? "yes" : "no");
   ImGui::Text("Signed in to:   %s",
               profile->signin_state() == X_USER_SIGNIN_STATE::SignedInToLive

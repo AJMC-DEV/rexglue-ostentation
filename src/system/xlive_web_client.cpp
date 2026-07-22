@@ -29,17 +29,22 @@ REXCVAR_DECLARE(bool,        xlive_web_delete_stale_on_startup);
 REXCVAR_DECLARE(std::string, user_gamertag);
 REXCVAR_DECLARE(std::string, user_xuid);
 REXCVAR_DECLARE(int32_t,     systemlink_port_offset);
+REXCVAR_DECLARE(std::string, lan_ip);
 
 #if REX_PLATFORM_WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "ws2_32.lib")
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #endif
 
 namespace rex::system {
@@ -291,7 +296,8 @@ class WinHttpSession {
                const std::wstring& method,
                const std::string& request_body,
                std::string& out_response,
-               int timeout_ms) {
+               int timeout_ms,
+               const wchar_t* headers_override = nullptr) {
     ParsedUrl pu = ParseUrl(full_url);
 
     HINTERNET hConn = WinHttpConnect(hSession_, pu.host.c_str(), pu.port, 0);
@@ -307,7 +313,9 @@ class WinHttpSession {
     WinHttpSetTimeouts(hReq, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
 
     // Headers
-    const wchar_t* headers = L"Content-Type: application/json\r\nAccept: application/json\r\n";
+    const wchar_t* headers =
+        headers_override ? headers_override
+                         : L"Content-Type: application/json\r\nAccept: application/json\r\n";
     DWORD hdrLen = static_cast<DWORD>(wcslen(headers));
 
     LPCVOID body_ptr = request_body.empty() ? nullptr : static_cast<LPCVOID>(request_body.c_str());
@@ -381,12 +389,147 @@ uint32_t XLiveWebClient::public_address_net() const {
 #endif
 }
 
+const std::string& XLiveWebClient::lan_address() const {
+  static std::mutex mutex;
+  static std::string cached;
+  std::lock_guard<std::mutex> lock(mutex);
+  if (cached.empty()) {
+    std::string override_ip = REXCVAR_GET(lan_ip);
+    if (!override_ip.empty()) {
+      cached = override_ip;
+      return cached;
+    }
+    // UDP "connect" trick: no packet is sent; the OS just binds the socket to
+    // the default-route interface, whose address is what LAN peers can reach.
+    auto s = socket(AF_INET, SOCK_DGRAM, 0);
+#if REX_PLATFORM_WIN32
+    bool socket_valid = (s != INVALID_SOCKET);
+#else
+    bool socket_valid = (s >= 0);
+#endif
+    if (socket_valid) {
+      std::string result;
+      sockaddr_in probe{};
+      probe.sin_family = AF_INET;
+      probe.sin_port = htons(53);
+      inet_pton(AF_INET, "8.8.8.8", &probe.sin_addr);
+      if (connect(s, reinterpret_cast<sockaddr*>(&probe), sizeof(probe)) == 0) {
+        sockaddr_in local{};
+        socklen_t len = sizeof(local);
+        if (getsockname(s, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
+          char buf[INET_ADDRSTRLEN] = {};
+          if (inet_ntop(AF_INET, &local.sin_addr, buf, sizeof(buf))) result = buf;
+        }
+      }
+#if REX_PLATFORM_WIN32
+      closesocket(s);
+#else
+      close(s);
+#endif
+      // Only cache a successful detection — an empty result (Winsock not
+      // ready yet, no route, etc.) must be retried on the next call rather
+      // than frozen for the rest of the process lifetime.
+      if (!result.empty()) cached = result;
+    }
+  }
+  return cached;
+}
+
+uint32_t XLiveWebClient::lan_address_net() const {
+  const std::string& ip = lan_address();
+  if (ip.empty()) return 0;
+  uint32_t addr = 0;
+  inet_pton(AF_INET, ip.c_str(), &addr);
+  return addr;
+}
+
+uint64_t XLiveWebClient::machine_mac() const {
+  uint64_t base = 0;
+
+  // Explicit user override wins.
+  std::string xuid_str = REXCVAR_GET(user_xuid);
+  bool have_override = false;
+  if (!xuid_str.empty()) {
+    try {
+      base = std::stoull(xuid_str, nullptr, 16);
+      have_override = true;
+    } catch (...) {}
+  }
+
+  if (!have_override) {
+    // The default offline XUID is a fixed constant on every fresh install, so
+    // two machines on one LAN would collide; mix in the hostname to keep the
+    // network identity unique per machine. Save paths never see this value.
+    if (auto* ks = kernel_state()) {
+      if (auto* profile = ks->user_profile()) {
+        base = profile->GetOnlineXUID();
+        if (!base) base = profile->xuid();
+      }
+    }
+    if (!base) base = 0xB13EBABEBABEBABEULL;
+    char host[256] = {};
+#if REX_PLATFORM_WIN32
+    DWORD host_len = sizeof(host);
+    GetComputerNameA(host, &host_len);
+#else
+    gethostname(host, sizeof(host));
+#endif
+    const uint64_t h = std::hash<std::string>{}(std::string(host));
+    base ^= h * 0x9E3779B97F4A7C15ULL;
+  }
+
+  // Two instances on one PC share a hostname, a public IP, and often a profile
+  // directory, so everything above can still collide. They must already run
+  // with distinct systemlink_port_offset values to avoid fighting over UDP
+  // ports, so fold that in: it is the one value guaranteed to differ. Without
+  // this the backend sees one machine and the second instance's startup
+  // "delete my stale sessions" wipes the first instance's hosted session.
+  const uint64_t offset = static_cast<uint64_t>(
+      static_cast<uint32_t>(REXCVAR_GET(systemlink_port_offset)));
+  if (offset) base ^= offset * 0xD1B54A32D192ED03ULL;
+
+  return base & 0x0000FFFFFFFFFFFFULL;
+}
+
 bool XLiveWebClient::HttpGet(const std::string& path, std::string& out) {
 #if REX_PLATFORM_WIN32
   std::string url = BaseUrl() + path;
   if (REXCVAR_GET(xlive_web_log_requests)) XLIVE_LOG("GET {}", url);
   bool ok = GetWinHttp().Request(url, L"GET", {}, out, REXCVAR_GET(xlive_web_timeout_ms));
   if (REXCVAR_GET(xlive_web_log_requests)) XLIVE_LOG("GET {} -> {}", url, out);
+  return ok;
+#else
+  (void)path; (void)out;
+  return false;
+#endif
+}
+
+bool XLiveWebClient::HttpPostBinary(const std::string& path,
+                                    const std::string& body, std::string& out) {
+#if REX_PLATFORM_WIN32
+  std::string url = BaseUrl() + path;
+  // Mirrors xenia's QoSPost content type. A JSON content type would let Nest's
+  // body parser consume the stream before rawBody is captured.
+  static const wchar_t* kRawHeaders =
+      L"Content-Type: application/x-www-form-urlencoded\r\nAccept: */*\r\n";
+  if (REXCVAR_GET(xlive_web_log_requests))
+    XLIVE_LOG("POST(raw) {} ({} bytes)", url, body.size());
+  return GetWinHttp().Request(url, L"POST", body, out,
+                              REXCVAR_GET(xlive_web_timeout_ms), kRawHeaders);
+#else
+  (void)path; (void)body; (void)out;
+  return false;
+#endif
+}
+
+bool XLiveWebClient::HttpGetBinary(const std::string& path, std::string& out) {
+#if REX_PLATFORM_WIN32
+  std::string url = BaseUrl() + path;
+  static const wchar_t* kRawHeaders = L"Accept: */*\r\n";
+  bool ok = GetWinHttp().Request(url, L"GET", {}, out,
+                                 REXCVAR_GET(xlive_web_timeout_ms), kRawHeaders);
+  if (REXCVAR_GET(xlive_web_log_requests))
+    XLIVE_LOG("GET(raw) {} -> {} bytes (ok={})", url, out.size(), ok);
   return ok;
 #else
   (void)path; (void)out;
@@ -481,13 +624,14 @@ bool XLiveWebClient::EnsureReady() {
     }
   }
   if (!online_xuid) {
-    // Synthesize an online XUID like older builds did.
-    online_xuid = 0x0009000000000000ULL | (offline_xuid & 0x0000FFFFFFFFFFFFULL);
+    // Synthesize an online XUID like older builds did. Synthesized ids must
+    // be machine-unique, the default offline XUID is not.
+    online_xuid = 0x0009000000000000ULL | machine_mac();
   }
   if (gamertag.empty()) gamertag = "Player";
 
   registered_xuid_ = fmt::format("{:016X}", online_xuid);
-  registered_mac_  = MacFromXuid(offline_xuid);
+  registered_mac_  = MacFromXuid(machine_mac());
 
   // 3. Register player
   if (!RegisterPlayer(online_xuid, gamertag, registered_mac_)) {
@@ -580,6 +724,12 @@ bool XLiveWebClient::CreateSession(uint32_t title_id, const WebSession& info,
   if (ok) {
     out_session_id = json::GetString(resp, "id");
     if (out_session_id.empty()) out_session_id = json::GetString(resp, "sessionId");
+    // The backend's POST handler returns 201 with an EMPTY body, so neither
+    // field is there. The session is keyed by the id we just sent, so fall back
+    // to that. Callers gate hosted-session setup on a non-empty id: without
+    // this the host never uploads its advertised properties and every joiner
+    // drops the search result as "unjoinable".
+    if (out_session_id.empty()) out_session_id = session_id_hex;
     XLIVE_LOG("CreateSession -> id={}", out_session_id);
   } else {
     XLIVE_ERR("CreateSession failed: payload={} resp={}", payload, resp);
@@ -655,21 +805,41 @@ bool XLiveWebClient::SetSessionProperties(
 }
 
 bool XLiveWebClient::JoinSession(uint32_t title_id, const std::string& id,
-                                 uint64_t xuid) {
-  std::string payload = fmt::format(R"({{"xuid":"{}","gamertag":"{}"}})",
-                                    fmt::format("{:016X}", xuid),
-                                    REXCVAR_GET(user_gamertag));
+                                 const std::vector<uint64_t>& xuids,
+                                 const std::vector<bool>& private_slots) {
+  // Backend shape (JoinSessionRequest): {"xuids":[...],"privateSlots":[...]}.
+  // It iterates request.xuids, so a scalar "xuid" field throws server-side.
+  std::string xuid_arr, slot_arr;
+  for (size_t i = 0; i < xuids.size(); ++i) {
+    if (i) { xuid_arr += ","; slot_arr += ","; }
+    xuid_arr += fmt::format("\"{:016X}\"", xuids[i]);
+    slot_arr += (i < private_slots.size() && private_slots[i]) ? "true" : "false";
+  }
+  std::string payload =
+      "{\"xuids\":[" + xuid_arr + "],\"privateSlots\":[" + slot_arr + "]}";
   std::string resp;
-  return HttpPost(SessionPath(title_id, id) + "/join", payload, resp);
+  bool ok = HttpPost(SessionPath(title_id, id) + "/join", payload, resp);
+  XLIVE_LOG("JoinSession {} -> {} member(s) (ok={}) resp={}", id, xuids.size(),
+            ok, resp);
+  return ok;
 }
 
 bool XLiveWebClient::PrejoinSession(uint32_t title_id, const std::string& id,
-                                    uint64_t xuid) {
-  std::string payload = fmt::format(R"({{"xuid":"{}","gamertag":"{}"}})",
-                                    fmt::format("{:016X}", xuid),
-                                    REXCVAR_GET(user_gamertag));
+                                    const std::vector<uint64_t>& xuids) {
+  // Joiners (non-host) announce themselves with /prejoin, which points each
+  // player row at this session. Only the host posts /join — mirrors xenia
+  // XSession::JoinSession's IsHost() split.
+  std::string arr;
+  for (size_t i = 0; i < xuids.size(); ++i) {
+    if (i) arr += ",";
+    arr += fmt::format("\"{:016X}\"", xuids[i]);
+  }
+  std::string payload = "{\"xuids\":[" + arr + "]}";
   std::string resp;
-  return HttpPost(SessionPath(title_id, id) + "/prejoin", payload, resp);
+  bool ok = HttpPost(SessionPath(title_id, id) + "/prejoin", payload, resp);
+  XLIVE_LOG("PrejoinSession {} -> {} member(s) (ok={}) resp={}", id,
+            xuids.size(), ok, resp);
+  return ok;
 }
 
 bool XLiveWebClient::LeaveSession(uint32_t title_id, const std::string& id,
@@ -694,20 +864,25 @@ bool XLiveWebClient::DeleteStaleSessions(bool by_mac, const std::string& mac) {
 
 bool XLiveWebClient::UploadQos(uint32_t title_id, const std::string& id,
                                const std::vector<uint8_t>& data) {
-  std::string hex = ToHex(data.data(), data.size());
-  std::string payload = fmt::format(R"({{"data":"{}"}})", hex);
+  // The backend does writeFile(qosPath, req.rawBody) — the body IS the blob.
+  // Wrapping it in JSON would store the JSON text and hand joiners garbage.
+  std::string body(reinterpret_cast<const char*>(data.data()), data.size());
   std::string resp;
-  return HttpPost(SessionPath(title_id, id) + "/qos", payload, resp);
+  bool ok = HttpPostBinary(SessionPath(title_id, id) + "/qos", body, resp);
+  XLIVE_LOG("UploadQos {} -> {} bytes (ok={})", id, data.size(), ok);
+  return ok;
 }
 
 bool XLiveWebClient::DownloadQos(uint32_t title_id, const std::string& id,
                                  std::vector<uint8_t>& out) {
+  // Streams the stored file back verbatim; 204 with no body means the host
+  // never published QoS data.
   std::string resp;
-  if (!HttpGet(SessionPath(title_id, id) + "/qos", resp)) return false;
-  std::string hex = json::GetString(resp, "data");
-  if (hex.empty()) return false;
-  out.resize(hex.size() / 2);
-  return FromHex(hex, out.data(), out.size());
+  if (!HttpGetBinary(SessionPath(title_id, id) + "/qos", resp)) return false;
+  if (resp.empty()) return false;
+  out.assign(resp.begin(), resp.end());
+  XLIVE_LOG("DownloadQos {} -> {} bytes", id, out.size());
+  return true;
 }
 
 bool XLiveWebClient::FindPlayerByIp(const std::string& ip, WebSession& out) {

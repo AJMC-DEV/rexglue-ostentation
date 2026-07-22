@@ -108,6 +108,14 @@ class ProfileManager {
   // profile if it was signed in.
   bool SetGamertag(const uint64_t xuid, const std::string& gamertag);
 
+  // Assigns a freshly randomized online XUID (persists; re-logs if signed in).
+  // Copying a profile folder to make a second local instance clones its online
+  // XUID too, and that XUID is the whole netplay identity: the backend keys
+  // players by it, hides a session from its own host during search, and
+  // machine_mac() derives the console MAC from it. Two instances sharing one
+  // then delete each other's sessions during startup/shutdown cleanup.
+  bool RegenerateOnlineXUID(const uint64_t xuid);
+
   static bool IsGamertagValid(const std::string gamertag);
 
   uint64_t GenerateXuid() const {

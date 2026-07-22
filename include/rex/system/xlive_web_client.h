@@ -87,6 +87,15 @@ class XLiveWebClient {
   const std::string& public_address() const { return public_address_; }
   uint32_t           public_address_net() const;  ///< network byte order
 
+  /// Best-effort LAN IPv4 (dotted decimal) of this machine, for routing to
+  /// same-subnet peers. Respects the lan_ip cvar override. Empty if unknown.
+  const std::string& lan_address() const;
+  uint32_t lan_address_net() const;  ///< network byte order; 0 if unknown
+
+  /// Machine-unique 48-bit value used as the synthetic console MAC in XNADDR
+  /// abEnet and the netplay machineId. Never used for save paths.
+  uint64_t machine_mac() const;
+
   // -------------------------------------------------------------------------
   // Players
   // -------------------------------------------------------------------------
@@ -118,11 +127,16 @@ class XLiveWebClient {
   bool SetSessionProperties(uint32_t title_id, const std::string& session_id,
                             const std::vector<std::vector<uint8_t>>& blobs);
 
+  /// Host-side member registration: POST /join with the full member set.
+  /// The backend iterates "xuids", so members must be sent as arrays.
   bool JoinSession(uint32_t title_id, const std::string& session_id,
-                   uint64_t xuid);
+                   const std::vector<uint64_t>& xuids,
+                   const std::vector<bool>& private_slots);
 
+  /// Joiner-side announcement: POST /prejoin points each player row at this
+  /// session. Non-host clients call this instead of JoinSession.
   bool PrejoinSession(uint32_t title_id, const std::string& session_id,
-                      uint64_t xuid);
+                      const std::vector<uint64_t>& xuids);
 
   bool LeaveSession(uint32_t title_id, const std::string& session_id,
                     uint64_t xuid);
@@ -159,6 +173,13 @@ class XLiveWebClient {
   bool HttpGet(const std::string& path, std::string& out_body);
   bool HttpPost(const std::string& path, const std::string& body, std::string& out_body);
   bool HttpDelete(const std::string& path, std::string& out_body);
+
+  // The QoS endpoints trade raw bytes, not JSON: the backend writes the request
+  // body straight to a file and streams it back verbatim. These skip the JSON
+  // content-type so Nest exposes rawBody, matching xenia's QoSPost/QoSGet.
+  bool HttpPostBinary(const std::string& path, const std::string& body,
+                      std::string& out_body);
+  bool HttpGetBinary(const std::string& path, std::string& out_body);
 
   bool ParseWebSession(const std::string& json_obj, WebSession& out);
 

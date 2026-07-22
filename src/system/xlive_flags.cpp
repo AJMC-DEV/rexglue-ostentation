@@ -81,6 +81,17 @@ REXCVAR_DEFINE_BOOL(xlive_web_bridge_loopback_same_public_ip, true, "XLive",
                     "Rewrite same-public-IP joins to loopback (127.0.0.1).");
 
 // ---------------------------------------------------------------------------
+// LAN awareness
+// ---------------------------------------------------------------------------
+REXCVAR_DEFINE_STRING(lan_ip, "", "XLive",
+                      "LAN IPv4 address advertised to same-subnet System Link peers. "
+                      "Empty = auto-detect from the default-route interface.");
+
+REXCVAR_DEFINE_BOOL(systemlink_lan_discovery, true, "XLive",
+                    "Also emit System Link discovery probes as real UDP broadcasts so "
+                    "peers on the same LAN (sharing one public IP) can hear them.");
+
+// ---------------------------------------------------------------------------
 // System Link ports
 // ---------------------------------------------------------------------------
 REXCVAR_DEFINE_INT32(systemlink_base_port, 1001, "XLive",

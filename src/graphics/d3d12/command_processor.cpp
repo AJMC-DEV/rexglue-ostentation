@@ -2452,7 +2452,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     if (!tess_log_last_valid || !(tess_log_last == tess_log_state)) {
       tess_log_last = tess_log_state;
       tess_log_last_valid = true;
-      REXGPU_INFO(
+      REXGPU_TRACE(
           "Tessellated draw: mode={} hvs_type={} guest_count={} host_count={} "
           "min_vtx_indx={} max_vtx_indx={} indx_offset={} dma_size=0x{:08X} "
           "hos_tess_level=[{}, {}] ib_type={} ib_fmt={} ib_endian={}",

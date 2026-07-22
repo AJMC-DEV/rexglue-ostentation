@@ -143,6 +143,7 @@ uint32_t XNetAddrCache::Store(const XNADDR& addr, const XNKID& kid) {
   // Check if already cached by public IP
   for (auto& [tok, entry] : table_) {
     if (entry.xn_addr.inaOnline == addr.inaOnline &&
+        entry.xn_addr.ina == addr.ina &&
         entry.xn_addr.wPortOnline == addr.wPortOnline) {
       return tok;
     }

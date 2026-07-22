@@ -13,6 +13,7 @@
 #include <rex/logging.h>
 #include <rex/hook.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/xlive_web_client.h>
 
 REXCVAR_DECLARE(bool, xlive_web_enabled);
 
@@ -36,20 +37,24 @@ u32 XNetLogonSetTitleID_impl(u32 title_id) {
   return 0;
 }
 
+u32 XNetLogonGetTitleID_impl() {
+  // Returns the title id directly, not a status. The joining title polls
+  // this while loading a peer garden and dereferences null when it gets
+  // the stub answer instead of its own id.
+  uint32_t title_id = REX_KERNEL_STATE()->title_id();
+  REXKRNL_INFO("XNetLogonGetTitleID: -> {:08X}", title_id);
+  return title_id;
+}
+
 u32 XNetLogonGetMachineID_impl(mapped_u64 machine_id_ptr) {
   if (!machine_id_ptr) {
     return X_STATUS_INVALID_PARAMETER;
   }
 
-  // Netplay: machine id = 0xFA00000000000000 | console mac. Our synthetic
-  // console MAC is the low 6 bytes of the offline XUID (same bytes the
-  // XNADDR abEnet carries).
-  uint64_t xuid = 0xB13EBABEBABEBABE;
-  if (auto* profile = REX_KERNEL_STATE()->user_profile()) {
-    xuid = profile->xuid();
-  }
-
-  const uint64_t mac = xuid & 0x0000FFFFFFFFFFFFULL;
+  // Netplay: machine id = 0xFA00000000000000 | console mac.
+  // Must match the MAC in XNADDR abEnet (XNetGetTitleXnAddr) and the netplay
+  // registration, or titles filter peers inconsistently.
+  const uint64_t mac = rex::system::XLiveWebClient::Get().machine_mac();
   const uint64_t machine_id = 0xFA00000000000000ULL | mac;
   *machine_id_ptr = machine_id;
 
@@ -292,7 +297,7 @@ REX_EXPORT_STUB(__imp__XNetLogonGetServiceInfo);
 REX_EXPORT_STUB(__imp__XNetLogonGetServiceNetworkID);
 REX_EXPORT_STUB(__imp__XNetLogonGetState);
 REX_EXPORT_STUB(__imp__XNetLogonGetTicketOpt);
-REX_EXPORT_STUB(__imp__XNetLogonGetTitleID);
+REX_EXPORT(__imp__XNetLogonGetTitleID, rex::kernel::xam::XNetLogonGetTitleID_impl);
 REX_EXPORT_STUB(__imp__XNetLogonGetTitleVersion);
 REX_EXPORT(__imp__XNetLogonGetUserPrivileges, rex::kernel::xam::XNetLogonGetUserPrivileges_impl);
 REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);

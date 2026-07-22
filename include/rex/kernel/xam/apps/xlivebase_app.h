@@ -158,6 +158,7 @@ class XLiveBaseApp : public system::xam::App {
   X_HRESULT XFriendsCreateEnumerator(uint32_t buffer_ptr,
                                      uint32_t buffer_length);
   X_HRESULT XStorageBuildServerPath(uint32_t buffer_ptr);
+  X_HRESULT XStringVerify(uint32_t buffer_ptr);
   X_HRESULT ZeroAsyncTaskResults(uint32_t buffer_ptr);
 
   // Reads argument N of a marshaled X_ARGUMENT_LIST as a 32-bit value.

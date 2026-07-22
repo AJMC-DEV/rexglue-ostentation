@@ -87,6 +87,51 @@ X_HRESULT XLiveBaseApp::ZeroAsyncTaskResults(uint32_t buffer_ptr) {
   return X_E_SUCCESS;
 }
 
+// Completes a marshaled XStringVerify task. The title allocates the results
+// buffer as a packed STRING_VERIFY_RESPONSE header immediately followed by one
+// HRESULT per verified string:
+//   struct STRING_VERIFY_RESPONSE {  // 2-byte packed, 6 bytes total
+//     be<uint16_t> wNumStrings;
+//     be<uint32_t> pStringResult;    // guest ptr at offset +2
+//   };
+// XAM points pStringResult at the HRESULT array inside the same buffer and the
+// title dereferences it without a null check, so zeroing the buffer (the old
+// behavior) crashes the caller. Populate the header and report every string as
+// acceptable (HRESULT 0).
+X_HRESULT XLiveBaseApp::XStringVerify(uint32_t buffer_ptr) {
+  if (!buffer_ptr) {
+    return X_E_INVALIDARG;
+  }
+
+  auto* async_message =
+      memory_->TranslateVirtual<XLIVEBASE_ASYNC_MESSAGE*>(buffer_ptr);
+  if (!async_message->xlive_async_task_ptr) {
+    return X_E_SUCCESS;
+  }
+
+  auto* task = memory_->TranslateVirtual<XLIVE_ASYNC_TASK*>(
+      async_message->xlive_async_task_ptr);
+
+  constexpr uint32_t kResponseHeaderSize = 6;
+  if (!task->results_ptr || task->results_size < kResponseHeaderSize) {
+    return X_E_INVALIDARG;
+  }
+
+  uint8_t* results = memory_->TranslateVirtual(task->results_ptr);
+  std::memset(results, 0, task->results_size);
+
+  const uint32_t num_strings =
+      (task->results_size - kResponseHeaderSize) / sizeof(uint32_t);
+  memory::store_and_swap<uint16_t>(results + 0,
+                                   static_cast<uint16_t>(num_strings));
+  memory::store_and_swap<uint32_t>(results + 2,
+                                   task->results_ptr + kResponseHeaderSize);
+  // The HRESULT array stays zeroed: X_E_SUCCESS for every string.
+
+  REXKRNL_DEBUG("XStringVerify: {} string(s) -> all acceptable", num_strings);
+  return X_E_SUCCESS;
+}
+
 X_HRESULT XLiveBaseApp::XOnlineGetServiceInfo(uint32_t service_id,
                                               uint32_t service_info) {
   if (!REXCVAR_GET(xlive_web_enabled)) {
@@ -345,10 +390,11 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       return ZeroAsyncTaskResults(buffer_ptr);
     }
     case 0x0005000C: {
-      // 57520829, 4156081C, 415607D2
-      // Zeroed STRING_VERIFY_RESPONSE result codes == 0 (no offensive text).
+      // 57520829, 4156081C, 415607D2, 4D53085F
+      // Titles read STRING_VERIFY_RESPONSE.pStringResult without a null
+      // check; the header must point at the trailing HRESULT array.
       REXKRNL_DEBUG("XStringVerify({:08X}, {:08X})", buffer_ptr, buffer_length);
-      return ZeroAsyncTaskResults(buffer_ptr);
+      return XStringVerify(buffer_ptr);
     }
     case 0x0005000D: {
       // 4D5307EA, 58410889
