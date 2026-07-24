@@ -25,6 +25,11 @@ REXCVAR_DEFINE_BOOL(vulkan_validation_enabled, false, "UI/Vulkan",
 REXCVAR_DEFINE_INT32(vulkan_device, -1, "UI/Vulkan", "Vulkan device index (-1 for auto selection)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_BOOL(vulkan_prefer_discrete_gpu, true, "UI/Vulkan",
+                    "Prefer a discrete (dedicated) GPU over an integrated one when "
+                    "auto-selecting, as on hybrid-graphics laptops")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_BOOL(vulkan_prefer_geometry_shader, true, "UI/Vulkan",
                     "Prefer physical devices supporting geometryShader when auto-selecting")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -84,13 +89,18 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
 
   if (!provider->vulkan_device_) {
     std::vector<VkPhysicalDevice> physical_devices_ordered = physical_devices;
+    bool prefer_discrete_gpu = REXCVAR_GET(vulkan_prefer_discrete_gpu);
     bool prefer_geometry_shader = REXCVAR_GET(vulkan_prefer_geometry_shader);
     bool prefer_fragment_stores = REXCVAR_GET(vulkan_prefer_fragment_stores_and_atomics);
     bool prefer_vertex_stores = REXCVAR_GET(vulkan_prefer_vertex_pipeline_stores_and_atomics);
     bool prefer_fill_mode_non_solid = REXCVAR_GET(vulkan_prefer_fill_mode_non_solid);
-    if (with_gpu_emulation && physical_devices.size() > 1 &&
-        (prefer_geometry_shader || prefer_fragment_stores || prefer_vertex_stores ||
-         prefer_fill_mode_non_solid)) {
+    // The discrete-GPU preference applies to presentation-only providers too:
+    // on hybrid laptops the presenter must live on the same GPU the user
+    // expects to be driving the game.
+    if (physical_devices.size() > 1 &&
+        (prefer_discrete_gpu ||
+         (with_gpu_emulation && (prefer_geometry_shader || prefer_fragment_stores ||
+                                 prefer_vertex_stores || prefer_fill_mode_non_solid)))) {
       struct PhysicalDeviceScore {
         VkPhysicalDevice physical_device;
         uint32_t score;
@@ -101,6 +111,26 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
         VkPhysicalDeviceFeatures supported_features = {};
         ifn.vkGetPhysicalDeviceFeatures(physical_device, &supported_features);
         uint32_t score = 0;
+        // Weighted above every feature preference combined so a dedicated GPU
+        // always wins over an integrated one that merely ticks more boxes.
+        if (prefer_discrete_gpu) {
+          VkPhysicalDeviceProperties device_properties;
+          ifn.vkGetPhysicalDeviceProperties(physical_device, &device_properties);
+          switch (device_properties.deviceType) {
+            case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+              score += 32;
+              break;
+            case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+              score += 16;
+              break;
+            case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+              score += 8;
+              break;
+            default:
+              // CPU and other types are a last resort.
+              break;
+          }
+        }
         if (prefer_geometry_shader && supported_features.geometryShader) {
           ++score;
         }
@@ -144,6 +174,17 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
           "Vulkan logical device");
       return nullptr;
     }
+  }
+
+  {
+    VkPhysicalDeviceProperties chosen_properties;
+    ifn.vkGetPhysicalDeviceProperties(provider->vulkan_device_->physical_device(),
+                                      &chosen_properties);
+    provider->device_name_ = chosen_properties.deviceName;
+    provider->device_is_discrete_ =
+        chosen_properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+    REXLOG_INFO("Using Vulkan physical device: {} ({})", provider->device_name_,
+                provider->device_is_discrete_ ? "discrete" : "integrated/other");
   }
 
   if (with_presentation) {

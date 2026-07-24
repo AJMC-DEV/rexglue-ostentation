@@ -73,6 +73,9 @@
  * - .range(min, max) - Numeric bounds validation
  * - .allowed({...}) - String enum validation
  * - .debug_only() - Mark as debug-only (for filtering in release UIs)
+ * - .color(fmt) - Mark an INT32/UINT32 cvar as a packed color; UIs render
+ *                 color-picker controls. fmt is a ColorFormat byte layout
+ *                 (kRGBA default, kARGB, kABGR (ImU32), kBGRA)
  * - .validator(fn) - Custom validation function
  *
  * @section cvar_query Querying CVars
@@ -135,6 +138,43 @@ const std::filesystem::path& GetConfigPath();
 
 enum class FlagType { Boolean, Int32, Int64, Uint32, Uint64, Double, String, Command };
 
+// Byte layout of a packed 32-bit color cvar, described most-significant byte
+// first (as the value reads in hex). kABGR matches ImGui's ImU32.
+enum class ColorFormat {
+  kRGBA,  // 0xRRGGBBAA
+  kARGB,  // 0xAARRGGBB
+  kABGR,  // 0xAABBGGRR  (ImGui ImU32)
+  kBGRA,  // 0xBBGGRRAA
+};
+
+// Unpack a packed 32-bit color of `fmt` into 8-bit channels.
+inline void UnpackColor(uint32_t packed, ColorFormat fmt, uint8_t& r, uint8_t& g, uint8_t& b,
+                        uint8_t& a) {
+  const uint8_t b3 = static_cast<uint8_t>(packed >> 24);
+  const uint8_t b2 = static_cast<uint8_t>(packed >> 16);
+  const uint8_t b1 = static_cast<uint8_t>(packed >> 8);
+  const uint8_t b0 = static_cast<uint8_t>(packed);
+  switch (fmt) {
+    case ColorFormat::kRGBA: r = b3; g = b2; b = b1; a = b0; break;
+    case ColorFormat::kARGB: a = b3; r = b2; g = b1; b = b0; break;
+    case ColorFormat::kABGR: a = b3; b = b2; g = b1; r = b0; break;
+    case ColorFormat::kBGRA: b = b3; g = b2; r = b1; a = b0; break;
+  }
+}
+
+// Pack 8-bit channels back into a 32-bit color of `fmt`.
+inline uint32_t PackColor(uint8_t r, uint8_t g, uint8_t b, uint8_t a, ColorFormat fmt) {
+  uint8_t b3 = 0, b2 = 0, b1 = 0, b0 = 0;
+  switch (fmt) {
+    case ColorFormat::kRGBA: b3 = r; b2 = g; b1 = b; b0 = a; break;
+    case ColorFormat::kARGB: b3 = a; b2 = r; b1 = g; b0 = b; break;
+    case ColorFormat::kABGR: b3 = a; b2 = b; b1 = g; b0 = r; break;
+    case ColorFormat::kBGRA: b3 = b; b2 = g; b1 = r; b0 = a; break;
+  }
+  return (static_cast<uint32_t>(b3) << 24) | (static_cast<uint32_t>(b2) << 16) |
+         (static_cast<uint32_t>(b1) << 8) | static_cast<uint32_t>(b0);
+}
+
 // Lifecycle: when can this flag be modified?
 enum class Lifecycle {
   kInitOnly,        // Can only be set during initialization (before FinalizeInit)
@@ -165,6 +205,10 @@ struct FlagEntry {
   Constraints constraints;
   std::string default_value;
   bool is_debug_only = false;
+  // Marks an integer cvar as a packed 32-bit color so UIs render color controls
+  // for it. `color_format` gives the byte layout. Set via .color(fmt).
+  bool is_color = false;
+  ColorFormat color_format = ColorFormat::kRGBA;
 };
 
 std::vector<FlagEntry>& GetRegistry();
@@ -282,6 +326,16 @@ struct FlagRegistrar {
 
   FlagRegistrar&& debug_only() && {
     apply_([](FlagEntry& entry) { entry.is_debug_only = true; });
+    return std::move(*this);
+  }
+
+  // Mark an integer cvar as a packed 32-bit color so UIs render color controls
+  // for it. `fmt` selects the byte layout (default RGBA, i.e. 0xRRGGBBAA).
+  FlagRegistrar&& color(ColorFormat fmt = ColorFormat::kRGBA) && {
+    apply_([=](FlagEntry& entry) {
+      entry.is_color = true;
+      entry.color_format = fmt;
+    });
     return std::move(*this);
   }
 

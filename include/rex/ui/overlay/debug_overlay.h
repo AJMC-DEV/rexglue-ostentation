@@ -14,6 +14,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <string>
 
 namespace rex::ui {
 
@@ -32,11 +33,16 @@ class DebugOverlayDialog : public ImGuiDialog {
 
   void SetStatsProvider(FrameStatsProvider provider) { stats_provider_ = std::move(provider); }
 
+  // Name of the host GPU the graphics provider selected. Fixed for the life of
+  // the process, so it's pushed in rather than polled.
+  void SetGpuName(std::string name) { gpu_name_ = std::move(name); }
+
  protected:
   void OnDraw(ImGuiIO& io) override;
 
  private:
   FrameStatsProvider stats_provider_;
+  std::string gpu_name_;
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
   static constexpr size_t kFrameHistorySize = 120;
   std::array<float, kFrameHistorySize> frame_time_history_{};

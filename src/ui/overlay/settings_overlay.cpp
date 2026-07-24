@@ -478,6 +478,26 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
           }
           ImGui::EndCombo();
         }
+      } else if (entry.is_color && (entry.type == rex::cvar::FlagType::Int32 ||
+                                     entry.type == rex::cvar::FlagType::Uint32)) {
+        // Color cvar: unpack the 4-byte value per its ColorFormat (int32 colors
+        // share the same bit pattern) and present RGBA color controls.
+        uint32_t packed =
+            static_cast<uint32_t>(std::strtoul(current_val.c_str(), nullptr, 10));
+        uint8_t r = 0, g = 0, b = 0, a = 0;
+        rex::cvar::UnpackColor(packed, entry.color_format, r, g, b, a);
+        ImVec4 col(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
+        if (ImGui::ColorEdit4("##v", &col.x, ImGuiColorEditFlags_AlphaBar)) {
+          auto to_u8 = [](float f) {
+            return static_cast<uint8_t>(std::clamp(f, 0.0f, 1.0f) * 255.0f + 0.5f);
+          };
+          uint32_t new_packed = rex::cvar::PackColor(to_u8(col.x), to_u8(col.y), to_u8(col.z),
+                                                     to_u8(col.w), entry.color_format);
+          std::string encoded = (entry.type == rex::cvar::FlagType::Int32)
+                                    ? std::to_string(static_cast<int32_t>(new_packed))
+                                    : std::to_string(static_cast<uint32_t>(new_packed));
+          rex::cvar::SetFlagByName(entry.name, encoded);
+        }
       } else if (entry.type == rex::cvar::FlagType::Int32 ||
                  entry.type == rex::cvar::FlagType::Int64 ||
                  entry.type == rex::cvar::FlagType::Uint32 ||

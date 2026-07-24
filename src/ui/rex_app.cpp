@@ -15,6 +15,7 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/platform.h>
 #include <rex/ui/flags.h>
 #include <rex/kernel/crt/heap.h>
 #include <rex/filesystem.h>
@@ -48,8 +49,27 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <string_view>
+
+// Nvidia Optimus / AMD PowerXpress opt-in for hybrid-graphics laptops.
+//
+// Both drivers look for these exports in the *executable's* export table when
+// deciding whether a process gets the dedicated GPU, so they have to live in a
+// translation unit compiled into the host binary - an equivalent export from a
+// DLL (rexruntime, the GPU plugin) is never consulted. rex_app.cpp is added to
+// every consumer target by rexglue_configure_target(), which makes it the right
+// home for them.
+//
+// https://developer.download.nvidia.com/devzone/devcenter/gamegraphics/files/OptimusRenderingPolicies.pdf
+// https://stackoverflow.com/questions/17458803/amd-equivalent-to-nvoptimusenablement
+#if REX_PLATFORM_WIN32
+extern "C" {
+__declspec(dllexport) uint32_t NvOptimusEnablement = 0x00000001;
+__declspec(dllexport) uint32_t AmdPowerXpressRequestHighPerformance = 1;
+}  // extern "C"
+#endif  // REX_PLATFORM_WIN32
 
 REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
@@ -546,6 +566,17 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
     } else {
       debug_overlay_ =
           std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
+      // The graphics system is moved into runtime_ during ConstructRuntime, so
+      // by the time this bind fires config_.graphics is a moved-from null. Read
+      // the live system from the runtime, falling back to config_ for the
+      // standalone/installer path where no runtime has been built yet.
+      auto* gs = runtime_ ? runtime_->graphics_system() : config_.graphics.get();
+      auto* provider = gs ? gs->provider() : nullptr;
+      if (provider && !provider->GetDeviceName().empty()) {
+        debug_overlay_->SetGpuName(
+            fmt::format("{} ({})", provider->GetDeviceName(),
+                        provider->IsDeviceDiscrete() ? "dedicated" : "integrated"));
+      }
     }
     UpdateBuiltinOverlayInputMode();
   });

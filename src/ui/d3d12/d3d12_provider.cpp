@@ -19,6 +19,7 @@
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 
+#include <dxgi1_6.h>
 #include <malloc.h>
 
 REXCVAR_DEFINE_BOOL(d3d12_debug, false, "UI/D3D12", "Enable Direct3D 12 and DXGI debug layer")
@@ -32,6 +33,11 @@ REXCVAR_DEFINE_BOOL(d3d12_break_on_warning, false, "UI/D3D12",
 
 REXCVAR_DEFINE_INT32(d3d12_adapter, -1, "UI/D3D12",
                      "Index of the DXGI adapter to use (-1 for any physical, -2 for WARP)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(d3d12_prefer_discrete_gpu, true, "UI/D3D12",
+                    "Prefer a discrete (dedicated) GPU over an integrated one when "
+                    "auto-selecting the adapter, as on hybrid-graphics laptops")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_INT32(d3d12_queue_priority, 1, "UI/D3D12",
@@ -266,10 +272,35 @@ bool D3D12Provider::Initialize() {
     return false;
   }
 
-  // Choose the adapter.
+  // Choose the adapter. When auto-selecting a physical adapter, ask DXGI for
+  // the high-performance ordering (IDXGIFactory6, Windows 10 1803+) so hybrid
+  // laptops land on the dedicated GPU instead of whatever EnumAdapters1
+  // happens to list first. An explicit d3d12_adapter index always uses the
+  // plain EnumAdapters1 order so the index stays stable.
+  Microsoft::WRL::ComPtr<IDXGIFactory6> dxgi_factory_6;
+  bool use_gpu_preference = false;
+  if (REXCVAR_GET(d3d12_adapter) == -1 && REXCVAR_GET(d3d12_prefer_discrete_gpu)) {
+    if (SUCCEEDED(dxgi_factory->QueryInterface(IID_PPV_ARGS(&dxgi_factory_6)))) {
+      use_gpu_preference = true;
+    } else {
+      REXLOG_DEBUG(
+          "IDXGIFactory6 unavailable, falling back to the default DXGI adapter "
+          "order - the discrete GPU may not be picked automatically");
+    }
+  }
+
   uint32_t adapter_index = 0;
   IDXGIAdapter1* adapter = nullptr;
-  while (dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
+  while (true) {
+    if (use_gpu_preference) {
+      if (dxgi_factory_6->EnumAdapterByGpuPreference(adapter_index,
+                                                     DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                                     IID_PPV_ARGS(&adapter)) != S_OK) {
+        break;
+      }
+    } else if (dxgi_factory->EnumAdapters1(adapter_index, &adapter) != S_OK) {
+      break;
+    }
     DXGI_ADAPTER_DESC1 adapter_desc;
     if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
       if (SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device),
@@ -308,14 +339,21 @@ bool D3D12Provider::Initialize() {
     return false;
   }
   adapter_vendor_id_ = GpuVendorID(adapter_desc.VendorId);
+  // DXGI has no integrated/discrete flag; dedicated video memory is the usual
+  // proxy for it, as integrated parts carve their working set out of system
+  // memory and report little to none of their own.
+  constexpr SIZE_T kDiscreteVideoMemoryThreshold = SIZE_T(512) * 1024 * 1024;
+  device_is_discrete_ = adapter_desc.DedicatedVideoMemory >= kDiscreteVideoMemoryThreshold;
   int adapter_name_mb_size =
       WideCharToMultiByte(CP_UTF8, 0, adapter_desc.Description, -1, nullptr, 0, nullptr, nullptr);
   if (adapter_name_mb_size != 0) {
     char* adapter_name_mb = reinterpret_cast<char*>(alloca(adapter_name_mb_size));
     if (WideCharToMultiByte(CP_UTF8, 0, adapter_desc.Description, -1, adapter_name_mb,
                             adapter_name_mb_size, nullptr, nullptr) != 0) {
-      REXGPU_INFO("DXGI adapter: {} (vendor 0x{:04X}, device 0x{:04X})", adapter_name_mb,
-                  adapter_desc.VendorId, adapter_desc.DeviceId);
+      device_name_ = adapter_name_mb;
+      REXGPU_INFO("DXGI adapter: {} (vendor 0x{:04X}, device 0x{:04X}, {})", adapter_name_mb,
+                  adapter_desc.VendorId, adapter_desc.DeviceId,
+                  device_is_discrete_ ? "discrete" : "integrated/other");
     }
   }
 

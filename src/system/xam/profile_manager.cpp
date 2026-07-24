@@ -216,6 +216,22 @@ void ProfileManager::Initialize() {
     LoadAccount(account_xuid);
   }
 
+  // Ensure every Live-enabled profile carries a valid, unique online XUID.
+  // Profiles created by older builds (or copied between installs) may have a
+  // zeroed/invalid xuid_online; without this, all such players would share the
+  // same default online identity. Generate one on demand and persist it so it
+  // stays stable across launches.
+  for (auto& [account_xuid, account] : accounts_) {
+    if (account.IsLiveEnabled() && !IsOnlineXUID(account.xuid_online)) {
+      account.xuid_online = GenerateXuidOnline();
+      if (UpdateAccount(account_xuid, &account)) {
+        REXSYS_INFO(
+            "ProfileManager: generated online XUID for {:016X} -> {:016X}",
+            account_xuid, static_cast<uint64_t>(account.xuid_online));
+      }
+    }
+  }
+
   // Pick the profile to auto-login:
   //  1. cvar user_xuid when it matches an existing profile,
   //  2. cvar user_gamertag when it matches an existing profile,

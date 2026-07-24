@@ -27,12 +27,15 @@ DebugOverlayDialog::~DebugOverlayDialog() {}
 void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
   ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
-  ImGui::SetNextWindowSize(ImVec2(280, 280), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(320, 300), ImGuiCond_FirstUseEver);
 #else
-  ImGui::SetNextWindowSize(ImVec2(220, 60), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(320, 80), ImGuiCond_FirstUseEver);
 #endif
   ImGui::SetNextWindowBgAlpha(0.5f);
   if (ImGui::Begin("Debug##overlay", nullptr, ImGuiWindowFlags_NoCollapse)) {
+    if (!gpu_name_.empty()) {
+      ImGui::Text("GPU: %s", gpu_name_.c_str());
+    }
     if (stats_provider_) {
       auto stats = stats_provider_();
       if (stats.frame_count > 0) {

@@ -11,6 +11,7 @@
  */
 
 #include <memory>
+#include <string>
 
 #include <rex/ui/immediate_drawer.h>
 #include <rex/ui/presenter.h>
@@ -51,8 +52,21 @@ class GraphicsProvider {
 
   virtual std::unique_ptr<ImmediateDrawer> CreateImmediateDrawer() = 0;
 
+  // Human-readable name of the physical device the provider is running on, as
+  // reported by the driver (for example "NVIDIA GeForce RTX 4060 Laptop GPU").
+  // Empty if the backend couldn't determine it.
+  const std::string& GetDeviceName() const { return device_name_; }
+
+  // True when the selected device is a dedicated GPU rather than an integrated
+  // or software one. Used to report whether discrete GPU selection took effect.
+  bool IsDeviceDiscrete() const { return device_is_discrete_; }
+
  protected:
   GraphicsProvider() = default;
+
+  // Filled in by the backend once a device has been chosen.
+  std::string device_name_;
+  bool device_is_discrete_ = false;
 };
 
 }  // namespace ui
