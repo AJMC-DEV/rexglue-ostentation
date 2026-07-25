@@ -110,6 +110,27 @@ REXCVAR_DEFINE_INT32(systemlink_port_offset, 0, "XLive",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 // ---------------------------------------------------------------------------
+// UPnP automatic port forwarding
+// ---------------------------------------------------------------------------
+REXCVAR_DEFINE_BOOL(upnp_enabled, true, "XLive",
+                    "Automatically forward netplay UDP ports on the router via "
+                    "UPnP (IGD). Lets players host without manual port "
+                    "forwarding. Requires a UPnP-capable router with UPnP "
+                    "enabled.");
+
+REXCVAR_DEFINE_INT32(upnp_lease_seconds, 3600, "XLive",
+                     "Lease duration (seconds) requested for each UPnP port "
+                     "mapping. Renewed automatically at half this interval. 0 "
+                     "requests a permanent mapping.")
+    .range(0, 604800);
+
+REXCVAR_DEFINE_BOOL(netplay_firewall_prompt, true, "XLive",
+                    "On first netplay use, briefly open a TCP listener so "
+                    "Windows shows its native 'Allow this app through the "
+                    "firewall' prompt. Allowing it lets peers reach hosted "
+                    "sessions. No firewall rule is added by the emulator.");
+
+// ---------------------------------------------------------------------------
 // QoS tuning
 // ---------------------------------------------------------------------------
 REXCVAR_DEFINE_INT32(xlive_web_qos_rtt_min_ms, 35, "XLive",

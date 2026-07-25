@@ -23,6 +23,7 @@ set(REXSYSTEM_SOURCES
     guest_path.cpp
     xlive_flags.cpp
     xlive_web_client.cpp
+    upnp.cpp
     xsession.cpp
 
     # Utilities
@@ -99,7 +100,7 @@ if(REXGLUE_ENABLE_TEXTURES)
 endif()
 
 if(WIN32)
-    target_link_libraries(rexruntime PRIVATE rexdiscord ws2_32 winhttp)
+    target_link_libraries(rexruntime PRIVATE rexdiscord ws2_32 winhttp iphlpapi)
     # DXGI is used by the UI presenter on Windows independently of the
     # graphics backend.
     target_link_libraries(rexruntime PUBLIC dxgi dxguid)

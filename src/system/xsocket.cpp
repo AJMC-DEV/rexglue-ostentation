@@ -12,6 +12,8 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 
 #include <rex/cvar.h>
@@ -19,6 +21,7 @@
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/upnp.h>
 #include <rex/system/xlive_web_client.h>
 #include <rex/system/xsession.h>
 #include <rex/system/xsocket.h>
@@ -33,6 +36,7 @@ REXCVAR_DECLARE(bool,    xlive_web_bridge_loopback_same_public_ip);
 REXCVAR_DECLARE(int32_t, systemlink_base_port);
 REXCVAR_DECLARE(int32_t, systemlink_port_offset);
 REXCVAR_DECLARE(bool,    systemlink_lan_discovery);
+REXCVAR_DECLARE(bool,    netplay_firewall_prompt);
 
 // Standard socket types used by Xbox API emulation
 #if REX_PLATFORM_WIN32
@@ -73,6 +77,54 @@ int GetNativeSocketError() {
   return WSAGetLastError();
 #else
   return errno;
+#endif
+}
+
+// Windows shows its native "Allow this app through the firewall" prompt the
+// first time a program listens for inbound connections with no existing rule.
+// The title's UDP binds don't reliably trigger it, but a TCP listen() does —
+// and the allow-rule Windows creates when the user clicks "Allow access" is
+// per-application, so it also covers our inbound netplay UDP. We open a
+// short-lived throwaway TCP listener once to coax that prompt. We never add a
+// firewall rule ourselves and never request elevation; the user drives the
+// standard Windows dialog. If they previously clicked "Cancel", Windows keeps a
+// block rule and won't prompt again — that must be undone manually.
+void TriggerFirewallPromptOnce(uint16_t port) {
+#if REX_PLATFORM_WIN32
+  if (!REXCVAR_GET(netplay_firewall_prompt)) {
+    return;
+  }
+  static std::once_flag once;
+  std::call_once(once, [port] {
+    std::thread([port] {
+      const auto listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+      if (listener == INVALID_SOCKET) {
+        return;
+      }
+      sockaddr_in addr{};
+      addr.sin_family = AF_INET;
+      addr.sin_addr.s_addr = htonl(INADDR_ANY);
+      addr.sin_port = htons(port);
+      // TCP and UDP port spaces are separate, so this never collides with the
+      // title's UDP bind on the same number. If some TCP already holds it, fall
+      // back to an ephemeral port — any listen() on this exe provokes the
+      // per-application prompt just the same.
+      if (bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        addr.sin_port = 0;
+        bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+      }
+      if (listen(listener, 1) == 0) {
+        REXKRNL_INFO("XSocket: opened transient TCP listener (port {}) to trigger "
+                     "the Windows Firewall allow prompt", port);
+        // Stay listening long enough for the firewall service to register it
+        // and for the user to answer the dialog, then tear it down.
+        std::this_thread::sleep_for(std::chrono::seconds(20));
+      }
+      rex::net::socket_close(static_cast<uint64_t>(listener));
+    }).detach();
+  });
+#else
+  (void)port;
 #endif
 }
 
@@ -379,6 +431,19 @@ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
     BoundUdpSockets()[bound_port_] = this;
   }
 
+  // Ask the router to forward this UDP port to us so peers on the internet can
+  // reach a hosted session without the player setting up manual port
+  // forwarding. Only meaningful for web netplay, and req_port here is the
+  // host-order port number the title actually listens on (post offset shift).
+  // The manager is non-blocking, idempotent, and no-ops when upnp_enabled is
+  // false, so this is safe to call on every bind.
+  if (type_ == SOCK_DGRAM && req_port != 0 && REXCVAR_GET(xlive_web_enabled)) {
+    UpnpManager::Get().RequestMapping(req_port, /*udp=*/true);
+    // Coax Windows' native firewall allow-prompt so inbound netplay traffic
+    // isn't silently dropped (fires at most once per process).
+    TriggerFirewallPromptOnce(req_port);
+  }
+
   return X_STATUS_SUCCESS;
 }
 
@@ -497,6 +562,12 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
     }
     REXKRNL_DEBUG("XSocket::RecvFrom got {} bytes from {}:{} (our local port={})", ret,
                   src_ip_str, ntohs(nfrom.sin_port), local_port);
+    if (netplay_rx_info_logged_ < kNetplayInfoLogCap) {
+      ++netplay_rx_info_logged_;
+      REXKRNL_INFO("XSocket netplay RX: {} bytes from {}:{} arrived on our local "
+                   "port {}",
+                   ret, src_ip_str, ntohs(nfrom.sin_port), local_port);
+    }
     MaybeLanJoinPunch(local_port, nfrom);
   }
   if (from) {
@@ -762,6 +833,11 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
       REXKRNL_DEBUG("XSocket::SendTo direct unicast to {}:{} ok, sent {} bytes "
                     "(our local port={})",
                     dest_ip_str, ntohs(nto.sin_port), direct_result, local_port);
+      if (netplay_tx_info_logged_ < kNetplayInfoLogCap) {
+        ++netplay_tx_info_logged_;
+        REXKRNL_INFO("XSocket netplay TX: {} bytes to {}:{} from our local port {}",
+                     direct_result, dest_ip_str, ntohs(nto.sin_port), local_port);
+      }
     }
   }
   return direct_result;

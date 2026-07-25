@@ -155,6 +155,15 @@ class XSocket : public XObject {
 
   bool broadcast_socket_ = false;
 
+  // Netplay connectivity diagnostics: the first few real inbound/outbound
+  // unicast datagrams on this socket are logged at INFO (not DEBUG) so a normal
+  // log reveals whether peer packets actually arrive and which local port our
+  // replies leave from — the decisive facts for NAT/reply-path problems.
+  // Capped per socket to stay quiet during sustained play.
+  uint32_t netplay_rx_info_logged_ = 0;
+  uint32_t netplay_tx_info_logged_ = 0;
+  static constexpr uint32_t kNetplayInfoLogCap = 8;
+
   mutable std::mutex lan_probe_mutex_;
   uint64_t lan_probe_handle_ = ~0ull;
   bool lan_probe_failed_ = false;
