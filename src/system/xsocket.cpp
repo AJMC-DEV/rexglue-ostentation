@@ -15,12 +15,14 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include <rex/cvar.h>
 #include <rex/kernel/xam/module.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/nat_punch.h>
 #include <rex/system/upnp.h>
 #include <rex/system/xlive_web_client.h>
 #include <rex/system/xsession.h>
@@ -274,8 +276,28 @@ bool XSocket::PunchFromBoundUdpSocket(uint16_t local_port, uint32_t peer_ip_net,
                  peer_port, GetNativeSocketError());
     return false;
   }
-  REXKRNL_INFO("XSocket LAN punch sent from port {} to {}:{}", local_port, peer_ip, peer_port);
+  REXKRNL_INFO("XSocket hole-punch sent from port {} to {}:{}", local_port, peer_ip, peer_port);
   return true;
+}
+
+void XSocket::PunchAllBoundUdpSockets(uint32_t peer_ip_net) {
+  // Snapshot the bound ports under the lock, then punch outside it so we don't
+  // hold g_bound_udp_mutex across sendto() or recurse into it via
+  // PunchFromBoundUdpSocket (which re-locks).
+  std::vector<uint16_t> ports;
+  {
+    std::lock_guard<std::mutex> lock(g_bound_udp_mutex);
+    ports.reserve(BoundUdpSockets().size());
+    for (const auto& [port, sock] : BoundUdpSockets()) {
+      (void)sock;
+      ports.push_back(port);
+    }
+  }
+  for (const uint16_t port : ports) {
+    // Port-preserving: the peer runs the same title, so its socket for our
+    // local port `port` listens on that same port number on its side.
+    PunchFromBoundUdpSocket(port, peer_ip_net, port);
+  }
 }
 
 XSocket::XSocket(KernelState* kernel_state) : XObject(kernel_state, kObjectType) {}
@@ -442,6 +464,9 @@ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
     // Coax Windows' native firewall allow-prompt so inbound netplay traffic
     // isn't silently dropped (fires at most once per process).
     TriggerFirewallPromptOnce(req_port);
+    // Continuously hole-punch toward peers so the session is reachable even
+    // when UPnP/port-forwarding isn't available (the common case).
+    NatPunchCoordinator::Get().Start(kernel_state_->title_id());
   }
 
   return X_STATUS_SUCCESS;
@@ -541,8 +566,23 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
     if (ret > 0 && IsLanPunchDatagram(buf, buf_len, ret)) {
       char src_ip_str[INET_ADDRSTRLEN] = {};
       inet_ntop(AF_INET, &nfrom.sin_addr, src_ip_str, sizeof(src_ip_str));
-      REXKRNL_DEBUG("XSocket::RecvFrom swallowed LAN punch from {}:{}", src_ip_str,
+      REXKRNL_DEBUG("XSocket::RecvFrom swallowed hole-punch from {}:{}", src_ip_str,
                     ntohs(nfrom.sin_port));
+      // Receiving a peer's punch proves our inbound NAT path is OPEN for them —
+      // the single most important fact for internet play. Surface the first few
+      // at INFO so a normal log confirms hole-punching worked.
+      if (netplay_punch_info_logged_ < kNetplayInfoLogCap) {
+        ++netplay_punch_info_logged_;
+        sockaddr_in local{};
+        socklen_t local_len = sizeof(local);
+        uint16_t local_port = 0;
+        if (getsockname(native_handle_, (sockaddr*)&local, &local_len) == 0) {
+          local_port = ntohs(local.sin_port);
+        }
+        REXKRNL_INFO("XSocket netplay: hole-punch received from {}:{} on our local "
+                     "port {} — inbound path is OPEN",
+                     src_ip_str, ntohs(nfrom.sin_port), local_port);
+      }
       continue;
     }
     break;

@@ -22,6 +22,7 @@
 #include <rex/runtime.h>
 #include <rex/system/export_resolver.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/nat_punch.h>
 #include <rex/system/upnp.h>
 #include <rex/system/xlive_web_client.h>
 #include <rex/system/function_dispatcher.h>
@@ -283,6 +284,8 @@ void Runtime::Shutdown() {
   // Tear down any UPnP port forwards we created (best effort; the router-side
   // lease would expire on its own if we crashed instead).
   system::UpnpManager::Get().Shutdown();
+  // Stop the WAN hole-punch loop.
+  system::NatPunchCoordinator::Get().Stop();
   kernel_state_.reset();
   function_dispatcher_.reset();
   export_resolver_.reset();

@@ -113,6 +113,13 @@ class XSocket : public XObject {
   static bool PunchFromBoundUdpSocket(uint16_t local_port, uint32_t peer_ip_net,
                                       uint16_t peer_port);
 
+  // Fire a hole-punch datagram at peer_ip_net from every bound UDP socket,
+  // targeting the peer's matching port (port-preserving assumption: both ends
+  // run the same title on the same System Link ports). Used by the WAN NAT
+  // punch coordinator to open both sides' NAT mappings for internet play with
+  // no router configuration.
+  static void PunchAllBoundUdpSockets(uint32_t peer_ip_net);
+
   X_STATUS SetOption(uint32_t level, uint32_t optname, void* optval_ptr, uint32_t optlen);
   X_STATUS IOControl(uint32_t cmd, uint8_t* arg_ptr);
 
@@ -162,6 +169,7 @@ class XSocket : public XObject {
   // Capped per socket to stay quiet during sustained play.
   uint32_t netplay_rx_info_logged_ = 0;
   uint32_t netplay_tx_info_logged_ = 0;
+  uint32_t netplay_punch_info_logged_ = 0;
   static constexpr uint32_t kNetplayInfoLogCap = 8;
 
   mutable std::mutex lan_probe_mutex_;

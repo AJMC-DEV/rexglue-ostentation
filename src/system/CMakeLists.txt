@@ -24,6 +24,7 @@ set(REXSYSTEM_SOURCES
     xlive_flags.cpp
     xlive_web_client.cpp
     upnp.cpp
+    nat_punch.cpp
     xsession.cpp
 
     # Utilities
