@@ -137,6 +137,51 @@ target_compile_definitions(o1heap PRIVATE
     "O1HEAP_CONFIG_HEADER=\"${CMAKE_CURRENT_SOURCE_DIR}/../include/rex/o1heap_config.h\"")
 target_compile_options(o1heap PRIVATE -w)
 
+# miniupnpc - UPnP IGD client (vendored from https://github.com/miniupnp/miniupnp)
+# Used by rex::system::UPnP to discover the router and add/remove the netplay
+# port forwards. Only the miniupnpc client library is vendored; miniupnpd and
+# the standalone tools are not.
+set(MINIUPNPC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/miniupnp/miniupnpc")
+file(READ "${MINIUPNPC_DIR}/VERSION" MINIUPNPC_VERSION)
+string(STRIP "${MINIUPNPC_VERSION}" MINIUPNPC_VERSION)
+# miniupnpcstrings.h is generated upstream by a per-platform script; the values
+# only feed the User-Agent header, so configure it straight into the build dir.
+set(PROJECT_VERSION "${MINIUPNPC_VERSION}")
+configure_file("${MINIUPNPC_DIR}/miniupnpcstrings.h.cmake"
+               "${CMAKE_CURRENT_BINARY_DIR}/miniupnp/miniupnpcstrings.h" @ONLY)
+
+add_library(miniupnp STATIC
+    ${MINIUPNPC_DIR}/src/addr_is_reserved.c
+    ${MINIUPNPC_DIR}/src/connecthostport.c
+    ${MINIUPNPC_DIR}/src/igd_desc_parse.c
+    ${MINIUPNPC_DIR}/src/minisoap.c
+    ${MINIUPNPC_DIR}/src/minissdpc.c
+    ${MINIUPNPC_DIR}/src/miniupnpc.c
+    ${MINIUPNPC_DIR}/src/miniwget.c
+    ${MINIUPNPC_DIR}/src/minixml.c
+    ${MINIUPNPC_DIR}/src/portlistingparse.c
+    ${MINIUPNPC_DIR}/src/receivedata.c
+    ${MINIUPNPC_DIR}/src/upnpcommands.c
+    ${MINIUPNPC_DIR}/src/upnpdev.c
+    ${MINIUPNPC_DIR}/src/upnperrors.c
+    ${MINIUPNPC_DIR}/src/upnpreplyparse.c
+)
+target_include_directories(miniupnp
+    PRIVATE
+        ${MINIUPNPC_DIR}
+        ${CMAKE_CURRENT_BINARY_DIR}/miniupnp
+    PUBLIC
+        $<BUILD_INTERFACE:${MINIUPNPC_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_compile_definitions(miniupnp PUBLIC MINIUPNP_STATICLIB)
+if(WIN32)
+    target_link_libraries(miniupnp PRIVATE ws2_32 iphlpapi)
+else()
+    target_compile_definitions(miniupnp PRIVATE _GNU_SOURCE)
+endif()
+# Suppress warnings in third-party C code
+target_compile_options(miniupnp PRIVATE -w)
+
 # xxHash - extremely fast non-cryptographic hash (git submodule)
 set(XXHASH_BUILD_XXHSUM OFF CACHE BOOL "" FORCE)
 add_subdirectory(xxHash/cmake_unofficial)

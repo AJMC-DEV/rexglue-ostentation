@@ -181,6 +181,13 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
     return fail(X_STATUS_UNSUCCESSFUL, "VFS setup failed");
   }
 
+  // Start looking for the router now: SSDP discovery takes seconds, and the
+  // title's first bind() shouldn't have to wait for it. Runs on its own thread
+  // and no-ops when upnp_enabled is false.
+  if (REXCVAR_GET(xlive_web_enabled)) {
+    system::UPnP::Get().Initialize();
+  }
+
   // Skip GPU initialization in tool mode (for analysis tools like codegen)
   if (tool_mode_) {
     REXSYS_INFO("Runtime initialized in tool mode (no GPU)");
@@ -283,7 +290,7 @@ void Runtime::Shutdown() {
   }
   // Tear down any UPnP port forwards we created (best effort; the router-side
   // lease would expire on its own if we crashed instead).
-  system::UpnpManager::Get().Shutdown();
+  system::UPnP::Get().Shutdown();
   // Stop the WAN hole-punch loop.
   system::NatPunchCoordinator::Get().Stop();
   kernel_state_.reset();

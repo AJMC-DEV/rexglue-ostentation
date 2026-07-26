@@ -2,43 +2,25 @@
  * @file        system/upnp.cpp
  * @brief       Automatic NAT traversal via UPnP IGD port forwarding.
  *
- *   Self-contained UPnP Internet Gateway Device client:
- *     1. SSDP discovery (UDP multicast to 239.255.255.250:1900) to find the
- *        router and the LOCATION of its device description.
- *     2. Fetch + parse the device description XML for the WANIPConnection /
- *        WANPPPConnection service control URL.
- *     3. SOAP AddPortMapping / DeletePortMapping (HTTP POST via WinHTTP).
+ *   Ported from Xenia Canary's xe::kernel::UPnP, which is built on miniupnpc
+ *   (thirdparty/miniupnp). miniupnpc handles SSDP discovery, device
+ *   description parsing and the SOAP AddPortMapping/DeletePortMapping calls,
+ *   including the long tail of router quirks a hand-rolled client trips over.
  *
- *   No third-party dependency (miniupnpc etc.) — the netplay stack is already
- *   Windows/WinHTTP/Winsock based, so this matches it.
+ *   Two behaviours are kept from ReXGlue's previous hand-rolled client because
+ *   miniupnpc has no equivalent:
+ *     - Discovery probes every local IPv4 adapter, not just the OS-default
+ *       multicast interface. A Hyper-V/WSL/VMware/VPN adapter otherwise
+ *       swallows the M-SEARCH, which is the usual reason "no router found".
+ *     - ConflictInMappingEntry (718) is resolved by reading the existing rule
+ *       and reclaiming it only when it points at some other machine.
  *
  * @modified    2026 - ReXGlue netplay
  */
 
 #include <rex/system/upnp.h>
 
-#include <algorithm>
-#include <atomic>
-#include <cctype>
-#include <chrono>
-#include <condition_variable>
-#include <cstdlib>
-#include <cstring>
-#include <mutex>
-#include <string>
-#include <thread>
-#include <vector>
-
-#include <fmt/format.h>
-
-#include <rex/cvar.h>
-#include <rex/logging.h>
 #include <rex/platform.h>
-#include <rex/system/xlive_web_client.h>
-
-// Declared in xlive_flags.cpp
-REXCVAR_DECLARE(bool, upnp_enabled);
-REXCVAR_DECLARE(int32_t, upnp_lease_seconds);
 
 #if REX_PLATFORM_WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -50,801 +32,864 @@ REXCVAR_DECLARE(int32_t, upnp_lease_seconds);
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
-#include <windows.h>
-#include <winhttp.h>
-#pragma comment(lib, "winhttp.lib")
-#pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "iphlpapi.lib")
+#elif REX_PLATFORM_LINUX
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #endif
+
+#include <miniupnpc.h>
+#include <miniwget.h>
+#include <upnpcommands.h>
+#include <upnperrors.h>
+
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#include <fmt/format.h>
+
+#include <rex/cvar.h>
+#include <rex/logging.h>
+
+// Declared in xlive_flags.cpp
+REXCVAR_DECLARE(bool, upnp_enabled);
+REXCVAR_DECLARE(int32_t, upnp_lease_seconds);
+REXCVAR_DECLARE(std::string, upnp_root);
 
 namespace rex::system {
 
 #define UPNP_LOG(...) REXSYS_INFO("[UPnP] " __VA_ARGS__)
 #define UPNP_WARN(...) REXSYS_WARN("[UPnP] " __VA_ARGS__)
-
-#if REX_PLATFORM_WIN32
+#define UPNP_ERROR(...) REXSYS_ERROR("[UPnP] " __VA_ARGS__)
 
 namespace {
 
-constexpr char kSsdpMulticastAddr[] = "239.255.255.250";
-constexpr uint16_t kSsdpPort = 1900;
 constexpr char kMappingDescription[] = "ReXGlue Netplay";
 
-// ---------------------------------------------------------------------------
-// Small string / URL helpers
-// ---------------------------------------------------------------------------
+// How long to wait for SSDP replies on each interface probed.
+constexpr int kDiscoveryDelayMs = 2000;
 
-std::string ToLower(std::string s) {
-  for (char& c : s) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
-  return s;
+// Renewal interval used when the router only supports permanent (infinite)
+// leases, so a router reboot still gets our mappings back reasonably soon.
+constexpr std::chrono::seconds kPermanentLeaseRefreshInterval{45 * 60};
+
+// Write upnp_root back to the config file so the next run skips SSDP discovery
+// entirely. Cvars are only written on an explicit SaveConfig, and nothing else
+// in a netplay session triggers one.
+void PersistUPnPRoot() {
+  const auto& path = rex::cvar::GetConfigPath();
+  if (path.empty()) {
+    // Headless/tool runs never loaded a config; the cache is session-only.
+    return;
+  }
+  rex::cvar::SaveConfig(path);
 }
 
-// Case-insensitive extraction of a single HTTP header value (SSDP responses are
-// HTTP/1.1 formatted). Returns the trimmed value or "" if absent.
-std::string GetHttpHeader(const std::string& response, const std::string& name) {
-  const std::string haystack = ToLower(response);
-  const std::string needle = ToLower(name) + ":";
-  size_t pos = haystack.find(needle);
-  if (pos == std::string::npos) return {};
-  pos += needle.size();
-  size_t end = response.find_first_of("\r\n", pos);
-  std::string value = response.substr(pos, end - pos);
-  // Trim surrounding whitespace.
-  size_t b = value.find_first_not_of(" \t");
-  size_t e = value.find_last_not_of(" \t\r\n");
-  if (b == std::string::npos) return {};
-  return value.substr(b, e - b + 1);
-}
+// Every "up", non-loopback IPv4 unicast address on this machine, as dotted
+// strings suitable for miniupnpc's `multicastif` parameter.
+std::vector<std::string> EnumerateLocalIpv4Strings() {
+  std::vector<std::string> ips;
 
-// Extract the text between <tag> and </tag>, searching from `from`. Namespace
-// prefixes are ignored by matching only the local tag name.
-std::string GetXmlTag(const std::string& xml, const std::string& tag,
-                      size_t from = 0) {
-  const std::string open = "<" + tag + ">";
-  const std::string close = "</" + tag + ">";
-  size_t start = xml.find(open, from);
-  if (start == std::string::npos) return {};
-  start += open.size();
-  size_t end = xml.find(close, start);
-  if (end == std::string::npos) return {};
-  return xml.substr(start, end - start);
-}
-
-struct ParsedUrl {
-  std::string host;
-  uint16_t port = 80;
-  std::string path = "/";
-  bool https = false;
-};
-
-ParsedUrl ParseUrl(const std::string& url) {
-  ParsedUrl r;
-  std::string rest = url;
-  if (rest.compare(0, 8, "https://") == 0) {
-    r.https = true;
-    r.port = 443;
-    rest = rest.substr(8);
-  } else if (rest.compare(0, 7, "http://") == 0) {
-    rest = rest.substr(7);
-  }
-  size_t slash = rest.find('/');
-  std::string authority = rest.substr(0, slash);
-  r.path = (slash == std::string::npos) ? "/" : rest.substr(slash);
-  size_t colon = authority.find(':');
-  if (colon == std::string::npos) {
-    r.host = authority;
-  } else {
-    r.host = authority.substr(0, colon);
-    r.port = static_cast<uint16_t>(std::atoi(authority.c_str() + colon + 1));
-  }
-  return r;
-}
-
-// The scheme://host:port origin of a URL, without the path.
-std::string UrlOrigin(const std::string& url) {
-  ParsedUrl p = ParseUrl(url);
-  const char* scheme = p.https ? "https://" : "http://";
-  return fmt::format("{}{}:{}", scheme, p.host, p.port);
-}
-
-// Resolve a (possibly relative) control URL against the device description's
-// LOCATION origin and optional <URLBase>.
-std::string ResolveControlUrl(const std::string& location,
-                              const std::string& url_base,
-                              const std::string& control_url) {
-  if (control_url.compare(0, 7, "http://") == 0 ||
-      control_url.compare(0, 8, "https://") == 0) {
-    return control_url;
-  }
-  const std::string origin =
-      !url_base.empty() ? UrlOrigin(url_base) : UrlOrigin(location);
-  if (!control_url.empty() && control_url.front() == '/') {
-    return origin + control_url;
-  }
-  return origin + "/" + control_url;
-}
-
-// ---------------------------------------------------------------------------
-// WinHTTP request (arbitrary method/headers/body -> status + body)
-// ---------------------------------------------------------------------------
-
-bool HttpRequest(const std::string& url, const std::wstring& method,
-                 const std::wstring& headers, const std::string& body,
-                 int timeout_ms, DWORD& out_status, std::string& out_body) {
-  out_status = 0;
-  out_body.clear();
-  ParsedUrl pu = ParseUrl(url);
-
-  HINTERNET hSession = WinHttpOpen(L"ReXGlue-UPnP/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
-                                   WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-  if (!hSession) return false;
-
-  const std::wstring whost(pu.host.begin(), pu.host.end());
-  const std::wstring wpath(pu.path.begin(), pu.path.end());
-
-  HINTERNET hConn = WinHttpConnect(hSession, whost.c_str(), pu.port, 0);
-  if (!hConn) {
-    WinHttpCloseHandle(hSession);
-    return false;
-  }
-
-  DWORD flags = pu.https ? WINHTTP_FLAG_SECURE : 0;
-  HINTERNET hReq = WinHttpOpenRequest(hConn, method.c_str(), wpath.c_str(), nullptr,
-                                      WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                      flags);
-  if (!hReq) {
-    WinHttpCloseHandle(hConn);
-    WinHttpCloseHandle(hSession);
-    return false;
-  }
-
-  WinHttpSetTimeouts(hReq, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
-
-  const wchar_t* hdr = headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headers.c_str();
-  DWORD hdr_len = headers.empty() ? 0 : static_cast<DWORD>(headers.size());
-
-  LPCVOID body_ptr = body.empty() ? nullptr : static_cast<LPCVOID>(body.data());
-  DWORD body_len = static_cast<DWORD>(body.size());
-
-  bool ok = WinHttpSendRequest(hReq, hdr, hdr_len, const_cast<LPVOID>(body_ptr),
-                               body_len, body_len, 0) != FALSE;
-  if (ok) ok = WinHttpReceiveResponse(hReq, nullptr) != FALSE;
-
-  if (ok) {
-    DWORD status = 0;
-    DWORD status_size = sizeof(status);
-    WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                        WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size,
-                        WINHTTP_NO_HEADER_INDEX);
-    out_status = status;
-
-    DWORD avail = 0;
-    while (WinHttpQueryDataAvailable(hReq, &avail) && avail > 0) {
-      std::string chunk(avail, '\0');
-      DWORD read = 0;
-      if (WinHttpReadData(hReq, chunk.data(), avail, &read)) {
-        out_body.append(chunk.data(), read);
-      } else {
-        break;
-      }
-    }
-  }
-
-  WinHttpCloseHandle(hReq);
-  WinHttpCloseHandle(hConn);
-  WinHttpCloseHandle(hSession);
-  return ok;
-}
-
-// ---------------------------------------------------------------------------
-// UPnP manager implementation
-// ---------------------------------------------------------------------------
-
-struct DesiredMapping {
-  uint16_t port = 0;
-  bool udp = true;
-  // steady_clock time at which the router-side lease should be renewed. Zero
-  // means "not mapped yet, add ASAP".
-  std::chrono::steady_clock::time_point next_renew{};
-};
-
-class Impl {
- public:
-  static Impl& Get() {
-    static Impl instance;
-    return instance;
-  }
-
-  void RequestMapping(uint16_t port, bool udp) {
-    if (port == 0) return;
-    if (!REXCVAR_GET(upnp_enabled)) return;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      for (const auto& m : desired_) {
-        if (m.port == port && m.udp == udp) return;  // already tracked
-      }
-      desired_.push_back(DesiredMapping{port, udp, {}});
-      UPNP_LOG("Queued {} port {} for forwarding", udp ? "UDP" : "TCP", port);
-      EnsureWorkerLocked();
-    }
-    cv_.notify_all();
-  }
-
-  bool is_available() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return discovered_;
-  }
-
-  void Shutdown() {
-    std::thread worker;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (!worker_running_) return;
-      stop_ = true;
-      worker = std::move(worker_);
-      worker_running_ = false;
-    }
-    cv_.notify_all();
-    if (worker.joinable()) worker.join();
-  }
-
- private:
-  Impl() = default;
-  ~Impl() { Shutdown(); }
-
-  void EnsureWorkerLocked() {
-    if (worker_running_) return;
-    stop_ = false;
-    worker_running_ = true;
-    worker_ = std::thread([this] { WorkerMain(); });
-    // Delete our mappings even if the host forgets to call Shutdown().
-    static std::once_flag atexit_once;
-    std::call_once(atexit_once,
-                   [] { std::atexit([] { Impl::Get().Shutdown(); }); });
-  }
-
-  // ------------------------------------------------------------------
-  // Worker
-  // ------------------------------------------------------------------
-  void WorkerMain() {
-    using namespace std::chrono;
-    auto next_discovery_attempt = steady_clock::now();
-
-    for (;;) {
-      std::unique_lock<std::mutex> lock(mutex_);
-      if (stop_) break;
-
-      if (!discovered_) {
-        if (steady_clock::now() >= next_discovery_attempt) {
-          lock.unlock();
-          const bool ok = Discover();
-          lock.lock();
-          if (stop_) break;
-          if (!ok) {
-            // Routers that don't answer SSDP won't start answering soon; back
-            // off so we're not spamming multicast every loop.
-            next_discovery_attempt = steady_clock::now() + seconds(30);
-          }
-        }
-        if (!discovered_) {
-          cv_.wait_until(lock, next_discovery_attempt,
-                         [this] { return stop_.load(); });
-          continue;
-        }
-      }
-
-      // Apply / renew mappings that are due.
-      const auto now = steady_clock::now();
-      std::vector<DesiredMapping> due;
-      for (auto& m : desired_) {
-        if (m.next_renew.time_since_epoch().count() == 0 || now >= m.next_renew) {
-          due.push_back(m);
-        }
-      }
-
-      const int lease = LeaseSeconds();
-      const std::string internal_ip = internal_ip_;
-      const std::string control_url = control_url_;
-      const std::string service_type = service_type_;
-      lock.unlock();
-
-      for (const auto& m : due) {
-        const bool ok = AddPortMapping(control_url, service_type, internal_ip,
-                                       m.port, m.udp, lease);
-        std::lock_guard<std::mutex> relock(mutex_);
-        for (auto& d : desired_) {
-          if (d.port == m.port && d.udp == m.udp) {
-            // Renew at half the lease; retry sooner if the add failed so a
-            // transient router hiccup self-heals.
-            d.next_renew =
-                steady_clock::now() +
-                (ok ? seconds(lease > 0 ? lease / 2 : 1800) : seconds(60));
-          }
-        }
-      }
-
-      lock.lock();
-      if (stop_) break;
-      // Wake for the soonest renewal, but at least every 5 minutes so newly
-      // queued ports get picked up promptly.
-      auto wake = now + minutes(5);
-      for (const auto& m : desired_) {
-        if (m.next_renew.time_since_epoch().count() != 0 && m.next_renew < wake) {
-          wake = m.next_renew;
-        }
-      }
-      cv_.wait_until(lock, wake, [this] { return stop_.load(); });
-    }
-
-    // Teardown: remove every mapping we created.
-    DeleteAllMappings();
-  }
-
-  int LeaseSeconds() const {
-    int lease = REXCVAR_GET(upnp_lease_seconds);
-    if (lease < 0) lease = 0;
-    return lease;
-  }
-
-  // ------------------------------------------------------------------
-  // Discovery
-  // ------------------------------------------------------------------
-  bool Discover() {
-    std::vector<std::string> locations = SsdpSearch();
-    if (locations.empty()) {
-      UPNP_WARN("No router answered SSDP discovery. Enable UPnP on the router, "
-                "or (if a VPN/Hyper-V/WSL adapter is active) it may be "
-                "intercepting multicast. Manual port forwarding of the netplay "
-                "UDP port remains an alternative.");
-      return false;
-    }
-
-    for (const std::string& location : locations) {
-      DWORD status = 0;
-      std::string xml;
-      if (!HttpRequest(location, L"GET", L"", "", 3000, status, xml) ||
-          status != 200 || xml.empty()) {
-        continue;
-      }
-
-      const std::string url_base = GetXmlTag(xml, "URLBase");
-
-      // Prefer WANIPConnection (Ethernet/cable), fall back to WANPPPConnection
-      // (DSL). Match on the local service name so :1 / :2 both work.
-      for (const char* wanted : {"WANIPConnection", "WANPPPConnection"}) {
-        size_t svc = xml.find(wanted);
-        if (svc == std::string::npos) continue;
-
-        // Recover the full serviceType value enclosing this match.
-        size_t type_open = xml.rfind("<serviceType>", svc);
-        size_t type_close = xml.find("</serviceType>", svc);
-        if (type_open == std::string::npos || type_close == std::string::npos) {
-          continue;
-        }
-        type_open += std::strlen("<serviceType>");
-        std::string service_type = xml.substr(type_open, type_close - type_open);
-
-        std::string control = GetXmlTag(xml, "controlURL", svc);
-        if (control.empty()) continue;
-
-        const std::string full = ResolveControlUrl(location, url_base, control);
-        const std::string internal_ip = DetectInternalIp(ParseUrl(location).host);
-        if (internal_ip.empty()) {
-          UPNP_WARN("Found IGD but could not determine our LAN address");
-          continue;
-        }
-
-        {
-          std::lock_guard<std::mutex> lock(mutex_);
-          control_url_ = full;
-          service_type_ = service_type;
-          internal_ip_ = internal_ip;
-          discovered_ = true;
-        }
-        UPNP_LOG("IGD found: service='{}' control='{}' internalClient={}",
-                 service_type, full, internal_ip);
-        return true;
-      }
-    }
-
-    UPNP_WARN("IGD responded but exposes no WAN connection service");
-    return false;
-  }
-
-  // Send M-SEARCH and collect unique LOCATION URLs from the replies.
-  // Every "up", non-loopback IPv4 unicast address on this machine, in network
-  // byte order. The router only answers a probe that actually egresses the LAN
-  // adapter it sits on; letting Windows pick a default multicast interface
-  // silently loses the probe to a Hyper-V/WSL/VMware/VPN virtual adapter, which
-  // is the usual reason discovery "finds no router". So we probe from each.
-  std::vector<uint32_t> EnumerateLocalIpv4() {
-    std::vector<uint32_t> ips;
-    ULONG size = 15000;
-    std::vector<uint8_t> buffer(size);
-    const ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
-                        GAA_FLAG_SKIP_DNS_SERVER;
-    ULONG ret = GetAdaptersAddresses(
+#if REX_PLATFORM_WIN32
+  ULONG size = 15000;
+  std::vector<uint8_t> buffer(size);
+  const ULONG flags =
+      GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+  ULONG ret = GetAdaptersAddresses(
+      AF_INET, flags, nullptr,
+      reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()), &size);
+  if (ret == ERROR_BUFFER_OVERFLOW) {
+    buffer.resize(size);
+    ret = GetAdaptersAddresses(
         AF_INET, flags, nullptr,
         reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()), &size);
-    if (ret == ERROR_BUFFER_OVERFLOW) {
-      buffer.resize(size);
-      ret = GetAdaptersAddresses(
-          AF_INET, flags, nullptr,
-          reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()), &size);
-    }
-    if (ret != NO_ERROR) return ips;
-
-    for (auto* a = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()); a;
-         a = a->Next) {
-      if (a->OperStatus != IfOperStatusUp) continue;
-      if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
-      for (auto* ua = a->FirstUnicastAddress; ua; ua = ua->Next) {
-        auto* sa = reinterpret_cast<sockaddr_in*>(ua->Address.lpSockaddr);
-        if (sa && sa->sin_family == AF_INET) {
-          const uint32_t ip = sa->sin_addr.s_addr;
-          if (ip != 0 && ip != htonl(INADDR_LOOPBACK)) ips.push_back(ip);
-        }
-      }
-    }
+  }
+  if (ret != NO_ERROR) {
     return ips;
   }
 
-  // Send M-SEARCH out one specific interface and collect LOCATION URLs from the
-  // (unicast) replies. if_addr == INADDR_ANY uses the OS default interface.
-  void QuerySsdpInterface(uint32_t if_addr, std::vector<std::string>& locations) {
-    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s == INVALID_SOCKET) return;
-
-    // Bind to the interface so replies return here and multicast egresses it.
-    sockaddr_in local{};
-    local.sin_family = AF_INET;
-    local.sin_addr.s_addr = if_addr;  // ANY when 0
-    bind(s, reinterpret_cast<sockaddr*>(&local), sizeof(local));
-
-    if (if_addr != INADDR_ANY) {
-      // Pin multicast egress to this interface (in_addr, network byte order).
-      setsockopt(s, IPPROTO_IP, IP_MULTICAST_IF,
-                 reinterpret_cast<const char*>(&if_addr), sizeof(if_addr));
-    }
-    const DWORD ttl = 2;
-    setsockopt(s, IPPROTO_IP, IP_MULTICAST_TTL, reinterpret_cast<const char*>(&ttl),
-               sizeof(ttl));
-    const DWORD recv_timeout = 1200;  // ms
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&recv_timeout),
-               sizeof(recv_timeout));
-
-    sockaddr_in dest{};
-    dest.sin_family = AF_INET;
-    dest.sin_port = htons(kSsdpPort);
-    inet_pton(AF_INET, kSsdpMulticastAddr, &dest.sin_addr);
-
-    // Probe both the IGD device type and the WAN connection services directly;
-    // some routers only answer the specific service search.
-    const char* search_targets[] = {
-        "urn:schemas-upnp-org:device:InternetGatewayDevice:1",
-        "urn:schemas-upnp-org:service:WANIPConnection:1",
-        "urn:schemas-upnp-org:service:WANPPPConnection:1",
-        "ssdp:all",
-    };
-    for (const char* st : search_targets) {
-      const std::string msearch = fmt::format(
-          "M-SEARCH * HTTP/1.1\r\n"
-          "HOST: {}:{}\r\n"
-          "MAN: \"ssdp:discover\"\r\n"
-          "MX: 2\r\n"
-          "ST: {}\r\n"
-          "\r\n",
-          kSsdpMulticastAddr, kSsdpPort, st);
-      // SSDP is UDP; send each target twice since the first is often dropped.
-      for (int i = 0; i < 2; ++i) {
-        sendto(s, msearch.data(), static_cast<int>(msearch.size()), 0,
-               reinterpret_cast<sockaddr*>(&dest), sizeof(dest));
+  for (auto* a = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()); a;
+       a = a->Next) {
+    if (a->OperStatus != IfOperStatusUp) continue;
+    if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+    for (auto* ua = a->FirstUnicastAddress; ua; ua = ua->Next) {
+      auto* sa = reinterpret_cast<sockaddr_in*>(ua->Address.lpSockaddr);
+      if (!sa || sa->sin_family != AF_INET) continue;
+      if (!sa->sin_addr.s_addr || sa->sin_addr.s_addr == htonl(INADDR_LOOPBACK)) {
+        continue;
       }
-    }
-
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    char buf[2048];
-    while (std::chrono::steady_clock::now() < deadline) {
-      sockaddr_in from{};
-      int from_len = sizeof(from);
-      int n = recvfrom(s, buf, sizeof(buf) - 1, 0, reinterpret_cast<sockaddr*>(&from),
-                       &from_len);
-      if (n <= 0) continue;  // timeout tick; keep draining until deadline
-      buf[n] = '\0';
-      std::string response(buf, n);
-      std::string location = GetHttpHeader(response, "LOCATION");
-      if (!location.empty() &&
-          std::find(locations.begin(), locations.end(), location) == locations.end()) {
-        locations.push_back(location);
-      }
-    }
-
-    closesocket(s);
-  }
-
-  std::vector<std::string> SsdpSearch() {
-    std::vector<std::string> locations;
-
-    std::vector<uint32_t> interfaces = EnumerateLocalIpv4();
-    // Always include the OS default interface as a fallback in case enumeration
-    // came up empty or missed the right adapter.
-    interfaces.push_back(INADDR_ANY);
-
-    UPNP_LOG("SSDP discovery across {} interface(s)", interfaces.size());
-    for (uint32_t if_addr : interfaces) {
-      QuerySsdpInterface(if_addr, locations);
-    }
-
-    UPNP_LOG("SSDP discovery collected {} device location(s)", locations.size());
-    return locations;
-  }
-
-  // The source IP the OS would use to reach the router is exactly the
-  // NewInternalClient the mapping must point at.
-  std::string DetectInternalIp(const std::string& igd_host) {
-    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s != INVALID_SOCKET) {
-      sockaddr_in probe{};
-      probe.sin_family = AF_INET;
-      probe.sin_port = htons(kSsdpPort);
-      if (inet_pton(AF_INET, igd_host.c_str(), &probe.sin_addr) == 1 &&
-          connect(s, reinterpret_cast<sockaddr*>(&probe), sizeof(probe)) == 0) {
-        sockaddr_in local{};
-        int len = sizeof(local);
-        if (getsockname(s, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
-          char ip[INET_ADDRSTRLEN] = {};
-          if (inet_ntop(AF_INET, &local.sin_addr, ip, sizeof(ip)) && ip[0]) {
-            closesocket(s);
-            return ip;
-          }
-        }
-      }
-      closesocket(s);
-    }
-    // Fall back to the netplay layer's own LAN detection (honours lan_ip cvar).
-    return XLiveWebClient::Get().lan_address();
-  }
-
-  // ------------------------------------------------------------------
-  // SOAP
-  // ------------------------------------------------------------------
-  bool AddPortMapping(const std::string& control_url, const std::string& service_type,
-                      const std::string& internal_ip, uint16_t port, bool udp,
-                      int lease) {
-    if (control_url.empty()) return false;
-    const char* proto = udp ? "UDP" : "TCP";
-
-    DWORD status = 0;
-    std::string resp;
-    bool ok = SoapAddPortMapping(control_url, service_type, internal_ip, port, udp,
-                                 lease, status, resp);
-
-    // 725 OnlyPermanentLeasesSupported: some routers reject a finite lease.
-    // Retry as a permanent (0) mapping.
-    if ((!ok || status != 200) && lease != 0 &&
-        resp.find("OnlyPermanentLeasesSupported") != std::string::npos) {
-      ok = SoapAddPortMapping(control_url, service_type, internal_ip, port, udp, 0,
-                              status, resp);
-    }
-
-    if (ok && status == 200) {
-      UPNP_LOG("Mapped {} {} -> {}:{} (lease {}s)", proto, port, internal_ip, port,
-               lease);
-      return true;
-    }
-
-    // 718 ConflictInMappingEntry: a forward for this external port already
-    // exists. That's harmless only if it points at THIS machine — otherwise the
-    // router is delivering the port to some other/stale internal client and a
-    // hosted session here is unreachable, so we must reclaim it. Look up where
-    // the existing rule actually points before deciding.
-    if (resp.find("ConflictInMappingEntry") != std::string::npos) {
-      std::string existing_client;
-      const bool got = SoapGetSpecificPortMapping(control_url, service_type, port,
-                                                  udp, existing_client);
-      if (got && existing_client == internal_ip) {
-        UPNP_LOG("{} port {} is already forwarded to this machine ({}) — good",
-                 proto, port, internal_ip);
-        return true;
-      }
-
-      // Couldn't read the existing rule — typically a static/manual forward the
-      // router hides from UPnP. Do NOT delete it: on a router that permitted the
-      // delete we'd wipe a forward that may already be correct and end up worse
-      // off. Just tell the user how to verify it. This is the common case for a
-      // player who already set up manual forwarding.
-      if (!got) {
-        UPNP_WARN("{} port {} already has a forward the router won't expose to "
-                  "UPnP (usually a manual/static rule). Leaving it untouched. If "
-                  "hosting is unreachable, confirm the router forwards {} {} to "
-                  "THIS PC ({}), or delete that manual rule and let UPnP manage it.",
-                  proto, port, proto, port, internal_ip);
-        return true;
-      }
-
-      // Positively points at a different client (stale DHCP lease, another
-      // device). Reclaim it: delete and re-add pointed at us.
-      UPNP_WARN("{} port {} is forwarded to {} (not us, {}); reclaiming it", proto,
-                port, existing_client, internal_ip);
-      DeletePortMapping(control_url, service_type, port, udp);
-
-      DWORD retry_status = 0;
-      std::string retry_resp;
-      bool retried = SoapAddPortMapping(control_url, service_type, internal_ip, port,
-                                        udp, lease, retry_status, retry_resp);
-      if ((!retried || retry_status != 200) && lease != 0 &&
-          retry_resp.find("OnlyPermanentLeasesSupported") != std::string::npos) {
-        retried = SoapAddPortMapping(control_url, service_type, internal_ip, port,
-                                     udp, 0, retry_status, retry_resp);
-      }
-      if (retried && retry_status == 200) {
-        UPNP_LOG("Reclaimed {} port {} -> {}:{}", proto, port, internal_ip, port);
-        return true;
-      }
-      UPNP_WARN("Could not reclaim {} port {} (status={}); the existing forward to "
-                "{} is static. Point it at this PC ({}) in the router, or remove "
-                "it so UPnP can. Hosting on this port is unreachable until then.",
-                proto, port, retry_status, existing_client, internal_ip);
-      return false;
-    }
-
-    UPNP_WARN("AddPortMapping {} {} failed (status={})", proto, port, status);
-    return false;
-  }
-
-  // Read the existing forward for {external port, proto}. Fills out_internal_client
-  // with the LAN IP the router currently delivers this port to. Returns false if
-  // there is no such mapping or the query failed.
-  bool SoapGetSpecificPortMapping(const std::string& control_url,
-                                  const std::string& service_type, uint16_t port,
-                                  bool udp, std::string& out_internal_client) {
-    out_internal_client.clear();
-    const std::string body = fmt::format(
-        "<?xml version=\"1.0\"?>\r\n"
-        "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
-        "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">"
-        "<s:Body>"
-        "<u:GetSpecificPortMappingEntry xmlns:u=\"{svc}\">"
-        "<NewRemoteHost></NewRemoteHost>"
-        "<NewExternalPort>{port}</NewExternalPort>"
-        "<NewProtocol>{proto}</NewProtocol>"
-        "</u:GetSpecificPortMappingEntry>"
-        "</s:Body></s:Envelope>",
-        fmt::arg("svc", service_type), fmt::arg("port", port),
-        fmt::arg("proto", udp ? "UDP" : "TCP"));
-
-    const std::wstring headers =
-        SoapHeaders(service_type, L"GetSpecificPortMappingEntry");
-    DWORD status = 0;
-    std::string resp;
-    if (!HttpRequest(control_url, L"POST", headers, body, 3000, status, resp) ||
-        status != 200) {
-      return false;
-    }
-    out_internal_client = GetXmlTag(resp, "NewInternalClient");
-    return !out_internal_client.empty();
-  }
-
-  bool SoapAddPortMapping(const std::string& control_url,
-                          const std::string& service_type,
-                          const std::string& internal_ip, uint16_t port, bool udp,
-                          int lease, DWORD& out_status, std::string& out_body) {
-    const std::string body = fmt::format(
-        "<?xml version=\"1.0\"?>\r\n"
-        "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
-        "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">"
-        "<s:Body>"
-        "<u:AddPortMapping xmlns:u=\"{svc}\">"
-        "<NewRemoteHost></NewRemoteHost>"
-        "<NewExternalPort>{port}</NewExternalPort>"
-        "<NewProtocol>{proto}</NewProtocol>"
-        "<NewInternalPort>{port}</NewInternalPort>"
-        "<NewInternalClient>{ip}</NewInternalClient>"
-        "<NewEnabled>1</NewEnabled>"
-        "<NewPortMappingDescription>{desc}</NewPortMappingDescription>"
-        "<NewLeaseDuration>{lease}</NewLeaseDuration>"
-        "</u:AddPortMapping>"
-        "</s:Body></s:Envelope>",
-        fmt::arg("svc", service_type), fmt::arg("port", port),
-        fmt::arg("proto", udp ? "UDP" : "TCP"), fmt::arg("ip", internal_ip),
-        fmt::arg("desc", kMappingDescription), fmt::arg("lease", lease));
-
-    const std::wstring headers = SoapHeaders(service_type, L"AddPortMapping");
-    return HttpRequest(control_url, L"POST", headers, body, 4000, out_status,
-                       out_body);
-  }
-
-  bool DeletePortMapping(const std::string& control_url,
-                         const std::string& service_type, uint16_t port, bool udp) {
-    const std::string body = fmt::format(
-        "<?xml version=\"1.0\"?>\r\n"
-        "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
-        "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">"
-        "<s:Body>"
-        "<u:DeletePortMapping xmlns:u=\"{svc}\">"
-        "<NewRemoteHost></NewRemoteHost>"
-        "<NewExternalPort>{port}</NewExternalPort>"
-        "<NewProtocol>{proto}</NewProtocol>"
-        "</u:DeletePortMapping>"
-        "</s:Body></s:Envelope>",
-        fmt::arg("svc", service_type), fmt::arg("port", port),
-        fmt::arg("proto", udp ? "UDP" : "TCP"));
-
-    const std::wstring headers = SoapHeaders(service_type, L"DeletePortMapping");
-    DWORD status = 0;
-    std::string resp;
-    const bool ok =
-        HttpRequest(control_url, L"POST", headers, body, 3000, status, resp);
-    return ok && status == 200;
-  }
-
-  std::wstring SoapHeaders(const std::string& service_type,
-                           const std::wstring& action) {
-    // SOAPAction: "<serviceType>#<action>"
-    std::wstring wsvc(service_type.begin(), service_type.end());
-    return L"Content-Type: text/xml; charset=\"utf-8\"\r\n"
-           L"SOAPAction: \"" +
-           wsvc + L"#" + action + L"\"\r\n";
-  }
-
-  void DeleteAllMappings() {
-    std::vector<DesiredMapping> mappings;
-    std::string control_url, service_type;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (!discovered_) return;
-      mappings = desired_;
-      control_url = control_url_;
-      service_type = service_type_;
-    }
-    for (const auto& m : mappings) {
-      if (DeletePortMapping(control_url, service_type, m.port, m.udp)) {
-        UPNP_LOG("Removed {} port {} forward", m.udp ? "UDP" : "TCP", m.port);
+      char ip[INET_ADDRSTRLEN] = {};
+      if (inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof(ip)) && ip[0]) {
+        ips.emplace_back(ip);
       }
     }
   }
+#elif REX_PLATFORM_LINUX
+  ifaddrs* addrs = nullptr;
+  if (getifaddrs(&addrs) != 0) {
+    return ips;
+  }
+  for (ifaddrs* it = addrs; it; it = it->ifa_next) {
+    if (!it->ifa_addr || it->ifa_addr->sa_family != AF_INET) continue;
+    if (!(it->ifa_flags & IFF_UP) || (it->ifa_flags & IFF_LOOPBACK)) continue;
+    auto* sa = reinterpret_cast<sockaddr_in*>(it->ifa_addr);
+    char ip[INET_ADDRSTRLEN] = {};
+    if (inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof(ip)) && ip[0]) {
+      ips.emplace_back(ip);
+    }
+  }
+  freeifaddrs(addrs);
+#endif
 
-  mutable std::mutex mutex_;
-  std::condition_variable cv_;
-  std::thread worker_;
-  std::atomic<bool> stop_{false};
-  bool worker_running_ = false;
-
-  bool discovered_ = false;
-  std::string control_url_;
-  std::string service_type_;
-  std::string internal_ip_;
-
-  std::vector<DesiredMapping> desired_;
-};
+  // Deduplicate; multi-homed adapters can repeat an address.
+  std::sort(ips.begin(), ips.end());
+  ips.erase(std::unique(ips.begin(), ips.end()), ips.end());
+  return ips;
+}
 
 }  // namespace
 
-UpnpManager& UpnpManager::Get() {
-  static UpnpManager instance;
+// miniupnpc state, kept out of the public header.
+struct UPnP::IgdState {
+  IGDdatas data = {};
+  UPNPUrls urls = {};
+  // Our LAN address on the route to the IGD, filled by miniupnpc.
+  char lan_addr[128] = {};
+  // FreeUPNPUrls must only run on a struct a successful lookup populated.
+  bool urls_valid = false;
+};
+
+UPnP& UPnP::Get() {
+  static UPnP instance;
   return instance;
 }
 
-void UpnpManager::RequestMapping(uint16_t port, bool udp) {
-  Impl::Get().RequestMapping(port, udp);
+UPnP::UPnP() : igd_(std::make_unique<IgdState>()) {}
+
+UPnP::~UPnP() { Shutdown(); }
+
+std::chrono::seconds UPnP::LeaseDuration() const {
+  int32_t lease = REXCVAR_GET(upnp_lease_seconds);
+  if (lease < 0) {
+    lease = 0;
+  }
+  return std::chrono::seconds(lease);
 }
 
-bool UpnpManager::is_available() const { return Impl::Get().is_available(); }
-
-void UpnpManager::Shutdown() { Impl::Get().Shutdown(); }
-
-#else  // !REX_PLATFORM_WIN32
-
-// UPnP is only implemented for the Windows netplay build for now. Non-Windows
-// targets get a no-op manager so callers don't need platform guards.
-UpnpManager& UpnpManager::Get() {
-  static UpnpManager instance;
-  return instance;
+std::chrono::seconds UPnP::RefreshInterval() const {
+  const auto lease = LeaseDuration();
+  if (lease.count() == 0) {
+    return kPermanentLeaseRefreshInterval;
+  }
+  // Renew at half the lease so one missed cycle doesn't drop the mapping,
+  // with a floor so a tiny configured lease can't spin the refresher.
+  return std::max(std::chrono::seconds(60), lease / 2);
 }
-void UpnpManager::RequestMapping(uint16_t, bool) {}
-bool UpnpManager::is_available() const { return false; }
-void UpnpManager::Shutdown() {}
 
-#endif  // REX_PLATFORM_WIN32
+void UPnP::Initialize() {
+  if (active_ || !REXCVAR_GET(upnp_enabled)) {
+    return;
+  }
+
+  bool expected = false;
+  if (!initialized_.compare_exchange_strong(expected, true)) {
+    return;
+  }
+
+  get_valid_IGD_ = std::async(std::launch::async, &UPnP::GetValidIGD, this);
+}
+
+void UPnP::Start() {
+  if (active_ || !REXCVAR_GET(upnp_enabled)) {
+    return;
+  }
+
+  if (!get_valid_IGD_.valid()) {
+    Initialize();
+    if (!get_valid_IGD_.valid()) {
+      return;
+    }
+  }
+
+  const std::optional<std::string> igd_desc = get_valid_IGD_.get();
+
+  if (igd_desc.has_value()) {
+    // Cache the root description URL so the next run skips discovery. Some
+    // routers answer HTTP 401 to actions issued against a freshly rediscovered
+    // device, so reusing the known-good URL is also more reliable.
+    if (REXCVAR_GET(upnp_root) != igd_desc.value()) {
+      REXCVAR_SET(upnp_root, igd_desc.value());
+      PersistUPnPRoot();
+    }
+
+    active_ = true;
+    StartPeriodicPortsRefresher();
+
+    // Anything requested while discovery was still running is waiting here.
+    OpenTrackedPorts();
+  } else if (!REXCVAR_GET(upnp_root).empty()) {
+    // The cached router didn't answer and rediscovery found nothing either.
+    // Drop the stale URL so the next run does a clean search.
+    REXCVAR_SET(upnp_root, std::string());
+    PersistUPnPRoot();
+  }
+}
+
+void UPnP::StartAsync() {
+  if (active_ || !REXCVAR_GET(upnp_enabled)) {
+    return;
+  }
+  // A Start() already in flight owns get_valid_IGD_; don't launch a second.
+  if (start_async_.valid() &&
+      start_async_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+    return;
+  }
+  start_async_ = std::async(std::launch::async, &UPnP::Start, this);
+}
+
+void UPnP::Shutdown() {
+  StopPeriodicPortsRefresher();
+
+  if (start_async_.valid()) {
+    start_async_.wait();
+  }
+
+  // Drain in-flight adds first, or one could land after CloseOpenPorts() and
+  // leave a mapping behind.
+  {
+    std::lock_guard actions_lock(actions_mutex_);
+    for (auto& action : pending_actions_) {
+      if (action.valid()) {
+        action.wait();
+      }
+    }
+    pending_actions_.clear();
+  }
+
+  CloseOpenPorts();
+
+  active_ = false;
+
+  std::lock_guard igd_lock(igd_mutex_);
+  if (igd_->urls_valid) {
+    FreeUPNPUrls(&igd_->urls);
+    igd_->urls_valid = false;
+  }
+}
+
+std::optional<std::string> UPnP::GetValidIGD() {
+  // Check the saved UPnP device is still valid. This ensures we do not receive
+  // HTTP_UNAUTHORIZED when performing UPnP actions.
+  const std::string saved_root = REXCVAR_GET(upnp_root);
+  if (!saved_root.empty()) {
+    UPNP_LOG("Trying saved IGD root {}", saved_root);
+    if (LoadIGD(saved_root)) {
+      return saved_root;
+    }
+    UPNP_LOG("Saved IGD root is stale; rediscovering");
+  }
+
+  return DiscoverValidIGD();
+}
+
+std::optional<std::string> UPnP::DiscoverValidIGD() {
+  std::lock_guard igd_lock(igd_mutex_);
+
+  CleanupIGD();
+
+  // Probe the OS-default multicast interface first, then each local adapter.
+  // Letting Windows pick the interface loses the M-SEARCH to a Hyper-V/WSL/
+  // VPN virtual adapter on a lot of machines.
+  std::vector<std::string> interfaces = EnumerateLocalIpv4Strings();
+  interfaces.insert(interfaces.begin(), std::string());
+
+  UPNP_LOG("Starting UPnP search across {} interface(s)", interfaces.size());
+
+  for (const std::string& if_addr : interfaces) {
+    int error = 0;
+    UPNPDev* device_list =
+        upnpDiscover(kDiscoveryDelayMs, if_addr.empty() ? nullptr : if_addr.c_str(),
+                     nullptr, 0, 0, 2, &error);
+
+    if (!device_list) {
+      if (error) {
+        UPNP_LOG("No devices via {}: error code {}",
+                 if_addr.empty() ? "default interface" : if_addr, error);
+      }
+      continue;
+    }
+
+    const int status =
+        UPNP_GetValidIGD(device_list, &igd_->urls, &igd_->data, igd_->lan_addr,
+                         sizeof(igd_->lan_addr), nullptr, 0);
+
+    std::optional<std::string> igd_desc_url;
+
+    switch (status) {
+      case UPNP_NO_IGD: {
+        UPNP_WARN("No IGD found via {}.",
+                  if_addr.empty() ? "default interface" : if_addr);
+      } break;
+      case UPNP_CONNECTED_IGD: {
+        igd_->urls_valid = true;
+        igd_desc_url = igd_->urls.rootdescURL;
+        UPNP_LOG("Found valid and connected IGD at {}", igd_->urls.rootdescURL);
+      } break;
+      case UPNP_PRIVATEIP_IGD: {
+        igd_->urls_valid = true;
+        igd_desc_url = igd_->urls.rootdescURL;
+        UPNP_LOG(
+            "Found valid and connected IGD but with a reserved address at {}",
+            igd_->urls.rootdescURL);
+      } break;
+      case UPNP_DISCONNECTED_IGD: {
+        UPNP_WARN("Found valid IGD, but it reported as NOT connected.");
+      } break;
+      case UPNP_UNKNOWN_DEVICE: {
+        UPNP_WARN("UPnP device has been found but was not recognized as an IGD.");
+      } break;
+      default: {
+        UPNP_WARN("No valid IGD found (status: {}).", status);
+      } break;
+    }
+
+    freeUPNPDevlist(device_list);
+
+    if (igd_desc_url.has_value()) {
+      UPNP_LOG("Local address on the route to the IGD: {}", igd_->lan_addr);
+      return igd_desc_url;
+    }
+
+    // UPNP_GetValidIGD can partially fill urls even when it reports no IGD.
+    CleanupIGD();
+  }
+
+  UPNP_WARN(
+      "No UPnP router answered. Enable UPnP on the router (or forward the "
+      "netplay ports manually) if hosting is unreachable from the internet.");
+  return std::nullopt;
+}
+
+bool UPnP::LoadIGD(std::string igd_root) {
+  std::lock_guard igd_lock(igd_mutex_);
+
+  CleanupIGD();
+
+  const bool ok = UPNP_GetIGDFromUrl(igd_root.c_str(), &igd_->urls, &igd_->data,
+                                     igd_->lan_addr, sizeof(igd_->lan_addr)) != 0;
+  igd_->urls_valid = ok;
+  return ok;
+}
+
+void UPnP::CleanupIGD() {
+  // Caller holds igd_mutex_.
+  if (igd_->urls_valid) {
+    FreeUPNPUrls(&igd_->urls);
+    igd_->urls_valid = false;
+  }
+  igd_->urls = {};
+  igd_->data = {};
+  std::fill_n(igd_->lan_addr, sizeof(igd_->lan_addr), '\0');
+}
+
+std::future<int32_t> UPnP::AddPortAsync(std::string addr, uint16_t internal_port,
+                                        std::string protocol) {
+  return std::async(std::launch::async, &UPnP::AddPort, this, addr, internal_port,
+                    protocol);
+}
+
+// Games can bind to ports or close sockets from any thread, therefore all
+// member variables must be accessed and written to safely using a mutex.
+int32_t UPnP::AddPort(std::string addr, uint16_t internal_port,
+                      std::string protocol) {
+  if (!active_) {
+    return UPNPCOMMAND_UNKNOWN_ERROR;
+  }
+
+  std::lock_guard igd_lock(igd_mutex_);
+  std::lock_guard bindings_lock(mutex_bindings_);
+
+  if (!igd_->urls_valid || !igd_->urls.controlURL) {
+    return UPNPCOMMAND_UNKNOWN_ERROR;
+  }
+
+  internal_port = GetMappedBindPort(internal_port);
+
+  // If the port is already open then skip opening it again.
+  if (port_bindings_.contains(protocol)) {
+    if (port_bindings_.at(protocol).contains(internal_port)) {
+      return UPNPCOMMAND_SUCCESS;
+    }
+  }
+
+  TrackPort(internal_port, protocol);
+
+  if (addr.empty()) {
+    addr = igd_->lan_addr;
+  }
+
+  const uint16_t external_port = internal_port;
+  const std::string internal_port_str = fmt::format("{}", internal_port);
+  const std::string external_port_str = fmt::format("{}", external_port);
+  const std::string lease_time_str = fmt::format("{}", LeaseDuration().count());
+
+  int result = UPNP_AddPortMapping(
+      igd_->urls.controlURL, igd_->data.first.servicetype,
+      external_port_str.c_str(), internal_port_str.c_str(), addr.c_str(),
+      kMappingDescription, protocol.c_str(), nullptr, lease_time_str.c_str());
+
+  if (result == static_cast<int>(UPnPErrorCodes::OnlyPermanentLeasesSupported)) {
+    result = UPNP_AddPortMapping(
+        igd_->urls.controlURL, igd_->data.first.servicetype,
+        external_port_str.c_str(), internal_port_str.c_str(), addr.c_str(),
+        kMappingDescription, protocol.c_str(), nullptr, "0");
+
+    leases_supported_ = false;
+  }
+
+  // ConflictInMappingEntry: a forward for this external port already exists.
+  // That's harmless only if it points at THIS machine — otherwise the router is
+  // delivering the port to some other/stale internal client and a session
+  // hosted here is unreachable, so we must reclaim it. Read where the existing
+  // rule actually points before deciding.
+  if (result == static_cast<int>(UPnPErrorCodes::ConflictInMappingEntry)) {
+    char existing_client[64] = {};
+    char existing_port[8] = {};
+    char existing_desc[128] = {};
+    char existing_enabled[8] = {};
+    char existing_lease[16] = {};
+
+    const int query = UPNP_GetSpecificPortMappingEntry(
+        igd_->urls.controlURL, igd_->data.first.servicetype,
+        external_port_str.c_str(), protocol.c_str(), nullptr, existing_client,
+        existing_port, existing_desc, existing_enabled, existing_lease);
+
+    if (query == UPNPCOMMAND_SUCCESS && addr == existing_client) {
+      UPNP_LOG("{} port {} is already forwarded to this machine ({}) — good",
+               protocol, external_port, addr);
+      port_bindings_[protocol][internal_port] = external_port;
+      port_binding_results_[protocol][external_port] = UPNPCOMMAND_SUCCESS;
+      return UPNPCOMMAND_SUCCESS;
+    }
+
+    if (query != UPNPCOMMAND_SUCCESS) {
+      // Typically a static/manual forward the router hides from UPnP. Do NOT
+      // delete it: on a router that permitted the delete we'd wipe a forward
+      // that may already be correct and end up worse off.
+      UPNP_WARN(
+          "{} port {} already has a forward the router won't expose to UPnP "
+          "(usually a manual/static rule). Leaving it untouched. If hosting is "
+          "unreachable, confirm the router forwards {} {} to THIS PC ({}), or "
+          "delete that manual rule and let UPnP manage it.",
+          protocol, external_port, protocol, external_port, addr);
+      port_binding_results_[protocol][external_port] = result;
+      return result;
+    }
+
+    // Positively points at a different client (stale DHCP lease, another
+    // device). Reclaim it: delete, then re-add pointed at us.
+    UPNP_WARN("{} port {} is forwarded to {} (not us, {}); reclaiming it",
+              protocol, external_port, existing_client, addr);
+
+    UPNP_DeletePortMapping(igd_->urls.controlURL, igd_->data.first.servicetype,
+                           external_port_str.c_str(), protocol.c_str(), nullptr);
+
+    result = UPNP_AddPortMapping(
+        igd_->urls.controlURL, igd_->data.first.servicetype,
+        external_port_str.c_str(), internal_port_str.c_str(), addr.c_str(),
+        kMappingDescription, protocol.c_str(), nullptr,
+        leases_supported_ ? lease_time_str.c_str() : "0");
+  }
+
+  if (result != UPNPCOMMAND_SUCCESS) {
+    if (result == static_cast<int>(UPnPErrorCodes::HttpUnauthorized)) {
+      UPNP_ERROR("UPnP Unauthorized!");
+    }
+
+    UPNP_ERROR("Failed to bind port! {}:{}({}) to IGD:{}", addr, internal_port,
+               protocol, external_port);
+    UPNP_ERROR("UPnP error code {} ({})", result,
+               GetUPnPErrorCodeToDesc(result));
+
+    port_binding_results_[protocol][external_port] = result;
+    return result;
+  }
+
+  port_bindings_[protocol][internal_port] = external_port;
+
+  UPNP_LOG("Successfully opened {}:{}({}) to IGD:{} (lease {}s)", addr,
+           internal_port, protocol, external_port,
+           leases_supported_ ? LeaseDuration().count() : 0);
+
+  port_binding_results_[protocol][external_port] = result;
+
+  return result;
+}
+
+std::future<int32_t> UPnP::RemovePortAsync(uint16_t port, std::string protocol) {
+  return std::async(std::launch::async, &UPnP::RemovePort, this, port, protocol);
+}
+
+int32_t UPnP::RemovePort(uint16_t port, std::string protocol) {
+  if (!active_) {
+    return UPNPCOMMAND_UNKNOWN_ERROR;
+  }
+
+  std::lock_guard igd_lock(igd_mutex_);
+  std::lock_guard bindings_lock(mutex_bindings_);
+
+  if (!igd_->urls_valid || !igd_->urls.controlURL) {
+    return UPNPCOMMAND_UNKNOWN_ERROR;
+  }
+
+  if (!port_bindings_.contains(protocol)) {
+    return UPNPCOMMAND_UNKNOWN_ERROR;
+  }
+
+  const auto& port_mapping = port_bindings_.at(protocol);
+
+  if (!port_mapping.contains(port)) {
+    return UPNPCOMMAND_UNKNOWN_ERROR;
+  }
+
+  const std::string external_port_str = fmt::format("{}", port);
+
+  const int result = UPNP_DeletePortMapping(
+      igd_->urls.controlURL, igd_->data.first.servicetype,
+      external_port_str.c_str(), protocol.c_str(), nullptr);
+
+  if (result != UPNPCOMMAND_SUCCESS) {
+    UPNP_WARN("Failed to delete port mapping IGD:{}({}): {} ({})",
+              external_port_str, protocol, result,
+              GetUPnPErrorCodeToDesc(result));
+  } else {
+    UPNP_LOG("Removed {} port {} forward", protocol, port);
+  }
+
+  port_binding_results_.at(protocol).erase(port);
+  port_bindings_.at(protocol).erase(port);
+
+  if (port_binding_results_.at(protocol).empty()) {
+    port_binding_results_.erase(protocol);
+  }
+
+  if (port_bindings_.at(protocol).empty()) {
+    port_bindings_.erase(protocol);
+  }
+
+  return result;
+}
+
+void UPnP::QueueAction(std::future<int32_t> action) {
+  std::lock_guard actions_lock(actions_mutex_);
+  pending_actions_.erase(
+      std::remove_if(pending_actions_.begin(), pending_actions_.end(),
+                     [](const std::future<int32_t>& f) {
+                       return !f.valid() ||
+                              f.wait_for(std::chrono::seconds(0)) ==
+                                  std::future_status::ready;
+                     }),
+      pending_actions_.end());
+  pending_actions_.push_back(std::move(action));
+}
+
+void UPnP::RequestMapping(uint16_t port, bool udp) {
+  if (!port || !REXCVAR_GET(upnp_enabled)) {
+    return;
+  }
+
+  const std::string protocol = udp ? "UDP" : "TCP";
+
+  if (!active_) {
+    // Discovery hasn't finished (or hasn't started). Remember the port; Start()
+    // opens everything tracked once an IGD is known.
+    TrackPort(GetMappedBindPort(port), protocol);
+    StartAsync();
+    return;
+  }
+
+  // AddPort performs blocking SOAP round-trips and the caller is usually a
+  // title thread inside bind().
+  QueueAction(AddPortAsync(GetLocalIP(), port, protocol));
+}
+
+void UPnP::ReleaseMapping(uint16_t port, bool udp) {
+  if (!port || !active_) {
+    return;
+  }
+  QueueAction(RemovePortAsync(GetMappedBindPort(port), udp ? "UDP" : "TCP"));
+}
+
+std::string UPnP::GetLocalIP() {
+  std::lock_guard igd_lock(igd_mutex_);
+  return igd_->lan_addr;
+}
+
+std::string UPnP::GetLocalIP_wget() {
+  char lan_addr[64] = {};
+  int response_size = 0;
+  int status = 0;
+
+  const std::string root = REXCVAR_GET(upnp_root);
+  if (root.empty()) {
+    return {};
+  }
+
+  void* data = miniwget_getaddr(root.c_str(), &response_size, lan_addr,
+                                sizeof(lan_addr), 0, &status);
+  free(data);
+
+  if (status != 200) {
+    UPNP_LOG("Local IP lookup returned HTTP status {}", status);
+  }
+
+  return lan_addr;
+}
+
+void UPnP::TrackPort(uint16_t port, std::string protocol) {
+  std::lock_guard tracked_lock(mutex_tracked_ports_);
+  tracked_ports_[protocol].insert(port);
+}
+
+void UPnP::OpenTrackedPorts() {
+  if (!active_) {
+    return;
+  }
+
+  const std::string local_ip = GetLocalIP();
+
+  for (const auto& [protocol, internal_ports] : GetTrackedPorts()) {
+    for (const auto& internal_port : internal_ports) {
+      AddPort(local_ip, internal_port, protocol);
+    }
+  }
+}
+
+void UPnP::OpenPorts(
+    std::map<std::string, std::map<uint16_t, uint16_t>> open_ports) {
+  if (!active_) {
+    return;
+  }
+
+  const std::string local_ip = GetLocalIP();
+
+  for (const auto& [protocol, ports] : open_ports) {
+    for (const auto& [internal_port, external_port] : ports) {
+      AddPort(local_ip, internal_port, protocol);
+    }
+  }
+}
+
+void UPnP::CloseOpenPorts() {
+  if (!active_) {
+    return;
+  }
+
+  const auto opened_ports = GetOpenedPorts();
+
+  for (const auto& [protocol, prot_bindings] : opened_ports) {
+    for (const auto& [internal_port, external_port] : prot_bindings) {
+      RemovePort(external_port, protocol);
+    }
+  }
+}
+
+void UPnP::RefreshPorts() {
+  const auto opened_ports = GetOpenedPorts();
+
+  // First remove all the ports, otherwise we receive a conflict-in-mapping
+  // -entry error when re-adding them.
+  CloseOpenPorts();
+
+  // Open all tracked ports back, effectively resetting the lease time.
+  OpenPorts(opened_ports);
+}
+
+void UPnP::StartPeriodicPortsRefresher() {
+  std::lock_guard lock(refresher_mutex_);
+  if (refresher_thread_.joinable()) {
+    return;
+  }
+
+  refresher_stop_ = false;
+  refresher_thread_ = std::thread([this]() {
+    for (;;) {
+      const auto interval = RefreshInterval();
+      {
+        std::unique_lock lock(refresher_mutex_);
+        refresher_cv_.wait_for(lock, interval, [this] { return refresher_stop_; });
+        if (refresher_stop_) {
+          return;
+        }
+      }
+
+      // We don't know whether the router supports variable lease times until
+      // the first port is opened; permanent mappings need no renewal, but we
+      // still re-add periodically so a router reboot doesn't strand us.
+      RefreshPorts();
+    }
+  });
+}
+
+void UPnP::StopPeriodicPortsRefresher() {
+  std::thread thread;
+  {
+    std::lock_guard lock(refresher_mutex_);
+    if (!refresher_thread_.joinable()) {
+      return;
+    }
+    refresher_stop_ = true;
+    thread = std::move(refresher_thread_);
+  }
+  refresher_cv_.notify_all();
+  thread.join();
+}
+
+uint16_t UPnP::GetMappedConnectPort(uint16_t external_port) {
+  std::lock_guard mapped_lock(mapped_mutex_);
+
+  if (mapped_connect_ports_.contains(external_port)) {
+    return mapped_connect_ports_[external_port];
+  }
+
+  // A wildcard entry maps every guest port to one host port.
+  if (mapped_connect_ports_.contains(0)) {
+    return mapped_connect_ports_.at(0);
+  }
+
+  return external_port;
+}
+
+uint16_t UPnP::GetMappedBindPort(uint16_t external_port) {
+  std::lock_guard mapped_lock(mapped_mutex_);
+
+  if (mapped_bind_ports_.contains(external_port)) {
+    return mapped_bind_ports_[external_port];
+  }
+
+  if (mapped_bind_ports_.contains(0)) {
+    return mapped_bind_ports_.at(0);
+  }
+
+  return external_port;
+}
+
+const std::map<std::string, std::map<uint16_t, uint16_t>>
+UPnP::GetOpenedPorts() {
+  std::lock_guard bindings_lock(mutex_bindings_);
+  return port_bindings_;
+}
+
+const std::map<std::string, std::map<uint16_t, int32_t>>
+UPnP::GetPortBindingResults() {
+  std::lock_guard bindings_lock(mutex_bindings_);
+  return port_binding_results_;
+}
+
+const std::map<std::string, std::set<uint16_t>> UPnP::GetTrackedPorts() {
+  std::lock_guard tracked_lock(mutex_tracked_ports_);
+  return tracked_ports_;
+}
+
+std::string_view UPnP::GetMiniUPnPcErrorCodeToDesc(int32_t error) noexcept {
+  switch (error) {
+    case UPNPCOMMAND_SUCCESS:
+      return "Success";
+    case UPNPCOMMAND_INVALID_ARGS:
+      return "Invalid Args";
+    case UPNPCOMMAND_HTTP_ERROR:
+      return "HTTP Error";
+    case UPNPCOMMAND_INVALID_RESPONSE:
+      return "Invalid Response";
+    case UPNPCOMMAND_MEM_ALLOC_ERROR:
+      return "Memory Allocation";
+    case UPNPCOMMAND_UNKNOWN_ERROR:
+    default:
+      return "Unknown Error Code";
+  }
+}
+
+std::string_view UPnP::GetUPnPErrorCodeToDesc(int32_t error) noexcept {
+  return GetUPnPErrorCodeToDesc(static_cast<UPnPErrorCodes>(error));
+}
+
+std::string_view UPnP::GetUPnPErrorCodeToDesc(UPnPErrorCodes error) noexcept {
+  switch (error) {
+    case UPnPErrorCodes::Success:
+      return "Success";
+
+    case UPnPErrorCodes::HttpUnauthorized:
+      return "HTTP Unauthorized";
+
+    case UPnPErrorCodes::ActionNotAuthorized:
+      return "Action Not Authorized";
+
+    case UPnPErrorCodes::InactiveConnectionStateRequired:
+      return "Inactive Connection State Required";
+    case UPnPErrorCodes::ConnectionSetupFailed:
+      return "Connection Setup Failed";
+    case UPnPErrorCodes::ConnectionSetupInProgress:
+      return "Connection Setup In Progress";
+    case UPnPErrorCodes::ConnectionNotConfigured:
+      return "Connection Not Configured";
+    case UPnPErrorCodes::DisconnectInProgress:
+      return "Disconnect In Progress";
+    case UPnPErrorCodes::InvalidLayer2Address:
+      return "Invalid Layer2 Address";
+    case UPnPErrorCodes::InternetAccessDisabled:
+      return "Internet Access Disabled";
+    case UPnPErrorCodes::InvalidConnectionType:
+      return "Invalid Connection Type";
+    case UPnPErrorCodes::ConnectionAlreadyTerminated:
+      return "Connection Already Terminated";
+    case UPnPErrorCodes::SpecifiedArrayIndexInvalid:
+      return "Specified Array Index Invalid";
+    case UPnPErrorCodes::NoSuchEntryInArray:
+      return "No Such Entry In Array";
+    case UPnPErrorCodes::WildcardNotPermittedInSourceIP:
+      return "Wildcard Not Permitted In Source IP";
+    case UPnPErrorCodes::WildcardNotPermittedInExternalPort:
+      return "Wildcard Not Permitted In External Port";
+    case UPnPErrorCodes::ConflictInMappingEntry:
+      return "Conflict In Mapping Entry";
+    case UPnPErrorCodes::SamePortValuesRequired:
+      return "Same Port Values Required";
+    case UPnPErrorCodes::OnlyPermanentLeasesSupported:
+      return "Only Permanent Lease Supported";
+    case UPnPErrorCodes::RemoteHostOnlySupportsRawTcp:
+      return "Remote Host Only Supports Raw TCP";
+    case UPnPErrorCodes::ExternalPortOnlySupportsWildcard:
+      return "External Port Only Supports Wildcard";
+    case UPnPErrorCodes::NoPortMappingsAvailable:
+      return "No Port Mappings Available";
+    case UPnPErrorCodes::ConflictWithOtherMechanisms:
+      return "Conflict With Other Mechanisms";
+    case UPnPErrorCodes::PortMappingNotFound:
+      return "Port Mapping Not Found";
+    case UPnPErrorCodes::InconsistentParameters:
+      return "Inconsistent Parameters";
+  }
+
+  const auto error_code = static_cast<int32_t>(error);
+
+  if (error_code < 0) {
+    return GetMiniUPnPcErrorCodeToDesc(error_code);
+  }
+
+  if (error_code >= 600 && error_code <= 699) {
+    return "Unknown Common Action Error";
+  }
+
+  if (error_code >= 700 && error_code <= 799) {
+    return "Unknown Action Specific Error";
+  }
+
+  return "Unknown Error Code";
+}
 
 }  // namespace rex::system

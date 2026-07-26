@@ -124,6 +124,12 @@ REXCVAR_DEFINE_INT32(upnp_lease_seconds, 3600, "XLive",
                      "requests a permanent mapping.")
     .range(0, 604800);
 
+REXCVAR_DEFINE_STRING(upnp_root, "", "XLive",
+                      "Root description URL of the UPnP router (IGD) found on "
+                      "the last run. Filled in automatically; reusing it skips "
+                      "SSDP discovery at startup. Clear it to force a fresh "
+                      "search.");
+
 REXCVAR_DEFINE_BOOL(netplay_firewall_prompt, true, "XLive",
                     "On first netplay use, briefly open a TCP listener so "
                     "Windows shows its native 'Allow this app through the "

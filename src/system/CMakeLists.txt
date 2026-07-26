@@ -22,6 +22,7 @@ set(REXSYSTEM_SOURCES
     xmodule.cpp
     guest_path.cpp
     xlive_flags.cpp
+    xlive_commands.cpp
     xlive_web_client.cpp
     upnp.cpp
     nat_punch.cpp
@@ -78,6 +79,7 @@ target_link_libraries(rexruntime
         SDL3::SDL3
     PRIVATE
         aes128
+        miniupnp
         mspack
         xxHash::xxhash
 )
