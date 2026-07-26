@@ -493,7 +493,7 @@ BOOL WINAPI ConsoleCtrlHandler(DWORD) {
 
 struct AtExitInstaller {
   AtExitInstaller() {
-    std::atexit([] { SyncClearAndClose(); });
+    std::atexit([] { Stop(); });
 #if REX_PLATFORM_WIN32
     ::SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
 #endif
@@ -561,8 +561,7 @@ void SetSmallImage(const std::string& key, const std::string& text) {
 }
 
 void Stop() {
-  if (!g_running.exchange(false))
-    return;
+  g_running = false;
   if (g_thread.joinable())
     g_thread.join();
 }
