@@ -95,6 +95,12 @@ REXCVAR_DEFINE_BOOL(systemlink_lan_discovery, true, "XLive",
                     "Also emit System Link discovery probes as real UDP broadcasts so "
                     "peers on the same LAN (sharing one public IP) can hear them.");
 
+REXCVAR_DEFINE_BOOL(systemlink_lan_all_adapters, false, "XLive",
+                    "Emit System Link discovery on every usable IPv4 interface instead "
+                    "of only the default-route one. Off by default: hosts with a VPN or "
+                    "a hypervisor switch would otherwise advertise sessions on networks "
+                    "the player did not intend. Ignored when lan_ip is set.");
+
 // ---------------------------------------------------------------------------
 // System Link ports
 // ---------------------------------------------------------------------------

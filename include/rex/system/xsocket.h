@@ -12,6 +12,8 @@
 
 #include <cstring>
 #include <queue>
+#include <string>
+#include <vector>
 
 #include <rex/math.h>
 #include <rex/system/xobject.h>
@@ -99,10 +101,9 @@ class XSocket : public XObject {
   X_STATUS Initialize(AddressFamily af, Type type, Protocol proto);
   X_STATUS Close();
 
-  // A logical Xbox socket may use a second native UDP socket when the primary
-  // socket cannot transmit LAN broadcasts. Read readiness from either native
-  // handle belongs to this logical socket.
-  bool EnsureLanProbeSocket(uint32_t bind_address_net);
+  // Create a broadcast probe for the selected interface.
+  bool EnsureLanProbeSocket(uint32_t bind_address_net,
+                            uint32_t broadcast_address_net = 0xFFFFFFFFu);
   size_t GetNativeReadHandles(uint64_t* handles, size_t capacity) const;
   bool IsNativeReadHandle(uint64_t handle) const;
 
@@ -150,6 +151,10 @@ class XSocket : public XObject {
 
  private:
   XSocket(KernelState* kernel_state, uint64_t native_handle);
+
+  // Refresh probes for the selected LAN interfaces.
+  void EnsureLanProbeSockets();
+
   uint64_t native_handle_ = -1;
 
   AddressFamily af_;    // Address family
@@ -172,9 +177,18 @@ class XSocket : public XObject {
   uint32_t netplay_punch_info_logged_ = 0;
   static constexpr uint32_t kNetplayInfoLogCap = 8;
 
+  // Probe socket for one selected IPv4 interface.
+  struct LanProbeSocket {
+    uint32_t bind_address_net = 0;
+    uint32_t broadcast_address_net = 0xFFFFFFFFu;
+    uint64_t handle = ~0ull;
+    bool send_failure_logged = false;
+  };
+
   mutable std::mutex lan_probe_mutex_;
-  uint64_t lan_probe_handle_ = ~0ull;
-  bool lan_probe_failed_ = false;
+  std::vector<LanProbeSocket> lan_probe_sockets_;
+  std::vector<uint32_t> failed_lan_probe_addresses_;
+  std::string last_invalid_lan_ip_;
 
   std::unique_ptr<rex::thread::Event> event_;
   std::mutex incoming_packet_mutex_;

@@ -16,6 +16,7 @@ set(REXSYSTEM_SOURCES
     xiocompletion.cpp
     xnotifylistener.cpp
     xenumerator.cpp
+    lan_interfaces.cpp
     xsocket.cpp
     xsymboliclink.cpp
     xobject.cpp

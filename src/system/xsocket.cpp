@@ -9,10 +9,12 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -22,6 +24,7 @@
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/lan_interfaces.h>
 #include <rex/system/nat_punch.h>
 #include <rex/system/upnp.h>
 #include <rex/system/xlive_web_client.h>
@@ -38,6 +41,8 @@ REXCVAR_DECLARE(bool,    xlive_web_bridge_loopback_same_public_ip);
 REXCVAR_DECLARE(int32_t, systemlink_base_port);
 REXCVAR_DECLARE(int32_t, systemlink_port_offset);
 REXCVAR_DECLARE(bool,    systemlink_lan_discovery);
+REXCVAR_DECLARE(std::string, lan_ip);
+REXCVAR_DECLARE(bool, systemlink_lan_all_adapters);
 REXCVAR_DECLARE(bool,    netplay_firewall_prompt);
 
 // Standard socket types used by Xbox API emulation
@@ -169,12 +174,20 @@ void MaybeLanJoinPunch(uint16_t local_port, const sockaddr_in& src) {
 }
 }  // namespace
 
-bool XSocket::EnsureLanProbeSocket(uint32_t bind_address_net) {
+bool XSocket::EnsureLanProbeSocket(uint32_t bind_address_net, uint32_t broadcast_address_net) {
   std::lock_guard<std::mutex> lock(lan_probe_mutex_);
-  if (lan_probe_handle_ != ~0ull)
+  const auto existing = std::find_if(lan_probe_sockets_.begin(), lan_probe_sockets_.end(),
+                                     [bind_address_net](const LanProbeSocket& probe) {
+                                       return probe.bind_address_net == bind_address_net;
+                                     });
+  if (existing != lan_probe_sockets_.end()) {
+    existing->broadcast_address_net = broadcast_address_net;
     return true;
-  if (lan_probe_failed_)
+  }
+  if (std::find(failed_lan_probe_addresses_.begin(), failed_lan_probe_addresses_.end(),
+                bind_address_net) != failed_lan_probe_addresses_.end()) {
     return false;
+  }
 
   const auto probe = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 #if REX_PLATFORM_WIN32
@@ -183,7 +196,7 @@ bool XSocket::EnsureLanProbeSocket(uint32_t bind_address_net) {
   const bool invalid_probe = probe < 0;
 #endif
   if (invalid_probe) {
-    lan_probe_failed_ = true;
+    failed_lan_probe_addresses_.push_back(bind_address_net);
     REXKRNL_WARN("XSocket LAN probe socket creation failed err={}", GetNativeSocketError());
     return false;
   }
@@ -193,7 +206,7 @@ bool XSocket::EnsureLanProbeSocket(uint32_t bind_address_net) {
                  sizeof(broadcast)) != 0) {
     const int error = GetNativeSocketError();
     rex::net::socket_close(static_cast<uint64_t>(probe));
-    lan_probe_failed_ = true;
+    failed_lan_probe_addresses_.push_back(bind_address_net);
     REXKRNL_WARN("XSocket LAN probe SO_BROADCAST failed err={}", error);
     return false;
   }
@@ -206,7 +219,7 @@ bool XSocket::EnsureLanProbeSocket(uint32_t bind_address_net) {
   if (bind(probe, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
     const int error = GetNativeSocketError();
     rex::net::socket_close(static_cast<uint64_t>(probe));
-    lan_probe_failed_ = true;
+    failed_lan_probe_addresses_.push_back(bind_address_net);
     REXKRNL_WARN("XSocket LAN probe bind failed err={}", error);
     return false;
   }
@@ -222,16 +235,63 @@ bool XSocket::EnsureLanProbeSocket(uint32_t bind_address_net) {
   if (nonblocking_result != 0) {
     const int error = GetNativeSocketError();
     rex::net::socket_close(static_cast<uint64_t>(probe));
-    lan_probe_failed_ = true;
+    failed_lan_probe_addresses_.push_back(bind_address_net);
     REXKRNL_WARN("XSocket LAN probe nonblocking setup failed err={}", error);
     return false;
   }
 
   char bound_ip[INET_ADDRSTRLEN] = {};
   inet_ntop(AF_INET, &local.sin_addr, bound_ip, sizeof(bound_ip));
-  lan_probe_handle_ = static_cast<uint64_t>(probe);
+  lan_probe_sockets_.push_back(
+      LanProbeSocket{bind_address_net, broadcast_address_net, static_cast<uint64_t>(probe), false});
   REXKRNL_INFO("XSocket LAN probe socket bound to {}", bound_ip);
   return true;
+}
+
+void XSocket::EnsureLanProbeSockets() {
+  uint32_t override_address_net = 0;
+  const std::string override_address = REXCVAR_GET(lan_ip);
+  if (!override_address.empty() &&
+      inet_pton(AF_INET, override_address.c_str(), &override_address_net) != 1) {
+    bool should_log = false;
+    {
+      std::lock_guard<std::mutex> lock(lan_probe_mutex_);
+      should_log = override_address != last_invalid_lan_ip_;
+      last_invalid_lan_ip_ = override_address;
+    }
+    if (should_log) {
+      REXKRNL_WARN("XSocket ignoring invalid lan_ip override '{}'", override_address);
+    }
+    override_address_net = 0;
+  } else {
+    std::lock_guard<std::mutex> lock(lan_probe_mutex_);
+    last_invalid_lan_ip_.clear();
+  }
+
+  auto targets =
+      BuildSystemLinkBroadcastTargets(EnumerateLocalIPv4Interfaces(), override_address_net);
+
+  if (override_address_net == 0 && !REXCVAR_GET(systemlink_lan_all_adapters)) {
+    const uint32_t preferred = XLiveWebClient::Get().lan_address_net();
+    const auto match = std::find_if(
+        targets.begin(), targets.end(),
+        [preferred](const IPv4BroadcastTarget& target) { return target.address_net == preferred; });
+    if (match != targets.end()) {
+      const IPv4BroadcastTarget chosen = *match;
+      targets.assign(1, chosen);
+    } else {
+      targets.clear();
+    }
+  }
+
+  for (const auto& target : targets) {
+    EnsureLanProbeSocket(target.address_net, target.broadcast_net);
+  }
+
+  // Fall back to the preferred address when no interface was selected.
+  if (targets.empty()) {
+    EnsureLanProbeSocket(XLiveWebClient::Get().lan_address_net(), htonl(INADDR_BROADCAST));
+  }
 }
 
 size_t XSocket::GetNativeReadHandles(uint64_t* handles, size_t capacity) const {
@@ -241,8 +301,10 @@ size_t XSocket::GetNativeReadHandles(uint64_t* handles, size_t capacity) const {
   }
 
   std::lock_guard<std::mutex> lock(lan_probe_mutex_);
-  if (lan_probe_handle_ != ~0ull && count < capacity) {
-    handles[count++] = lan_probe_handle_;
+  for (const auto& probe : lan_probe_sockets_) {
+    if (probe.handle == ~0ull || count >= capacity)
+      break;
+    handles[count++] = probe.handle;
   }
   return count;
 }
@@ -250,8 +312,11 @@ size_t XSocket::GetNativeReadHandles(uint64_t* handles, size_t capacity) const {
 bool XSocket::IsNativeReadHandle(uint64_t handle) const {
   if (handle == native_handle_)
     return native_handle_ != ~0ull;
+  if (handle == ~0ull)
+    return false;
   std::lock_guard<std::mutex> lock(lan_probe_mutex_);
-  return handle == lan_probe_handle_ && lan_probe_handle_ != ~0ull;
+  return std::any_of(lan_probe_sockets_.begin(), lan_probe_sockets_.end(),
+                     [handle](const LanProbeSocket& probe) { return probe.handle == handle; });
 }
 
 bool XSocket::PunchFromBoundUdpSocket(uint16_t local_port, uint32_t peer_ip_net,
@@ -339,10 +404,15 @@ X_STATUS XSocket::Close() {
   }
   {
     std::lock_guard<std::mutex> lock(lan_probe_mutex_);
-    if (lan_probe_handle_ != ~0ull) {
-      close_failed = rex::net::socket_close(lan_probe_handle_) != 0;
-      lan_probe_handle_ = ~0ull;
+    for (auto& probe : lan_probe_sockets_) {
+      if (probe.handle == ~0ull)
+        continue;
+      // Report a teardown failure if any helper fails, not just the last one.
+      close_failed = rex::net::socket_close(probe.handle) != 0 || close_failed;
+      probe.handle = ~0ull;
     }
+    lan_probe_sockets_.clear();
+    failed_lan_probe_addresses_.clear();
   }
   {
     std::lock_guard<std::mutex> lock(incoming_packet_mutex_);
@@ -544,11 +614,13 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
   // one datagram per guest receive so readiness and delivery stay paired.
   {
     std::lock_guard<std::mutex> lock(lan_probe_mutex_);
-    if (lan_probe_handle_ != ~0ull) {
+    for (const auto& probe : lan_probe_sockets_) {
+      if (probe.handle == ~0ull)
+        continue;
       uint8_t reply[2048];
       sockaddr_in src{};
       socklen_t src_len = sizeof(src);
-      const int n = recvfrom(lan_probe_handle_, reinterpret_cast<char*>(reply), sizeof(reply), 0,
+      const int n = recvfrom(probe.handle, reinterpret_cast<char*>(reply), sizeof(reply), 0,
                              reinterpret_cast<sockaddr*>(&src), &src_len);
       if (n > 0) {
         QueuePacket(ntohl(src.sin_addr.s_addr), ntohs(src.sin_port), reply, static_cast<size_t>(n));
@@ -556,6 +628,8 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
         inet_ntop(AF_INET, &src.sin_addr, src_ip_str, sizeof(src_ip_str));
         REXKRNL_DEBUG("XSocket::RecvFrom injected {} probe reply bytes from {}:{}", n, src_ip_str,
                       ntohs(src.sin_port));
+        // One datagram per guest receive keeps readiness and delivery paired.
+        break;
       }
     }
   }
@@ -845,18 +919,46 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
               "XSocket::SendTo LAN broadcast FAILED err={} opt_rc={} so_broadcast={} "
               "so_type={} guest_flags={} handle={}",
               bc_err, bc_opt_rc, bc_state, so_type, flags, native_handle_);
-          // Fall back to this logical socket's helper. Replies are surfaced
-          // through this same XSocket in select and RecvFrom.
-          if (EnsureLanProbeSocket(XLiveWebClient::Get().lan_address_net())) {
+          EnsureLanProbeSockets();
+          {
             std::lock_guard<std::mutex> lock(lan_probe_mutex_);
-            const int alt_sent = sendto(lan_probe_handle_, reinterpret_cast<char*>(buf), buf_len, 0,
-                                        reinterpret_cast<sockaddr*>(&bcast), sizeof(bcast));
-            if (alt_sent < 0) {
-              REXKRNL_WARN("XSocket::SendTo LAN probe socket broadcast ALSO failed err={}",
-                           WSAGetLastError());
-            } else {
-              REXKRNL_DEBUG("XSocket::SendTo LAN probe socket sent {} bytes to port {}", alt_sent,
-                            dest_port);
+            bool any_sent = false;
+            for (auto& probe : lan_probe_sockets_) {
+              if (probe.handle == ~0ull)
+                continue;
+              const uint32_t destinations[] = {probe.broadcast_address_net,
+                                               htonl(INADDR_BROADCAST)};
+              for (size_t i = 0; i < 2; ++i) {
+                if (i != 0 && destinations[i] == destinations[0])
+                  continue;
+                sockaddr_in target = bcast;
+                target.sin_addr.s_addr = destinations[i];
+                const int alt_sent = sendto(probe.handle, reinterpret_cast<char*>(buf), buf_len, 0,
+                                            reinterpret_cast<sockaddr*>(&target), sizeof(target));
+                if (alt_sent >= 0) {
+                  any_sent = true;
+                  probe.send_failure_logged = false;
+                  char bind_ip[INET_ADDRSTRLEN] = {};
+                  char target_ip[INET_ADDRSTRLEN] = {};
+                  inet_ntop(AF_INET, &probe.bind_address_net, bind_ip, sizeof(bind_ip));
+                  inet_ntop(AF_INET, &target.sin_addr, target_ip, sizeof(target_ip));
+                  REXKRNL_DEBUG("XSocket::SendTo LAN probe {} sent {} bytes to {}:{}", bind_ip,
+                                alt_sent, target_ip, dest_port);
+                  break;
+                }
+                // Avoid repeated warnings until a send succeeds.
+                if (!probe.send_failure_logged) {
+                  probe.send_failure_logged = true;
+                  char bind_ip[INET_ADDRSTRLEN] = {};
+                  inet_ntop(AF_INET, &probe.bind_address_net, bind_ip, sizeof(bind_ip));
+                  REXKRNL_WARN("XSocket::SendTo LAN probe {} broadcast ALSO failed err={}", bind_ip,
+                               GetNativeSocketError());
+                }
+              }
+            }
+            if (!any_sent) {
+              REXKRNL_WARN("XSocket::SendTo no LAN probe socket could broadcast on port {}",
+                           dest_port);
             }
           }
         } else {

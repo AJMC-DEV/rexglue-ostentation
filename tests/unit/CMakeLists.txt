@@ -16,6 +16,7 @@ add_executable(unit_tests
     system/guest_path_test.cpp
     system/achievement_manager_test.cpp
     system/function_dispatcher_test.cpp
+    system/lan_interfaces_test.cpp
     system/xsocket_test.cpp
     codegen/manifest_test.cpp
     rexglue/migration_scan_test.cpp
