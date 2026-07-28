@@ -111,6 +111,17 @@ class PipelineCache {
                                     std::string_view entry_point,
                                     std::string_view target_profile,
                                     std::string* out_error);
+  // Re-reads and recompiles the mod-supplied replacement for every currently
+  // loaded shader translation from disk, swapping in the new bytecode and
+  // invalidating affected pipelines. Returns the number of translations that
+  // were replaced. Drives the K-key runtime hot reload.
+  size_t ReloadModdedShaders();
+  // Applies all queued shader binary replacements: swaps each translation's
+  // bytecode and destroys the pipelines that reference it. MUST be called only
+  // on the GPU worker thread at a point where the GPU is idle, no submission is
+  // open, and pipeline creation threads are quiescent (see
+  // D3D12CommandProcessor::EndSubmission).
+  void ApplyPendingShaderReplacements();
   void ResetShaderProfiling();
 
   mutable std::mutex shaders_mutex_;
@@ -290,6 +301,25 @@ class PipelineCache {
                                IDxbcConverter* dxbc_converter = nullptr,
                                IDxcUtils* dxc_utils = nullptr,
                                IDxcCompiler* dxc_compiler = nullptr);
+
+#ifdef REXGLUE_ENABLE_SHADERS
+  // Resolves and (for .hlsl) compiles the enabled-mod replacement bytecode for
+  // one shader translation, searching mod folders in priority order. Returns
+  // the replacement DXBC, or empty if no mod supplies a usable shader. Shared
+  // by the translate-on-load path and ReloadModdedShaders.
+  std::vector<uint8_t> LoadModShaderReplacement(uint64_t ucode_hash, uint64_t modification,
+                                                xenos::ShaderType type);
+
+  // A shader binary swap requested at runtime, awaiting application at a safe
+  // GPU frame boundary by ApplyPendingShaderReplacements.
+  struct PendingShaderReplacement {
+    uint64_t ucode_hash;
+    uint64_t modification;
+    std::vector<uint8_t> binary;
+  };
+  std::mutex pending_replacements_mutex_;
+  std::vector<PendingShaderReplacement> pending_replacements_;
+#endif  // REXGLUE_ENABLE_SHADERS
 
   // If draw_util::IsRasterizationPotentiallyDone is false, the pixel shader
   // MUST be made nullptr BEFORE calling this! The shaders must be translated

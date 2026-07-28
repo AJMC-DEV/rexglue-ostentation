@@ -74,7 +74,11 @@ class D3D12CommandProcessor : public CommandProcessor {
                                     std::string_view entry_point = {},
                                     std::string_view target_profile = {},
                                     std::string* out_error = nullptr) override;
+  size_t ReloadModdedShaders() override;
   void ResetShaderProfiling() override;
+  // Flags that the pipeline cache has queued shader binary replacements to be
+  // applied at the next safe frame boundary. Callable from any thread.
+  void RequestShaderReload() { shader_reload_requested_.store(true, std::memory_order_release); }
 #endif  // REXGLUE_ENABLE_SHADERS
 
   ui::d3d12::D3D12Provider& GetD3D12Provider() const {
@@ -447,6 +451,15 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool device_removed_ = false;
 
   bool cache_clear_requested_ = false;
+
+#ifdef REXGLUE_ENABLE_SHADERS
+  // Set from any thread when a modded-shader hot reload has queued binary
+  // replacements in the pipeline cache. Processed on the GPU worker thread at a
+  // safe frame boundary (submission closed, GPU idle, creation threads
+  // quiescent) so that PSOs still referenced by in-flight command lists are
+  // never released out from under the GPU. See ApplyPendingShaderReplacements.
+  std::atomic<bool> shader_reload_requested_{false};
+#endif  // REXGLUE_ENABLE_SHADERS
 
   HANDLE fence_completion_event_ = nullptr;
 

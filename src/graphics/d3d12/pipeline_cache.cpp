@@ -19,6 +19,7 @@
 #include <deque>
 #include <mutex>
 #include <set>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1247,95 +1248,14 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
   }
 
 #ifdef REXGLUE_ENABLE_SHADERS
-  if (REXCVAR_GET(shader_load_enabled)) {
-
-    // Use mods_data_root if set, otherwise the default <exe>/mods path.
-    std::filesystem::path mods_data_root = REXCVAR_GET(mods_data_root);
-    if (mods_data_root.empty()) {
-      mods_data_root = rex::filesystem::GetExecutableFolder() / "mods";
-    }
-
-    const bool compile_hlsl = REXCVAR_GET(shader_compile_hlsl) && provider.IsCompileAvailable();
-    const std::string base =
-        fmt::format("{:016X}_{:016X}", shader.ucode_data_hash(), translation.modification());
-    const std::string hlsl_filename = base + ".hlsl";
-    const std::string dxbc_filename = base + ".dxbc";
-
-    // Read an entire file into a byte vector (empty on any failure).
-    auto read_file = [](const std::filesystem::path& p) -> std::vector<uint8_t> {
-      std::vector<uint8_t> data;
-      FILE* f = rex::filesystem::OpenFile(p, "rb");
-      if (f) {
-        rex::filesystem::Seek(f, 0, SEEK_END);
-        const int64_t size = rex::filesystem::Tell(f);
-        rex::filesystem::Seek(f, 0, SEEK_SET);
-        if (size > 0) {
-          data.resize(static_cast<size_t>(size));
-          if (fread(data.data(), 1, data.size(), f) != data.size()) {
-            data.clear();
-          }
-        }
-        fclose(f);
-      }
-      return data;
-    };
-
-    // Search enabled mod folders in priority order (mods_data_root/<mod>/shaders/);
-    // the first mod that supplies a usable shader wins. Within a mod folder an
-    // .hlsl (compiled here, on the player's own GPU/driver) takes precedence over
-    // a prebuilt .dxbc, matching the goal of shipping source rather than bytecode
-    // baked on one specific machine.
-    for (const auto& mod_dir : GetEnabledModDirs(mods_data_root)) {
-      const auto shaders_dir = mod_dir / "shaders";
-      const auto hlsl_path = shaders_dir / hlsl_filename;
-      const auto dxbc_path = shaders_dir / dxbc_filename;
-
-      if (compile_hlsl && std::filesystem::exists(hlsl_path)) {
-        std::vector<uint8_t> source = read_file(hlsl_path);
-        if (!source.empty()) {
-          // Guest VS need vs_5_1 (they may use a UAV); PS use ps_5_1.
-          const char* target =
-              (shader.type() == xenos::ShaderType::kVertex) ? "vs_5_1" : "ps_5_1";
-          const std::string mod_macro = fmt::format("{}", translation.modification());
-          const D3D_SHADER_MACRO defines[] = {{"XE_SHADER_MODIFICATION", mod_macro.c_str()},
-                                              {nullptr, nullptr}};
-          const std::string source_name = hlsl_path.string();
-          Microsoft::WRL::ComPtr<ID3DBlob> code, errors;
-          const HRESULT hr = provider.Compile(
-              source.data(), source.size(), source_name.c_str(), defines,
-              D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-              &code, &errors);
-          if (SUCCEEDED(hr) && code) {
-            const uint8_t* bytes = static_cast<const uint8_t*>(code->GetBufferPointer());
-            translation.set_translated_binary(
-                std::vector<uint8_t>(bytes, bytes + code->GetBufferSize()));
-            REXGPU_INFO("Compiled replacement HLSL {:016X} mod {:016X} ({}) from {}",
-                        shader.ucode_data_hash(), translation.modification(), target,
-                        shaders_dir.string());
-            if (errors && errors->GetBufferSize() > 1) {
-              REXGPU_WARN("HLSL warnings for {}: {}", source_name,
-                          static_cast<const char*>(errors->GetBufferPointer()));
-            }
-            break;
-          }
-          // Compilation failed: surface diagnostics and fall through to any
-          // prebuilt .dxbc in this same mod folder before moving on.
-          REXGPU_ERROR("Failed to compile HLSL shader mod {} (hr=0x{:08X}): {}", source_name,
-                       static_cast<uint32_t>(hr),
-                       errors ? static_cast<const char*>(errors->GetBufferPointer())
-                              : "no compiler diagnostics");
-        }
-      }
-
-      if (std::filesystem::exists(dxbc_path)) {
-        std::vector<uint8_t> replacement = read_file(dxbc_path);
-        if (!replacement.empty()) {
-          translation.set_translated_binary(std::move(replacement));
-          REXGPU_INFO("Loaded replacement DXBC {:016X} mod {:016X} from {}",
-                      shader.ucode_data_hash(), translation.modification(), shaders_dir.string());
-          break;
-        }
-      }
+  {
+    // Swap in a replacement from an enabled mod folder, if one exists. Shares
+    // its lookup/compile logic with the K-key runtime hot reload so both paths
+    // resolve mods identically.
+    std::vector<uint8_t> replacement = LoadModShaderReplacement(
+        shader.ucode_data_hash(), translation.modification(), shader.type());
+    if (!replacement.empty()) {
+      translation.set_translated_binary(std::move(replacement));
     }
   }
 #endif  // REXGLUE_ENABLE_SHADERS
@@ -3447,42 +3367,210 @@ CommandProcessor::ShaderDetails PipelineCache::GetShaderDetails(uint64_t ucode_h
   return details;
 }
 
+std::vector<uint8_t> PipelineCache::LoadModShaderReplacement(uint64_t ucode_hash,
+                                                             uint64_t modification,
+                                                             xenos::ShaderType type) {
+  if (!REXCVAR_GET(shader_load_enabled)) return {};
+
+  // Use mods_data_root if set, otherwise the default <exe>/mods path.
+  std::filesystem::path mods_data_root = REXCVAR_GET(mods_data_root);
+  if (mods_data_root.empty()) {
+    mods_data_root = rex::filesystem::GetExecutableFolder() / "mods";
+  }
+
+  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+  const bool compile_hlsl = REXCVAR_GET(shader_compile_hlsl) && provider.IsCompileAvailable();
+  const std::string base = fmt::format("{:016X}_{:016X}", ucode_hash, modification);
+  const std::string hlsl_filename = base + ".hlsl";
+  const std::string dxbc_filename = base + ".dxbc";
+
+  // Read an entire file into a byte vector (empty on any failure).
+  auto read_file = [](const std::filesystem::path& p) -> std::vector<uint8_t> {
+    std::vector<uint8_t> data;
+    FILE* f = rex::filesystem::OpenFile(p, "rb");
+    if (f) {
+      rex::filesystem::Seek(f, 0, SEEK_END);
+      const int64_t size = rex::filesystem::Tell(f);
+      rex::filesystem::Seek(f, 0, SEEK_SET);
+      if (size > 0) {
+        data.resize(static_cast<size_t>(size));
+        if (fread(data.data(), 1, data.size(), f) != data.size()) {
+          data.clear();
+        }
+      }
+      fclose(f);
+    }
+    return data;
+  };
+
+  // Search enabled mod folders in priority order (mods_data_root/<mod>/shaders/);
+  // the first mod that supplies a usable shader wins. Within a mod folder an
+  // .hlsl (compiled here, on the player's own GPU/driver) takes precedence over
+  // a prebuilt .dxbc, matching the goal of shipping source rather than bytecode
+  // baked on one specific machine.
+  for (const auto& mod_dir : GetEnabledModDirs(mods_data_root)) {
+    const auto shaders_dir = mod_dir / "shaders";
+    const auto hlsl_path = shaders_dir / hlsl_filename;
+    const auto dxbc_path = shaders_dir / dxbc_filename;
+
+    if (compile_hlsl && std::filesystem::exists(hlsl_path)) {
+      std::vector<uint8_t> source = read_file(hlsl_path);
+      if (!source.empty()) {
+        // Guest VS need vs_5_1 (they may use a UAV); PS use ps_5_1.
+        const char* target = (type == xenos::ShaderType::kVertex) ? "vs_5_1" : "ps_5_1";
+        const std::string mod_macro = fmt::format("{}", modification);
+        const D3D_SHADER_MACRO defines[] = {{"XE_SHADER_MODIFICATION", mod_macro.c_str()},
+                                            {nullptr, nullptr}};
+        const std::string source_name = hlsl_path.string();
+        Microsoft::WRL::ComPtr<ID3DBlob> code, errors;
+        const HRESULT hr = provider.Compile(
+            source.data(), source.size(), source_name.c_str(), defines,
+            D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+            &code, &errors);
+        if (SUCCEEDED(hr) && code) {
+          const uint8_t* bytes = static_cast<const uint8_t*>(code->GetBufferPointer());
+          REXGPU_INFO("Compiled replacement HLSL {:016X} mod {:016X} ({}) from {}", ucode_hash,
+                      modification, target, shaders_dir.string());
+          if (errors && errors->GetBufferSize() > 1) {
+            REXGPU_WARN("HLSL warnings for {}: {}", source_name,
+                        static_cast<const char*>(errors->GetBufferPointer()));
+          }
+          return std::vector<uint8_t>(bytes, bytes + code->GetBufferSize());
+        }
+        // Compilation failed: surface diagnostics and fall through to any
+        // prebuilt .dxbc in this same mod folder before moving on.
+        REXGPU_ERROR("Failed to compile HLSL shader mod {} (hr=0x{:08X}): {}", source_name,
+                     static_cast<uint32_t>(hr),
+                     errors ? static_cast<const char*>(errors->GetBufferPointer())
+                            : "no compiler diagnostics");
+      }
+    }
+
+    if (std::filesystem::exists(dxbc_path)) {
+      std::vector<uint8_t> replacement = read_file(dxbc_path);
+      if (!replacement.empty()) {
+        REXGPU_INFO("Loaded replacement DXBC {:016X} mod {:016X} from {}", ucode_hash, modification,
+                    shaders_dir.string());
+        return replacement;
+      }
+    }
+  }
+  return {};
+}
+
+size_t PipelineCache::ReloadModdedShaders() {
+  // Snapshot every (hash, modification, type) while holding the lock, then do
+  // the disk IO / HLSL compilation without it. The actual binary swap and the
+  // pipeline invalidation are marshalled onto the command-processor thread by
+  // ReplaceShaderTranslationBinary.
+  struct Target {
+    uint64_t hash;
+    uint64_t modification;
+    xenos::ShaderType type;
+  };
+  std::vector<Target> targets;
+  {
+    std::lock_guard<std::mutex> lock(shaders_mutex_);
+    for (const auto& kv : shaders_) {
+      D3D12Shader* shader = kv.second;
+      if (!shader) continue;
+      for (const auto& tr_kv : shader->translations()) {
+        if (!tr_kv.second) continue;
+        targets.push_back({kv.first, tr_kv.second->modification(), shader->type()});
+      }
+    }
+  }
+
+  size_t reloaded = 0;
+  for (const Target& t : targets) {
+    std::vector<uint8_t> replacement = LoadModShaderReplacement(t.hash, t.modification, t.type);
+    if (replacement.empty()) continue;
+    if (ReplaceShaderTranslationBinary(t.hash, t.modification, std::move(replacement))) {
+      ++reloaded;
+    }
+  }
+  REXGPU_INFO("Shader hot reload: {} modded translation(s) recompiled from {} candidate(s)",
+              reloaded, targets.size());
+  return reloaded;
+}
+
 bool PipelineCache::ReplaceShaderTranslationBinary(uint64_t ucode_hash, uint64_t modification,
                                                    std::vector<uint8_t> binary) {
-  D3D12Shader::D3D12Translation* translation = nullptr;
+  // Validate that the target translation exists, but do NOT swap the bytecode
+  // or touch pipelines here: the pipelines that reference this shader may still
+  // be recorded in the open command list or in flight on the GPU. Destroying an
+  // ID3D12PipelineState the GPU is still reading crashes the driver. Instead,
+  // queue the replacement and let the worker thread apply it at a safe frame
+  // boundary via ApplyPendingShaderReplacements().
   {
     std::lock_guard<std::mutex> lock(shaders_mutex_);
     auto it = shaders_.find(ucode_hash);
     if (it == shaders_.end() || !it->second) return false;
-    translation = static_cast<D3D12Shader::D3D12Translation*>(
-        it->second->GetTranslation(modification));
+    if (!it->second->GetTranslation(modification)) return false;
   }
-  if (!translation) return false;
-  command_processor_.CallInThread([this, ucode_hash, modification, binary = std::move(binary)]() {
+  {
+    std::lock_guard<std::mutex> lock(pending_replacements_mutex_);
+    // Collapse repeated requests for the same translation to the latest binary.
+    bool replaced_existing = false;
+    for (auto& pending : pending_replacements_) {
+      if (pending.ucode_hash == ucode_hash && pending.modification == modification) {
+        pending.binary = std::move(binary);
+        replaced_existing = true;
+        break;
+      }
+    }
+    if (!replaced_existing) {
+      pending_replacements_.push_back({ucode_hash, modification, std::move(binary)});
+    }
+  }
+  command_processor_.RequestShaderReload();
+  return true;
+}
+
+void PipelineCache::ApplyPendingShaderReplacements() {
+  std::vector<PendingShaderReplacement> batch;
+  {
+    std::lock_guard<std::mutex> lock(pending_replacements_mutex_);
+    batch.swap(pending_replacements_);
+  }
+  if (batch.empty()) return;
+
+  // Swap in the new bytecode for each translation and remember which shader
+  // hashes changed so their pipelines can be rebuilt.
+  std::unordered_set<uint64_t> changed_hashes;
+  for (auto& item : batch) {
     D3D12Shader::D3D12Translation* tr = nullptr;
     {
       std::lock_guard<std::mutex> lock(shaders_mutex_);
-      auto it = shaders_.find(ucode_hash);
-      if (it == shaders_.end() || !it->second) return;
-      tr = static_cast<D3D12Shader::D3D12Translation*>(it->second->GetTranslation(modification));
+      auto it = shaders_.find(item.ucode_hash);
+      if (it == shaders_.end() || !it->second) continue;
+      tr = static_cast<D3D12Shader::D3D12Translation*>(it->second->GetTranslation(item.modification));
     }
-    if (!tr) return;
-    tr->set_translated_binary(std::move(const_cast<std::vector<uint8_t>&>(binary)));
-    current_pipeline_ = nullptr;
-    for (auto it = pipelines_.begin(); it != pipelines_.end();) {
-      const auto& desc = it->second->description.description;
-      if (desc.vertex_shader_hash == ucode_hash || desc.pixel_shader_hash == ucode_hash) {
-        ID3D12PipelineState* state = it->second->state.load(std::memory_order_acquire);
-        if (state) state->Release();
-        delete it->second;
-        it = pipelines_.erase(it);
-      } else {
-        ++it;
-      }
+    if (!tr) continue;
+    tr->set_translated_binary(std::move(item.binary));
+    changed_hashes.insert(item.ucode_hash);
+  }
+  if (changed_hashes.empty()) return;
+
+  // Destroy every pipeline built from a changed shader so the next draw rebuilds
+  // it from the new bytecode. Safe here: the caller guarantees the GPU is idle,
+  // no submission is open, and creation threads are quiescent.
+  current_pipeline_ = nullptr;
+  for (auto it = pipelines_.begin(); it != pipelines_.end();) {
+    const auto& desc = it->second->description.description;
+    if (changed_hashes.count(desc.vertex_shader_hash) ||
+        changed_hashes.count(desc.pixel_shader_hash)) {
+      ID3D12PipelineState* state = it->second->state.load(std::memory_order_acquire);
+      if (state) state->Release();
+      delete it->second;
+      it = pipelines_.erase(it);
+    } else {
+      ++it;
     }
-    COUNT_profile_set("gpu/pipeline_cache/pipelines", pipelines_.size());
-  });
-  return true;
+  }
+  COUNT_profile_set("gpu/pipeline_cache/pipelines", pipelines_.size());
+  REXGPU_INFO("Applied {} shader binary replacement(s) for {} shader hash(es)", batch.size(),
+              changed_hashes.size());
 }
 
 bool PipelineCache::ReplaceShaderTranslationHLSL(uint64_t ucode_hash, uint64_t modification,

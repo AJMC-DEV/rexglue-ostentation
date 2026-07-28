@@ -558,6 +558,15 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
       UpdateBuiltinOverlayInputMode();
     }
   });
+
+  rex::ui::RegisterBind("bind_reload_shaders", "K", "Reload modded shaders", [this] {
+    auto* gs = runtime_ ? runtime_->graphics_system() : nullptr;
+    if (!gs) return;
+    auto* cp = gs->command_processor();
+    if (!cp) return;
+    size_t count = cp->ReloadModdedShaders();
+    REXLOG_INFO("Shader hot reload: recompiled {} modded shader translation(s)", count);
+  });
 #endif
 
   rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {

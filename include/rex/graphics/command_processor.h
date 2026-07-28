@@ -206,6 +206,11 @@ class CommandProcessor {
     return false;
   }
 
+  // Re-reads/recompiles the enabled-mod replacement for every loaded shader
+  // translation from disk and swaps it in at runtime (K-key hot reload).
+  // Returns the number of translations replaced.
+  virtual size_t ReloadModdedShaders() { return 0; }
+
   // Compile HLSL and apply to every translation of `ucode_hash`. Returns true
   // if at least one translation was replaced; sets *out_replaced_count if non-null.
   bool ReplaceShaderHLSL(uint64_t ucode_hash, std::string_view source,

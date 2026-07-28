@@ -3734,6 +3734,20 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
 
       shared_memory_->ClearCache();
     }
+
+#ifdef REXGLUE_ENABLE_SHADERS
+    // Apply queued modded-shader hot reloads (K key / shader debugger). Only
+    // here is it safe to swap shader bytecode and destroy the pipelines that
+    // reference it: the frame's command list has been submitted, the GPU has
+    // finished with it (AwaitAllQueueOperationsCompletion), and pipeline
+    // creation threads are idle (pipeline_cache_->EndSubmission() above drained
+    // them, and IsCreatingPipelines() confirms none are still busy).
+    if (shader_reload_requested_.load(std::memory_order_acquire) &&
+        !pipeline_cache_->IsCreatingPipelines() && AwaitAllQueueOperationsCompletion()) {
+      shader_reload_requested_.store(false, std::memory_order_relaxed);
+      pipeline_cache_->ApplyPendingShaderReplacements();
+    }
+#endif  // REXGLUE_ENABLE_SHADERS
   }
 
   return true;
@@ -5290,6 +5304,11 @@ bool D3D12CommandProcessor::ReplaceShaderTranslationHLSL(uint64_t ucode_hash,
   }
   return pipeline_cache_->ReplaceShaderTranslationHLSL(
       ucode_hash, modification, source, entry_point, target_profile, out_error);
+}
+
+size_t D3D12CommandProcessor::ReloadModdedShaders() {
+  if (!pipeline_cache_) return 0;
+  return pipeline_cache_->ReloadModdedShaders();
 }
 
 void D3D12CommandProcessor::ResetShaderProfiling() {
