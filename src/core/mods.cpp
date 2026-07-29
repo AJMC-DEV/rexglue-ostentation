@@ -4,12 +4,34 @@
  */
 #include <rex/mods.h>
 
+#include <atomic>
 #include <cctype>
 #include <string>
 #include <string_view>
 #include <system_error>
 
 #include <rex/filesystem.h>
+#include <rex/graphics/mod_shader_params.h>
+
+// Custom shader-mod parameters (see rex/graphics/mod_shader_params.h). Defined in
+// core so both the game and the GPU plugin link them from the same place; the
+// GPU command processor copies them into the system-constants cbuffer tail each
+// frame, and the game (or hooks) set them.
+namespace rex {
+namespace gpu {
+// Generic block copied into the tail of the system-constants cbuffer each frame
+// (xe_system_consts[29] = [0..3], [30] = [4..7]). The game fills whatever it
+// wants here; the GPU backend just copies it, so adding/reshuffling params never
+// needs an engine rebuild.
+static std::atomic<float> g_mod_params[kModShaderParamCount] = {};
+void SetModShaderParam(uint32_t index, float value) {
+  if (index < kModShaderParamCount) g_mod_params[index].store(value, std::memory_order_relaxed);
+}
+float GetModShaderParam(uint32_t index) {
+  return index < kModShaderParamCount ? g_mod_params[index].load(std::memory_order_relaxed) : 0.0f;
+}
+}  // namespace gpu
+}  // namespace rex
 
 REXCVAR_DEFINE_STRING(mods_data_root, "", "MODS",
                       "Path to mods data directory. <exe>/mods is always "

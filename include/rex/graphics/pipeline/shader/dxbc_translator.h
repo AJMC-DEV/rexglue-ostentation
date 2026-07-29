@@ -388,6 +388,12 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // The constant blend factor for the respective modes.
     float edram_blend_constant[4];
 
+    // Custom parameters exposed to shader mods only (translated guest shaders
+    // never reference these). Appended at the very end so all existing offsets
+    // are unchanged. Lands at xe_system_consts[29]..[33]. The game fills these
+    // each frame; the GPU backend just copies them (see mod_shader_params.h).
+    float mod_params[20];
+
    private:
     friend class DxbcShaderTranslator;
 
@@ -439,6 +445,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
       kEdramRTBlendFactorsOps,
 
       kEdramBlendConstant,
+
+      kModParams,
 
       kCount,
     };

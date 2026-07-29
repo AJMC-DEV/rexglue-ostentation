@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstring>
@@ -24,6 +25,7 @@
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/mod_shader_params.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
@@ -4255,6 +4257,17 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     dirty |=
         system_constants_.edram_blend_constant[3] != regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA);
     system_constants_.edram_blend_constant[3] = regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA);
+  }
+
+  // Custom shader-mod parameters (read by replaced guest shaders only). The game
+  // fills these; we just copy them. They typically change each frame -> re-upload
+  // of the system constants, which is negligible.
+  {
+    float mp[rex::gpu::kModShaderParamCount];
+    for (uint32_t k = 0; k < rex::gpu::kModShaderParamCount; ++k) mp[k] = rex::gpu::GetModShaderParam(k);
+    static_assert(sizeof(system_constants_.mod_params) == sizeof(mp), "mod_params size mismatch");
+    dirty |= std::memcmp(system_constants_.mod_params, mp, sizeof(mp)) != 0;
+    std::memcpy(system_constants_.mod_params, mp, sizeof(mp));
   }
 
   cbuffer_binding_system_.up_to_date &= !dirty;

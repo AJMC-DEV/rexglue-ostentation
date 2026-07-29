@@ -1982,7 +1982,15 @@ const DxbcShaderTranslator::SystemConstantRdef DxbcShaderTranslator::system_cons
     {"xe_edram_rt_blend_factors_ops", ShaderRdefTypeIndex::kUint4, sizeof(uint32_t) * 4},
 
     {"xe_edram_blend_constant", ShaderRdefTypeIndex::kFloat4, sizeof(float) * 4},
+
+    {"xe_mod_params", ShaderRdefTypeIndex::kFloat4, sizeof(float) * 20},
 };
+
+// mod_params must stay the last field in the cbuffer; shader mods read it at
+// xe_system_consts[29]/[30]. If this fails, the reported offset / 16 is the
+// index of the first vector.
+static_assert(offsetof(DxbcShaderTranslator::SystemConstants, mod_params) == 29 * 16,
+              "mod_params moved - update the index in shader mods that read it");
 
 void DxbcShaderTranslator::WriteResourceDefinition() {
   // Because of shader_object_.resize(), pointers can't be kept persistently
