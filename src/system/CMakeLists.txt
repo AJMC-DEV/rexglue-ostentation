@@ -101,13 +101,13 @@ if(REXGLUE_ENABLE_TEXTURES)
 endif()
 
 if(WIN32)
-    target_link_libraries(rexruntime PRIVATE rexdiscord ws2_32 winhttp iphlpapi)
+    target_link_libraries(rexruntime PRIVATE rexdiscord rexgamejolt ws2_32 winhttp iphlpapi)
     # DXGI is used by the UI presenter on Windows independently of the
     # graphics backend.
     target_link_libraries(rexruntime PUBLIC dxgi dxguid)
     target_compile_definitions(rexruntime PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
 elseif(LINUX)
-    target_link_libraries(rexruntime PRIVATE rexdiscord)
+    target_link_libraries(rexruntime PRIVATE rexdiscord rexgamejolt)
 endif()
 
 if(REXGLUE_USE_D3D12)

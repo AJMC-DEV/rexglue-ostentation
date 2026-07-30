@@ -1,7 +1,3 @@
-/**
- * @file        core/mods.cpp
- * @brief       Shared mod-folder configuration. See rex/mods.h.
- */
 #include <rex/mods.h>
 
 #include <atomic>
@@ -13,16 +9,8 @@
 #include <rex/filesystem.h>
 #include <rex/graphics/mod_shader_params.h>
 
-// Custom shader-mod parameters (see rex/graphics/mod_shader_params.h). Defined in
-// core so both the game and the GPU plugin link them from the same place; the
-// GPU command processor copies them into the system-constants cbuffer tail each
-// frame, and the game (or hooks) set them.
 namespace rex {
 namespace gpu {
-// Generic block copied into the tail of the system-constants cbuffer each frame
-// (xe_system_consts[29] = [0..3], [30] = [4..7]). The game fills whatever it
-// wants here; the GPU backend just copies it, so adding/reshuffling params never
-// needs an engine rebuild.
 static std::atomic<float> g_mod_params[kModShaderParamCount] = {};
 void SetModShaderParam(uint32_t index, float value) {
   if (index < kModShaderParamCount) g_mod_params[index].store(value, std::memory_order_relaxed);
@@ -30,43 +18,18 @@ void SetModShaderParam(uint32_t index, float value) {
 float GetModShaderParam(uint32_t index) {
   return index < kModShaderParamCount ? g_mod_params[index].load(std::memory_order_relaxed) : 0.0f;
 }
-}  // namespace gpu
-}  // namespace rex
+}
+}
 
 REXCVAR_DEFINE_STRING(mods_data_root, "", "MODS",
-                      "Path to mods data directory. <exe>/mods is always "
-                      "searched as a fallback in addition to this path.");
-REXCVAR_DEFINE_STRING(enabled_mods, "", "MODS",
-                      "Comma-separated, ordered list of mod folder names to load "
-                      "from mods_data_root (e.g. \"betterwater, bettersky\"). Mod "
-                      "folders listed neither here nor in default_mods are "
-                      "ignored. Earlier entries take precedence over later ones "
-                      "for conflicting files.");
-REXCVAR_DEFINE_STRING(default_mods, "", "MODS",
-                      "Comma-separated, ordered list of mod folder names that are "
-                      "always loaded even when absent from enabled_mods (for mods "
-                      "bundled with the game). Loaded after all enabled_mods "
-                      "entries, so user-enabled mods win conflicts.");
+                      "Path to mods data directory. <exe>/mods is always searched as a fallback.");
+REXCVAR_DEFINE_STRING(enabled_mods, "", "MODS", "Comma-separated, ordered list of mod folder names to load ");
+REXCVAR_DEFINE_STRING(default_mods, "", "MODS", "Comma-separated, ordered list of mod folder names that are always loaded even when absent from enabled_mods");
 
 namespace rex {
 
 namespace {
 
-// Case-insensitive comparison for mod folder names, matching the
-// case-insensitive filesystems the folders live on.
-bool NamesEqual(std::string_view a, std::string_view b) {
-  if (a.size() != b.size()) return false;
-  for (size_t i = 0; i < a.size(); ++i) {
-    if (std::tolower(static_cast<unsigned char>(a[i])) !=
-        std::tolower(static_cast<unsigned char>(b[i]))) {
-      return false;
-    }
-  }
-  return true;
-}
-
-// Appends the trimmed, comma-separated entries of `list` to `names`,
-// skipping entries already present.
 void AppendNames(const std::string& list, std::vector<std::string>& names) {
   size_t start = 0;
   while (start <= list.size()) {
@@ -80,7 +43,7 @@ void AppendNames(const std::string& list, std::vector<std::string>& names) {
       name = name.substr(b, e - b + 1);
       bool duplicate = false;
       for (const auto& existing : names) {
-        if (NamesEqual(existing, name)) {
+        if (ModNamesEqual(existing, name)) {
           duplicate = true;
           break;
         }
@@ -95,18 +58,46 @@ void AppendNames(const std::string& list, std::vector<std::string>& names) {
   }
 }
 
-}  // namespace
+}
+
+bool ModNamesEqual(std::string_view a, std::string_view b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(a[i])) !=
+        std::tolower(static_cast<unsigned char>(b[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::vector<std::string> ParseModList(const std::string& list) {
+  std::vector<std::string> names;
+  AppendNames(list, names);
+  return names;
+}
+
+std::string FormatModList(const std::vector<std::string>& names) {
+  std::string out;
+  for (const auto& name : names) {
+    if (name.empty()) continue;
+    if (!out.empty()) out += ", ";
+    out += name;
+  }
+  return out;
+}
+
+std::filesystem::path GetModsRoot() {
+  std::filesystem::path root = REXCVAR_GET(mods_data_root);
+  if (root.empty()) root = rex::filesystem::GetExecutableFolder() / "mods";
+  return root;
+}
 
 std::vector<std::filesystem::path> GetEnabledModDirs(const std::filesystem::path& mods_root) {
-  // enabled_mods first (user order = priority), then any default_mods not
-  // already listed — bundled defaults never outrank user-enabled mods.
   std::vector<std::string> names;
   AppendNames(REXCVAR_GET(enabled_mods), names);
   AppendNames(REXCVAR_GET(default_mods), names);
 
-  // Each name resolves against the caller's root first, then against the
-  // always-present <exe>/mods so bundled mods survive a redirected
-  // mods_data_root.
   std::vector<std::filesystem::path> roots;
   roots.push_back(mods_root);
   const auto exe_mods = rex::filesystem::GetExecutableFolder() / "mods";
@@ -131,4 +122,4 @@ std::vector<std::filesystem::path> GetEnabledModDirs(const std::filesystem::path
   return dirs;
 }
 
-}  // namespace rex
+}

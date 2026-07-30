@@ -1,13 +1,3 @@
-/**
- * @file        rex/ui/overlay/mods_menu_overlay.h
- *
- * @brief       Read-only ImGui overlay listing enabled mods (name,
- *              description, version, author, icon), sourced from
- *              mods_data_root/<mod>/mod.toml + icon.png. Enabling/disabling
- *              mods and mod load order are managed by an external launcher
- *              via the enabled_mods cvar — this overlay is purely
- *              informational and never touches that cvar.
- */
 #pragma once
 
 #include <filesystem>
@@ -36,17 +26,20 @@ class ModsMenuDialog : public ImGuiDialog {
     std::string description;
     std::string version;
     std::string author;
+    std::string folder_name;
     std::filesystem::path folder;
     std::unique_ptr<ImmediateTexture> icon;
+    bool enabled = false;
   };
 
-  // Rebuilds mods_ from mods_data_root/<enabled mod>/mod.toml + icon.png.
-  // A mod folder with a missing or invalid mod.toml is skipped entirely.
   void Rescan();
+
+  void ApplyOrder();
 
   ImmediateDrawer* immediate_drawer_ = nullptr;
   std::vector<ModEntry> mods_;
   bool scanned_ = false;
+  bool order_dirty_ = false;
 };
 
-}  // namespace rex::ui
+}

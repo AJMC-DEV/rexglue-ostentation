@@ -100,6 +100,18 @@ add_library(tiny-aes STATIC
 target_include_directories(tiny-aes PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tiny-aes-c)
 target_compile_definitions(tiny-aes PUBLIC AES128=1 CBC=1)
 
+# miniz 3.0.2 - DEFLATE + ZIP reader (mod.io ships mods as .zip archives)
+# From: https://github.com/richgel999/miniz (MIT). Amalgamated single-file build.
+add_library(miniz STATIC
+    miniz/miniz.c
+)
+target_include_directories(miniz PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/miniz>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+# Avoid colliding with any future real zlib in the link.
+target_compile_definitions(miniz PUBLIC MINIZ_NO_ZLIB_COMPATIBLE_NAMES=1)
+target_compile_options(miniz PRIVATE -w)
+
 # aes_128 - AES-128 encryption/decryption (used by kernel crypt routines)
 # From: https://github.com/openluopworld/aes_128
 add_library(aes128 STATIC
