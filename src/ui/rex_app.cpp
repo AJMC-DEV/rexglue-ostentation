@@ -779,17 +779,23 @@ void ReXApp::OnRestored(ui::UIEvent& e) {
   OnWindowRestored();
 }
 
-void ReXApp::UpdateBuiltinOverlayInputMode() {
-  auto* input_sys = runtime_
-      ? static_cast<rex::input::InputSystem*>(runtime_->input_system())
-      : nullptr;
-  if (!input_sys) return;
-  bool ui_mode = debug_overlay_ || console_overlay_ || settings_overlay_ || achievements_overlay_
+bool ReXApp::IsBuiltinOverlayOpen() const {
+  return debug_overlay_ || console_overlay_ || settings_overlay_ || achievements_overlay_
       || netplay_overlay_ || mods_menu_overlay_
 #ifdef REXGLUE_ENABLE_SHADERS
       || shader_debugger_overlay_
 #endif
       ;
+}
+
+void ReXApp::UpdateBuiltinOverlayInputMode() {
+  auto* input_sys = runtime_
+      ? static_cast<rex::input::InputSystem*>(runtime_->input_system())
+      : nullptr;
+  if (!input_sys) return;
+  // App-owned UI counts too: closing the last built-in overlay must not yank the
+  // cursor away from a launcher or dialog the app still has on screen.
+  const bool ui_mode = IsBuiltinOverlayOpen() || WantsUIInputMode();
   if (ui_mode) {
     input_sys->SetInputModeUIOnly();
     input_sys->SetShowMouseCursor(true);

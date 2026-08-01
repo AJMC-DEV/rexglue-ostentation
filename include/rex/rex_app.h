@@ -214,6 +214,12 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   virtual void OnWindowMinimized() {}
   virtual void OnWindowRestored() {}
 
+  virtual bool WantsUIInputMode() const { return false; }
+
+  bool IsBuiltinOverlayOpen() const;
+
+  void RefreshInputMode() { UpdateBuiltinOverlayInputMode(); }
+
   /// Creates the overlay toggled by bind_achievements. Override to replace the
   /// built-in achievement UI. Returning nullptr disables the overlay.
   virtual std::unique_ptr<ui::ImGuiDialog> CreateAchievementsOverlay();

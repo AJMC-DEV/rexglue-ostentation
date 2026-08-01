@@ -32,9 +32,19 @@ class ModsMenuDialog : public ImGuiDialog {
     bool enabled = false;
   };
 
+  struct PendingAction {
+    enum class Kind { kNone, kEnable, kDisable, kMoveUp, kMoveDown } kind = Kind::kNone;
+    size_t index = 0;
+  };
+
   void Rescan();
 
   void ApplyOrder();
+
+  size_t EnabledCount() const;
+
+  void DrawColumn(const char* id, bool enabled_column, float width, float height, PendingAction& pending);
+  bool DrawRow(const ModEntry& mod, bool enabled_column, size_t index, PendingAction& pending);
 
   ImmediateDrawer* immediate_drawer_ = nullptr;
   std::vector<ModEntry> mods_;

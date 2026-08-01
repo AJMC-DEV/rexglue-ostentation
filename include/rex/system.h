@@ -28,6 +28,8 @@ void ShutdownAndroidSystem();
 void LaunchWebBrowser(const std::string_view url);
 void LaunchFileExplorer(const std::filesystem::path& path);
 
+bool RelaunchProcess();
+
 enum class SimpleMessageBoxType {
   Help,
   Warning,
