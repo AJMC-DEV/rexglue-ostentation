@@ -54,6 +54,18 @@ target_link_libraries(rexapp_compile_test PRIVATE
 )
 add_dependencies(unit_tests rexapp_compile_test)
 
+# Regression test for the Discord worker lifetime: a process that starts rich
+# presence and exits without an explicit Stop() must still terminate cleanly.
+add_executable(discord_shutdown_test
+    rexglue/discord_shutdown_test.cpp
+)
+target_link_libraries(discord_shutdown_test PRIVATE rexruntime)
+set_target_properties(discord_shutdown_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:rexruntime>
+)
+add_test(NAME discord.shutdown_without_explicit_stop COMMAND discord_shutdown_test)
+set_tests_properties(discord.shutdown_without_explicit_stop PROPERTIES LABELS unit TIMEOUT 10)
+
 # Strip Tracy/profiling instrumentation from test targets
 target_compile_options(unit_tests PRIVATE
     -UTRACY_ENABLE -UREXGLUE_ENABLE_PROFILING
