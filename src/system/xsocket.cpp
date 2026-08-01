@@ -356,6 +356,13 @@ X_STATUS XSocket::Close() {
     native_handle_ = ~0ull;
   }
 
+  // Give the router its port back. Async because the SOAP round-trip would
+  // otherwise stall whichever title thread is closing the socket; the mapping
+  // would also expire on its own once the lease ran out.
+  if (bound_ && bound_port_ != 0) {
+    UPnP::Get().ReleaseMapping(bound_port_, /*udp=*/type_ == SOCK_DGRAM);
+  }
+
   return close_failed ? X_STATUS_UNSUCCESSFUL : X_STATUS_SUCCESS;
 }
 
@@ -391,6 +398,15 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
 }
 
 X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
+  // Translate the destination through the UPnP connect-port map so a title with
+  // a hardcoded port can be pointed at whatever the peer actually listens on.
+  // Identity unless a map has been installed.
+  if (name && name_len >= static_cast<int>(sizeof(N_XSOCKADDR_IN))) {
+    auto* sa_in = reinterpret_cast<N_XSOCKADDR_IN*>(name);
+    sa_in->sin_port =
+        UPnP::Get().GetMappedConnectPort(static_cast<uint16_t>(sa_in->sin_port));
+  }
+
   int ret = connect(native_handle_, (sockaddr*)name, name_len);
   if (ret < 0) {
     return X_STATUS_UNSUCCESSFUL;
@@ -434,6 +450,16 @@ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
       name->sin_port = shifted;
       req_port = shifted;
     }
+
+    // Titles with hardcoded ports can be redirected to a different host port
+    // via the UPnP bind-port map. Identity unless a map has been installed.
+    const uint16_t mapped = UPnP::Get().GetMappedBindPort(req_port);
+    if (mapped != req_port) {
+      REXKRNL_INFO("XSocket::Bind applying UPnP bind port map: {} -> {}", req_port,
+                   mapped);
+      name->sin_port = mapped;
+      req_port = mapped;
+    }
   }
   int ret = bind(native_handle_, (sockaddr*)name, name_len);
   if (ret < 0) {
@@ -460,7 +486,7 @@ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
   // The manager is non-blocking, idempotent, and no-ops when upnp_enabled is
   // false, so this is safe to call on every bind.
   if (type_ == SOCK_DGRAM && req_port != 0 && REXCVAR_GET(xlive_web_enabled)) {
-    UpnpManager::Get().RequestMapping(req_port, /*udp=*/true);
+    UPnP::Get().RequestMapping(req_port, /*udp=*/true);
     // Coax Windows' native firewall allow-prompt so inbound netplay traffic
     // isn't silently dropped (fires at most once per process).
     TriggerFirewallPromptOnce(req_port);
@@ -637,6 +663,11 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
   uint32_t dest_addr = 0;
 
   if (to) {
+    // Peers listen on the port we told the router to forward, so an installed
+    // bind-port map has to be applied to the destination too. Identity unless a
+    // map has been installed.
+    to->sin_port = UPnP::Get().GetMappedBindPort(static_cast<uint16_t>(to->sin_port));
+
     dest_addr = to->sin_addr;  // host byte order (be<> read of guest NBO bytes)
     uint16_t dest_port_nbo = htons(static_cast<uint16_t>(to->sin_port));
     if (REXCVAR_GET(xlive_web_enabled) && (dest_addr & 0xFF000000u) == 0xAB000000u) {
